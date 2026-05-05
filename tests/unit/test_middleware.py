@@ -177,10 +177,14 @@ async def _call_tool_via_middleware(
     tool_name: str,
     identity: str | None,
     upstream_returns: Any = "ok",
+    extra_args: dict[str, Any] | None = None,
 ) -> tuple[Any, _StubMiddlewareContext]:
     """Drive on_call_tool; returns (result, context_after) or raises."""
     ctx = _make_ctx(identity)
-    ctx.message = _StubMessage(name=tool_name, arguments={"x": 1})
+    args: dict[str, Any] = {"x": 1}
+    if extra_args:
+        args.update(extra_args)
+    ctx.message = _StubMessage(name=tool_name, arguments=args)
 
     async def call_next(_c: Any) -> Any:
         return upstream_returns
@@ -248,13 +252,21 @@ async def test_hitl_push_approve_calls_approver(policy: Policy) -> None:
 
     middleware = HITLMiddleware(p, _CapturingApprover())
     result, ctx = await _call_tool_via_middleware(
-        middleware, tool_name="technitium_dns_delete_record", identity="ironclaw"
+        middleware,
+        tool_name="technitium_dns_delete_record",
+        identity="ironclaw",
+        extra_args={"justification": "stale record from leftover test data"},
     )
     assert result == "ok"
     assert ctx.fastmcp_context.get_state("hitl_decision") == "approved"
     assert len(seen) == 1
-    assert seen[0].identity == "ironclaw"
-    assert seen[0].tool == "technitium_dns_delete_record"
+    req = seen[0]
+    assert req.identity == "ironclaw"
+    assert req.tool == "technitium_dns_delete_record"
+    assert req.mcp_name == "technitium"
+    assert req.justification == "stale record from leftover test data"
+    # Justification must be stripped from args before forwarding upstream.
+    assert "justification" not in req.args
 
 
 async def test_hitl_push_approve_rejected_raises(policy: Policy) -> None:
@@ -271,7 +283,52 @@ async def test_hitl_push_approve_rejected_raises(policy: Policy) -> None:
 
     with pytest.raises(McpError, match="POLICY_HITL_REJECTED"):
         await _call_tool_via_middleware(
-            middleware, tool_name="technitium_dns_list", identity="ironclaw"
+            middleware,
+            tool_name="technitium_dns_list",
+            identity="ironclaw",
+            extra_args={"justification": "needed for diagnostics"},
+        )
+
+
+async def test_hitl_push_approve_missing_justification_raises(policy: Policy) -> None:
+    """Push-approve without a justification arg → JUSTIFICATION_REQUIRED."""
+    import copy
+
+    raw: dict[str, Any] = copy.deepcopy(MINIMAL)
+    raw["identities"]["ironclaw"]["hitl"] = {"defaults": "push-approve"}
+    p = Policy(HubConfig.model_validate(raw))
+    from mcp_hub.approvers.auto import AutoApprover
+
+    middleware = HITLMiddleware(p, AutoApprover())
+    from mcp import McpError
+
+    with pytest.raises(McpError, match="JUSTIFICATION_REQUIRED"):
+        await _call_tool_via_middleware(
+            middleware,
+            tool_name="technitium_dns_list",
+            identity="ironclaw",
+            # no extra_args → no justification
+        )
+
+
+async def test_hitl_push_approve_empty_justification_raises(policy: Policy) -> None:
+    """Push-approve with empty/whitespace justification → JUSTIFICATION_REQUIRED."""
+    import copy
+
+    raw: dict[str, Any] = copy.deepcopy(MINIMAL)
+    raw["identities"]["ironclaw"]["hitl"] = {"defaults": "push-approve"}
+    p = Policy(HubConfig.model_validate(raw))
+    from mcp_hub.approvers.auto import AutoApprover
+
+    middleware = HITLMiddleware(p, AutoApprover())
+    from mcp import McpError
+
+    with pytest.raises(McpError, match="JUSTIFICATION_REQUIRED"):
+        await _call_tool_via_middleware(
+            middleware,
+            tool_name="technitium_dns_list",
+            identity="ironclaw",
+            extra_args={"justification": "   "},
         )
 
 

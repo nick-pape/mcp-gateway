@@ -97,7 +97,21 @@ class ApprovalRequest:
 
     request_id: str
     identity: str
+    # Backend MCP that owns the tool, e.g. ``technitium`` (the prefix on
+    # the registered tool name). Approvers display this so the human
+    # knows which subsystem is being touched.
+    mcp_name: str
+    # Tool name as registered with FastMCP (the prefixed form, e.g.
+    # ``technitium_dns_health_check``). The unprefixed form is
+    # derivable as ``tool.removeprefix(f"{mcp_name}_")``.
     tool: str
+    # The agent's required justification (``args["justification"]``) for
+    # push-approve calls; empty string for auto-approve cases (which
+    # don't go through the approver). Surfacing this in the notification
+    # is the human's primary signal for deciding.
+    justification: str
+    # Args sans the ``justification`` parameter (which is hub-only
+    # metadata, not forwarded to the upstream tool).
     args: dict[str, object]
     # Human-readable rendering of args, suitable for a push notification
     # body. The hub computes this; approvers should not re-render.

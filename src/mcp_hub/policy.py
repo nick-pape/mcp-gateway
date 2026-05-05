@@ -331,3 +331,16 @@ class Policy:
     def mcp_name_for_tool(self, tool: str) -> str:
         """Return the MCP name that owns ``tool`` (its prefix before the first '_')."""
         return tool.split("_", 1)[0]
+
+    def is_tool_ever_push_approved(self, tool: str) -> bool:
+        """True if ANY identity's policy resolves ``tool`` to push-approve.
+
+        Used by the registration phase in :class:`mcp_hub.server.Hub` to
+        decide whether to inject a required ``justification`` parameter
+        into the tool's input schema. Tools that are auto-approve for
+        every identity don't need the parameter.
+        """
+        for identity_name in self._config.identities:
+            if self.hitl_decision(identity_name, tool) == HITLAction.PUSH_APPROVE:
+                return True
+        return False

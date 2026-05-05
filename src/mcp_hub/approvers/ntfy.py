@@ -239,10 +239,19 @@ class NtfyApprover:
         approve_body = f'{{"ack_token":"{ack_token}","decision":"approve"}}'
         reject_body = f'{{"ack_token":"{ack_token}","decision":"reject"}}'
 
+        # Title: "<identity> wants to run <mcp_name> <unprefixed_tool>"
+        # Strip the "<mcp_name>_" prefix so the title doesn't repeat
+        # "technitium technitium_dns_health_check".
+        unprefixed = request.tool.removeprefix(f"{request.mcp_name}_")
+        title = (
+            f"{request.identity} wants to run {request.mcp_name} {unprefixed}"
+        )
+        message = _format_notification_body(request)
+
         payload: dict[str, Any] = {
             "topic": self._ntfy_topic,
-            "title": f"[{request.identity}] {request.tool}?",
-            "message": request.args_summary or "(no args)",
+            "title": title,
+            "message": message,
             "priority": 4,
             "actions": [
                 {
@@ -376,3 +385,59 @@ def _redact(s: str) -> str:
     if len(s) <= 8:
         return "****"
     return s[:4] + "..."
+
+
+def _format_notification_body(
+    request: ApprovalRequest,
+    *,
+    max_value_len: int = 80,
+    max_args_block: int = 800,
+) -> str:
+    """Compose the ntfy notification body.
+
+    Layout (the human's primary decision context):
+
+    .. code-block:: text
+
+        <justification>
+
+        param1: value1
+        param2: value2
+        …
+
+    No markdown — ntfy's Android app renders it raw and we want it
+    readable everywhere. Long values are truncated; the args block is
+    capped so a runaway args dict can't blow past ntfy's body limit.
+    """
+    parts: list[str] = []
+    if request.justification:
+        parts.append(request.justification)
+
+    if request.args:
+        if parts:
+            parts.append("")  # blank line separator
+        arg_lines: list[str] = []
+        running_len = 0
+        for k, v in request.args.items():
+            line = f"{k}: {_short_value(v, max_value_len)}"
+            if running_len + len(line) + 1 > max_args_block:
+                arg_lines.append("…")
+                break
+            arg_lines.append(line)
+            running_len += len(line) + 1
+        parts.extend(arg_lines)
+
+    return "\n".join(parts) if parts else "(no details)"
+
+
+def _short_value(v: object, max_len: int) -> str:
+    """Render an arg value compactly: scalars as ``str``, complex as JSON."""
+    if isinstance(v, (dict, list)):
+        import json
+
+        s = json.dumps(v, separators=(",", ":"), default=repr)
+    else:
+        s = str(v)
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s

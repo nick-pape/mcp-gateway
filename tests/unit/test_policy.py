@@ -330,3 +330,27 @@ def test_mcp_name_for_tool_splits_on_first_underscore() -> None:
     policy = _policy()
     assert policy.mcp_name_for_tool("technitium_dns_delete_record") == "technitium"
     assert policy.mcp_name_for_tool("paperless_get_doc") == "paperless"
+
+
+def test_is_tool_ever_push_approved_returns_true_for_overrides() -> None:
+    policy = _hitl_policy({"technitium_dns_delete_record": "push-approve"})
+    assert policy.is_tool_ever_push_approved("technitium_dns_delete_record") is True
+    # Non-matching tool: still defaults=auto-approve, so no.
+    assert policy.is_tool_ever_push_approved("technitium_dns_list") is False
+
+
+def test_is_tool_ever_push_approved_glob_match() -> None:
+    policy = _hitl_policy({"technitium_*delete*": "push-approve"})
+    assert policy.is_tool_ever_push_approved("technitium_dns_delete_record") is True
+    assert policy.is_tool_ever_push_approved("technitium_zones_delete_zone") is True
+    assert policy.is_tool_ever_push_approved("technitium_dns_list") is False
+
+
+def test_is_tool_ever_push_approved_default_push_approve() -> None:
+    """defaults=push-approve makes ALL tools require approval for that identity."""
+    import copy
+
+    raw = copy.deepcopy(MINIMAL)
+    raw["identities"]["ironclaw"]["hitl"] = {"defaults": "push-approve"}  # type: ignore[index]
+    policy = Policy(HubConfig.model_validate(raw))
+    assert policy.is_tool_ever_push_approved("technitium_dns_list") is True

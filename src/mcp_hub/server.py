@@ -211,7 +211,33 @@ class Hub:
         upstream_name = tool_def["name"]
         prefixed_name = f"{mcp_name}_{upstream_name}"
         description = tool_def.get("description", "")
-        input_schema = tool_def.get("inputSchema") or {"type": "object", "properties": {}}
+        # Defensive copy — we mutate the schema below to inject
+        # ``justification`` for HITL-gated tools, and tool_def comes
+        # from the upstream MCP's tools/list which we don't own.
+        input_schema = dict(tool_def.get("inputSchema") or {"type": "object", "properties": {}})
+        input_schema["properties"] = dict(input_schema.get("properties", {}))
+        input_schema["required"] = list(input_schema.get("required", []))
+
+        # If this tool resolves to push-approve for any identity, the
+        # agent MUST send a justification with the call. Inject it as a
+        # required string parameter at the gateway level so the schema
+        # the agent sees includes it. Auto-approve callers never see
+        # the field validated (HITL middleware only enforces it on
+        # push-approve), so headless agents stay simple.
+        gates_hitl = self._policy.is_tool_ever_push_approved(prefixed_name)
+        if gates_hitl and "justification" not in input_schema["properties"]:
+            input_schema["properties"]["justification"] = {
+                "type": "string",
+                "description": (
+                    "Required for push-approve tools: a brief, specific "
+                    "explanation of WHY this call should be approved. The "
+                    "human reviewer sees this as the primary signal for "
+                    "deciding. Vague text ('user requested this') will "
+                    "likely be rejected; reference concrete intent."
+                ),
+            }
+            if "justification" not in input_schema["required"]:
+                input_schema["required"].append("justification")
 
         # FastMCP introspects the function's signature for both schema
         # generation AND argument unpacking. **kwargs is rejected by its
@@ -229,6 +255,12 @@ class Hub:
                     f"{ErrorCode.IDENTITY_UNKNOWN}: tool {prefixed_name} "
                     f"called with no identity"
                 )
+            # Defense-in-depth: HITL middleware also strips ``justification``
+            # from context.message.arguments before call_next, but pop here
+            # too in case the upstream FastMCP version doesn't propagate
+            # the middleware mutation. Justification is hub-only metadata
+            # and the upstream MCP would reject it as an unknown parameter.
+            arguments.pop("justification", None)
             response = await fanout.call(
                 identity=identity,
                 request={

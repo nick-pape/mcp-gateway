@@ -202,11 +202,40 @@ class HITLMiddleware(Middleware):
             )
 
         if action == HITLAction.PUSH_APPROVE:
+            # Pull justification out of args. Required for push-approve;
+            # the registered tool schema includes it as a string property
+            # for any tool that could be HITL-gated, so a well-behaved
+            # agent always sends it. Strip from args before forwarding so
+            # the upstream MCP doesn't receive an unknown parameter.
+            justification_raw = args.pop("justification", None)
+            justification = (
+                justification_raw.strip()
+                if isinstance(justification_raw, str)
+                else ""
+            )
+            if not justification:
+                raise McpError(
+                    ErrorData(
+                        code=_RPC_POLICY_REJECTED,
+                        message=f"{ErrorCode.JUSTIFICATION_REQUIRED}: tool "
+                        f"{tool_name!r} requires a non-empty 'justification' "
+                        f"argument explaining why this call should be approved",
+                    )
+                )
+            # Mutate the message args so the downstream handler sees the
+            # cleaned dict (no ``justification`` leak to upstream MCP).
+            # CallToolRequestParams.arguments is a mutable dict in
+            # FastMCP; replacing it works in 2.14.x.
+            context.message.arguments = args  # type: ignore[union-attr]
+
             request_id = _ctx(context).get_state("request_id") or new_request_id()
+            mcp_name = tool_name.split("_", 1)[0]
             req = ApprovalRequest(
                 request_id=request_id,
                 identity=identity,
+                mcp_name=mcp_name,
                 tool=tool_name,
+                justification=justification,
                 args=args,
                 args_summary=_args_summary(args),
             )

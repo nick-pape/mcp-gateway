@@ -14,7 +14,9 @@ def request_() -> ApprovalRequest:
     return ApprovalRequest(
         request_id="01HXY00000000000000000000",
         identity="ironclaw",
+        mcp_name="technitium",
         tool="technitium_dns_delete_record",
+        justification="user wants to remove a stale record",
         args={"domain": "stale.pape.house", "ip": "172.16.0.99"},
         args_summary="domain=stale.pape.house ip=172.16.0.99",
     )

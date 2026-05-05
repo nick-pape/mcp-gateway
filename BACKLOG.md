@@ -6,29 +6,107 @@ end-to-end without any of these.
 
 ## Architectural / feature
 
-### MCP-client OAuth at the gateway
-Currently agents must pre-mint JWTs via `client_credentials` against
-Authentik (works for Claude Code, n8n, scripts, custom claws). Real MCP
-clients like Copilot expect to **do the OAuth flow themselves** when
-they register the MCP — they want to redirect to an authorization
-endpoint and walk through user consent.
+### HITL approval web UI
+The phone notification has hard length limits and no room for full
+context. Build a small web app at `https://mcp.pape.house/hitl/<request_id>`
+that the ntfy notification deep-links to ("View details" action button
+in addition to Approve/Reject). Shows what the hub already has but
+doesn't surface today:
 
-Design: the gateway exposes an `/oauth/authorize` + `/oauth/token`
-proxy that delegates to Authentik. From the MCP client's perspective,
-`mcp.pape.house` IS the OAuth provider; from Authentik's perspective,
-the gateway is a confidential client doing on-behalf-of. The user
-approves the connection in Authentik (real auth screen), and the MCP
-client gets back a JWT scoped to that user's identity.
+- Tool description from upstream MCP schema
+- Args formatted as key/value (full, not hashed)
+- Recent call history for this identity (last N calls + their outcomes)
+- bao secret path that would be touched
+- Request ID, identity, source IP, age of pending request
+- Approve/Reject buttons that hit the same /hitl/ack route
 
-Benefits:
-- Connect Copilot and have it OAuth into a service account or the
-  user's own account
-- Per-connection JWTs become user-scoped (not just service-scoped),
-  so audit shows the human behind the call
-- Standard MCP-spec OAuth flow; no custom client_credentials wiring
+Pure read of state the hub already holds; no new info channels. ~200
+LoC of starlette + a single template. Auth via the same Authentik
+OAuth flow (uses the human-OAuth backlog item — both depend on it).
+
+### Per-identity ntfy topics
+Today everyone subscribes to `mcp-hitl-approvals`. Two humans behind
+separate identities means everyone gets every push. Add `topic_template`
+to NtfyApprover config (`"mcp-hitl-{identity}"`); update ntfy ACL on
+the publisher user from a specific topic to glob `mcp-hitl-*`. Each
+human subscribes only to topics for identities they own.
+
+### Richer HITL notification body
+Current notification: `[claude-code-dev] technitium_dns_health_check?`
++ body `{}`. Have available but not piping through:
+- Tool description from upstream MCP `tools/list` schema
+- Args formatted as `key: value` lines (not raw JSON)
+- Request ID for audit correlation
+- Optional: severity/destructive-intent tagging based on tool name
+  glob (delete/remove/reset → red, read → blue, etc.)
+
+Pairs naturally with the per-identity topic change — both touch
+NtfyApprover._publish.
+
+### Required `justification` arg for push-approve tools
+Every tool that resolves to push-approve for the calling identity
+gets a *required* `justification` string parameter, enforced by
+HITL middleware. Auto-approve callers don't need to pass it (so
+headless agents stay simple); push-approve calls without
+justification get `JUSTIFICATION_REQUIRED` immediately.
+
+Implementation:
+- Tool schema injection: any tool with push-approve in ANY identity's
+  policy gets an OPTIONAL `justification` field added to its
+  `inputSchema.properties` at registration time (so all callers can
+  pass it without breaking schema validation).
+- HITL middleware: before publishing to ntfy, check `args.get("justification")`
+  is non-empty. Reject with `JUSTIFICATION_REQUIRED` if missing.
+- The notification body + web UI surface the agent's justification
+  prominently — that's the human's primary context for deciding.
+
+Cheaper than MCP elicitation (no round-trip) and harder to skip than
+voluntary `_meta` (schema-enforced for every push-approve caller).
+
+### Two-tool elicitation pattern for HITL context (fallback)
+If `justification` proves insufficient (e.g., LLM cargo-cults the
+field with shallow reasons), fall back to: before publishing the
+HITL request, the hub calls back to the agent via MCP "elicitation"
+asking *"explain in more detail"*. Slow (extra round trip) but
+breaks past trivial autocomplete-grade explanations. Defer until
+the simpler pattern shows its limits.
+
+### MCP-client OAuth at the gateway (human-driven flows)
+Two distinct auth populations need different patterns, and the gateway
+should serve both:
+
+- **Service / autonomous agents** (Claude Code in headless runs, n8n,
+  cron scripts, custom claws): pre-mint JWTs via Authentik
+  `client_credentials` and present them as bearers. This is what works
+  today; no change needed.
+
+- **Humans driving MCP clients** (Claude Desktop, Copilot, Cursor, any
+  IDE plugin that follows the MCP-spec OAuth flow): the client expects
+  to do the OAuth dance itself when it registers the MCP. The user
+  shouldn't have to know what a JWT is, let alone go pre-mint one. The
+  flow they expect: point the client at `https://mcp.pape.house`,
+  client discovers it needs auth, opens browser to Authentik, user
+  logs in (with their normal SSO), client gets back a token scoped to
+  that user's identity, tool calls work.
+
+This second population is the missing piece today.
+
+Design: the gateway exposes `/oauth/authorize` + `/oauth/token` +
+`/.well-known/oauth-authorization-server` (the MCP-spec discovery
+document) and proxies them to Authentik. From the MCP client's
+perspective, `mcp.pape.house` IS the OAuth provider; from Authentik's
+perspective, the gateway is a confidential client doing
+on-behalf-of. The user sees the real Authentik consent screen.
+
+Benefits beyond ergonomics:
+- Per-connection JWTs are user-scoped (not just service-scoped), so
+  audit shows the human behind every call
+- Same identity model regardless of client (Claude Code, Copilot,
+  custom): every tool call ties back to a user via Authentik
+- Standard MCP-spec; future MCP clients work without per-client wiring
 
 Probably ~150 LoC of additional middleware/routes plus an Authentik
-client config that allows authz_code grant.
+client config that allows authz_code grant + PKCE.
 
 ### JWT auto-refresh (v1.5)
 Currently the fanout JWT on disk is a 15-min Authentik token (or 7d
