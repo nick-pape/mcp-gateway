@@ -318,7 +318,10 @@ def _write_secret_file(path: Path, value: str, uid: int) -> None:
     if uid_separation_supported():
         try:
             os.chmod(str(path), 0o400)
-            os.chown(str(path), uid, uid)
+            # os.chown isn't a static attribute on Windows; uid_separation_supported()
+            # already gated to Linux+root, but mypy needs a runtime guard too.
+            if hasattr(os, "chown"):
+                os.chown(str(path), uid, uid)
         except (PermissionError, OSError) as exc:
             raise FanoutError(
                 f"failed to set 0400 + chown {uid}:{uid} on {path}: {exc}; "

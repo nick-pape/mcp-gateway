@@ -11,8 +11,18 @@ server:
   hitl_webhook_path: /hitl/ack
 
 auth:
-  issuer: https://auth.pape.house/application/o/mcp-pape-house/
-  jwks_uri: https://auth.pape.house/application/o/mcp-pape-house/jwks/
+  # Authentik global issuer. With issuer_mode=global on the providers,
+  # all JWTs carry iss=https://auth.pape.house/. The hub validates this
+  # exact match.
+  issuer: https://auth.pape.house/
+  # JWKS endpoint for hub-side signature verification. Authentik exposes
+  # this per-application, but every app under the same signing key returns
+  # the same JWKS. Pinning to one is fine. Pick mcp-fanout-svc since it
+  # always exists in this stack.
+  jwks_uri: https://auth.pape.house/application/o/mcp-fanout-svc/jwks/
+  # bao uses this to bootstrap its JWT auth method. Per-app even with
+  # global issuer; bao reads issuer from discovery and matches JWTs to it.
+  oidc_discovery_url: https://auth.pape.house/application/o/mcp-fanout-svc/
   audience_prefix: "mcp-"        # aud must start with this; suffix = identity
   algorithms: ["RS256"]
   clock_skew_s: 30

@@ -78,6 +78,10 @@ class AuthConfig(BaseModel):
     issuer: str
     jwks_uri: str
     audience_prefix: str
+    # OIDC discovery URL — used by bao's JWT auth method, NOT by the hub.
+    # Authentik publishes per-app discovery URLs even when issuer_mode=global,
+    # so this can differ from `issuer`. The hub itself uses `jwks_uri` directly.
+    oidc_discovery_url: str | None = None
     algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
     clock_skew_s: int = 30
     cache_ttl_s: int = 600

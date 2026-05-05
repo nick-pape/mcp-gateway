@@ -68,21 +68,33 @@ def ensure_jwt_auth_enabled(client: httpx.Client) -> None:
     print("  jwt auth method enabled")
 
 
-def configure_jwt_auth(client: httpx.Client, issuer: str, jwks_uri: str) -> None:
-    """Point the JWT auth method at the policy's Authentik issuer.
+def configure_jwt_auth(
+    client: httpx.Client,
+    *,
+    issuer: str,
+    jwks_uri: str,
+    oidc_discovery_url: str | None,
+) -> None:
+    """Point bao's JWT auth method at Authentik.
 
-    Uses ``oidc_discovery_url`` so bao auto-discovers the JWKS endpoint
-    from the issuer's ``.well-known/openid-configuration``. Falling back
-    to ``jwks_url`` directly is also supported for issuers that don't
-    publish discovery, but Authentik does.
+    Authentik with ``issuer_mode=global`` publishes the same ``iss``
+    claim across all providers (e.g., ``https://auth.pape.house/``) but
+    discovery is still per-application. So we configure bao with:
+
+    - ``oidc_discovery_url`` (per-app) — if given; bao uses this to
+      auto-discover the JWKS URL. The discovery doc returns the global
+      issuer string, and bao binds JWTs to that.
+    - ``jwks_url`` — fallback when no discovery URL is provided; bao
+      validates against this directly. ``bound_issuer`` ensures JWTs
+      with a matching ``iss`` claim are accepted.
     """
-    r = _post(
-        client,
-        "/v1/auth/jwt/config",
-        {"oidc_discovery_url": issuer.rstrip("/")},
-    )
+    if oidc_discovery_url:
+        body = {"oidc_discovery_url": oidc_discovery_url.rstrip("/")}
+    else:
+        body = {"jwks_url": jwks_uri, "bound_issuer": issuer}
+    r = _post(client, "/v1/auth/jwt/config", body)
     r.raise_for_status()
-    print(f"  jwt auth configured with issuer={issuer}")
+    print(f"  jwt auth configured (issuer={issuer})")
 
 
 def upsert_policy(client: httpx.Client, name: str, hcl: str) -> None:
@@ -160,7 +172,12 @@ def bootstrap(policy_path: Path, addr: str, token: str) -> int:
 
         print("[1] JWT auth method")
         ensure_jwt_auth_enabled(c)
-        configure_jwt_auth(c, raw["auth"]["issuer"], raw["auth"]["jwks_uri"])
+        configure_jwt_auth(
+            c,
+            issuer=raw["auth"]["issuer"],
+            jwks_uri=raw["auth"]["jwks_uri"],
+            oidc_discovery_url=raw["auth"].get("oidc_discovery_url"),
+        )
 
         print("[2] Per-(mcp, identity) policies + roles")
         identities: dict[str, Any] = raw.get("identities", {})
