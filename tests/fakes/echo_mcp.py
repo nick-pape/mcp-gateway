@@ -111,6 +111,11 @@ def main() -> int:
             # output — log to stderr and skip.
             print(f"echo_mcp: invalid JSON on stdin: {line!r}", file=sys.stderr)
             continue
+        # Per JSON-RPC: messages without an "id" are notifications and
+        # MUST NOT receive a response. Unknown notifications are
+        # silently ignored (real MCP servers behave the same way).
+        if "id" not in request:
+            continue
         response = handle(request)
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()

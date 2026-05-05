@@ -25,11 +25,13 @@ fatal() {
 [ -f "$POLICY_PATH" ] || fatal "policy.yaml not mounted at $POLICY_PATH"
 
 # Runtime dir for per-identity token files. compose mounts this as tmpfs
-# so writes are RAM-only and disappear on container stop. Create it
-# (mode 0700) so only root can list — children get their own files
-# fchown'd to their UIDs, mode 0400.
+# so writes are RAM-only and disappear on container stop. Mode 0711 —
+# root retains full access; per-identity children (UIDs 1001+) can
+# *traverse* the dir to open their own file but cannot *list* it. The
+# per-file mode 0400 owned by the child UID keeps siblings out.
+# Mode 0700 would block traversal entirely and break the design.
 mkdir -p "$RUNTIME_DIR"
-chmod 0700 "$RUNTIME_DIR"
+chmod 0711 "$RUNTIME_DIR"
 
 # Secrets are required for production backends. Tests / dev compose
 # may use the env / auto backends and skip these — only fail if the

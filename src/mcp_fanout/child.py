@@ -110,6 +110,29 @@ class ChildProcess:
 
             return parsed
 
+    async def send_notification(self, request: dict[str, Any]) -> None:
+        """Send a JSON-RPC notification (no response read).
+
+        Used for the ``notifications/initialized`` message in the MCP
+        handshake — clients send it after ``initialize`` returns; servers
+        do not respond.
+        """
+        async with self._lock:
+            if not self.alive:
+                raise BackendChildDead(
+                    f"child for identity={self._identity!r} has exited "
+                    f"(returncode={self._process.returncode})"
+                )
+            assert self._process.stdin is not None
+            payload = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
+            try:
+                self._process.stdin.write(payload)
+                await self._process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise BackendChildDead(
+                    f"child for identity={self._identity!r} closed stdin during notify"
+                ) from exc
+
     async def close(self) -> None:
         """Terminate the child process and reap it.
 

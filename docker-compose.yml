@@ -50,14 +50,21 @@ services:
     cap_drop:
       - ALL
     cap_add:
-      - SETUID
+      - SETUID  # spawn stdio children at distinct UIDs
       - SETGID
+      - CHOWN   # chown per-identity token files to the child UID so
+                # only that UID (mode 0400) can read its own secret;
+                # without this, files stay root-owned and gosu'd
+                # children can't open them
 
     # Per-identity token files live on a tmpfs. Mode 0700 limits to
     # root inside the container; each token file is then chown'd to
     # its child's UID with mode 0400 by Fanout._write_secret_file.
+    # Mode 0711 — root has full access; per-identity children can
+    # traverse to open their own (mode 0400, owner-uid'd) token file
+    # but cannot list the directory or read siblings'.
     tmpfs:
-      - /run/mcp-tokens:size=16m,mode=0700
+      - /run/mcp-tokens:size=16m,mode=0711
 
     # Read-only policy file from the LXC host. Edit + restart container
     # to apply changes (live reload deferred to v2).

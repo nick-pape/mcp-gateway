@@ -33,6 +33,7 @@ from .child import ChildProcess
 from .exceptions import (
     BackendChildDead,
     ChildSpawnFailed,
+    FanoutError,
     IdentityNotFound,
 )
 from .uid_alloc import spawn_command, uid_separation_supported
@@ -160,7 +161,14 @@ class Fanout:
         self._token_files.append(token_path)
 
         # 3. Spawn the child via gosu (or no-op on dev hosts).
+        # PATH is inherited so the child can resolve "gosu" + any tools
+        # the MCP shells out to. Other parent env vars are NOT inherited:
+        # the child must declare what it needs explicitly via extra_env.
+        parent_path = os.environ.get(
+            "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        )
         env = {
+            "PATH": parent_path,
             **self._extra_env,
             cfg.secret_env_name: str(token_path),
         }
@@ -170,7 +178,13 @@ class Fanout:
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                # Inherit stderr so child diagnostics land in our logs.
+                # Capturing here would risk filling the pipe buffer if
+                # the child is chatty and we never read; inherited
+                # stderr is the simplest correct behavior. Production
+                # MCPs that prefix stderr with [audit]/[warning] etc.
+                # show up directly in `docker logs`.
+                stderr=None,
                 env=env,
             )
         except OSError as exc:
@@ -179,11 +193,47 @@ class Fanout:
                 f"identity={cfg.identity!r}: {exc}"
             ) from exc
 
-        self._children[cfg.identity] = ChildProcess(
+        child = ChildProcess(
             process=process,
             identity=cfg.identity,
             max_response_bytes=self._max_response_bytes,
         )
+
+        # 4. MCP initialization handshake. Required by spec before any
+        #    tools/list or tools/call can succeed. Most production MCP
+        #    servers (TS SDK, Python SDK) hard-require it; without it
+        #    they read the request and close stdout.
+        try:
+            init_response = await child.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}},
+                        "clientInfo": {
+                            "name": "mcp-fanout",
+                            "version": "0.0.0",
+                        },
+                    },
+                }
+            )
+            if "error" in init_response:
+                raise ChildSpawnFailed(
+                    f"Fanout({self._mcp_name}): initialize failed for "
+                    f"identity={cfg.identity!r}: {init_response['error']}"
+                )
+            await child.send_notification(
+                {"jsonrpc": "2.0", "method": "notifications/initialized"}
+            )
+        except BackendChildDead as exc:
+            raise ChildSpawnFailed(
+                f"Fanout({self._mcp_name}): initialize handshake failed for "
+                f"identity={cfg.identity!r}: {exc}"
+            ) from exc
+
+        self._children[cfg.identity] = child
 
     async def call(self, *, identity: str, request: dict[str, Any]) -> dict[str, Any]:
         """Forward a JSON-RPC request to the child for ``identity``.
@@ -257,9 +307,20 @@ def _write_secret_file(path: Path, value: str, uid: int) -> None:
     finally:
         os.close(fd)
 
-    # Tighten on POSIX; chown to the spawning UID. Skipped on Windows.
-    if os.name == "posix":
-        with suppress(PermissionError):
+    # Tighten on Linux+root only — that's the configuration where the
+    # gosu'd child runs as a distinct UID and needs the secret restricted
+    # via mode 0400 + chown. Without uid separation (dev hosts), the
+    # child inherits the writer's UID and can read mode 0600 anyway.
+    #
+    # Errors here are FATAL: if uid separation is supposed to be on but
+    # chown fails (CAP_CHOWN missing), the gosu'd child won't be able to
+    # read its token. Failing loud surfaces the missing capability.
+    if uid_separation_supported():
+        try:
             os.chmod(str(path), 0o400)
-            if hasattr(os, "chown"):
-                os.chown(str(path), uid, uid)
+            os.chown(str(path), uid, uid)
+        except (PermissionError, OSError) as exc:
+            raise FanoutError(
+                f"failed to set 0400 + chown {uid}:{uid} on {path}: {exc}; "
+                f"this usually means the container is missing CAP_CHOWN"
+            ) from exc
