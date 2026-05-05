@@ -1,0 +1,102 @@
+# mcp.pape.house — example policy
+#
+# Drop a real version of this at /etc/mcp-pape-house/policy.yaml on the
+# deploy host. Source of truth is git; the hub watches the file but a
+# restart is required when adding/removing identities or MCPs.
+
+version: 1
+
+server:
+  bind: "0.0.0.0:8443"          # docker-network interface only; not 0.0.0.0
+  hitl_webhook_path: /hitl/ack
+
+auth:
+  issuer: https://auth.pape.house/application/o/mcp-pape-house/
+  jwks_uri: https://auth.pape.house/application/o/mcp-pape-house/jwks/
+  audience_prefix: "mcp-"        # aud must start with this; suffix = identity
+  algorithms: ["RS256"]
+  clock_skew_s: 30
+  cache_ttl_s: 600
+
+secret_backend:
+  name: bao
+  config:
+    addr: https://secrets.pape.house
+    role_jwt_path: /run/secrets/fanout_jwt
+    role_template: "mcp-{mcp}-{identity}"
+
+approver:
+  name: ntfy
+  config:
+    server: https://notify.service.pape.house
+    topic: mcp-hitl-approvals
+    publish_token_path: /run/secrets/ntfy_publish_token
+    timeout_default_s: 120
+
+audit:
+  sink: stderr
+  hash_args_default: true
+
+mcps:
+  technitium:
+    command: ["node", "/app/mcps/technitium/dist/index.js"]
+    secret_env_name: TECHNITIUM_TOKEN_FILE
+    uid_offset: 10
+  paperless:
+    command: ["python", "-m", "paperless_mcp"]
+    secret_env_name: PAPERLESS_TOKEN_FILE
+    uid_offset: 20
+
+identities:
+  ironclaw:
+    aud: mcp-ironclaw
+    uid_base: 1001
+    allowed_tools:
+      - "technitium_dns_*"
+      - "technitium_dhcp_list_*"
+      - "paperless_get_*"
+      - "paperless_search_*"
+    hitl:
+      defaults: auto-approve
+      overrides:
+        technitium_dns_delete_record: push-approve
+        technitium_dns_add_record: push-approve
+    secrets:
+      technitium:
+        path: secret/data/services/technitium/ironclaw
+        field: api_token
+      paperless:
+        path: secret/data/services/paperless/shared
+        field: api_token
+
+  paperless-bot:
+    aud: mcp-paperless-bot
+    uid_base: 1002
+    allowed_tools:
+      - "paperless_*"
+    hitl:
+      defaults: auto-approve
+    secrets:
+      paperless:
+        path: secret/data/services/paperless/shared
+        field: api_token
+
+  claude-code-dev:
+    aud: mcp-claude-code-dev
+    uid_base: 1003
+    allowed_tools:
+      - "technitium_*"
+      - "paperless_*"
+    hitl:
+      defaults: auto-approve
+      overrides:
+        # Most-specific wins on tie; longer pattern beats shorter.
+        technitium_dns_delete_record: push-approve
+        "technitium_dhcp_remove_*": push-approve
+    secrets:
+      technitium:
+        path: secret/data/services/technitium/claude-code-dev
+        field: api_token
+      paperless:
+        path: secret/data/services/paperless/shared
+        field: api_token
