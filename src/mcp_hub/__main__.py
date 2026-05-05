@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse, Response
 from .approvers.ntfy import NtfyApprover
 from .audit import Audit
 from .auth import AuthentikJWTValidator
-from .factory import build_approver, build_secret_backend
+from .factory import build_approver, build_refresher_manager, build_secret_backend
 from .policy import Policy
 from .server import Hub
 
@@ -72,6 +72,18 @@ async def _async_main() -> int:
     approver = build_approver(policy.config, http_client=http_client)
     audit = Audit()  # default: stderr → Loki via Promtail
 
+    # Token refreshers MUST mint before Hub.start() — Hub.start() does the
+    # bao login that reads role_jwt_path, which is the refresher's output.
+    # Build, mint synchronously, THEN start hub, THEN spawn rotation tasks.
+    refresher_manager = build_refresher_manager(policy.config)
+    try:
+        await refresher_manager.mint_initial()
+    except Exception:
+        logger.exception("token refresher initial mint failed; exiting")
+        await refresher_manager.close()
+        await http_client.aclose()
+        return 1
+
     hub = Hub(
         policy=policy,
         secret_backend=secret_backend,
@@ -85,7 +97,12 @@ async def _async_main() -> int:
         await hub.start()
     except Exception:
         logger.exception("hub start failed; exiting")
+        await refresher_manager.close()
+        await http_client.aclose()
         return 1
+
+    # Hub is up + bao login succeeded → safe to rotate underneath.
+    refresher_manager.start_background()
 
     # Wire /hitl/ack webhook route iff the approver supports it (NtfyApprover).
     if isinstance(approver, NtfyApprover):
@@ -114,6 +131,7 @@ async def _async_main() -> int:
     try:
         await hub.mcp.run_async(transport="http", host=bind_host, port=bind_port)
     finally:
+        await refresher_manager.close()
         await hub.close()
         await http_client.aclose()
 

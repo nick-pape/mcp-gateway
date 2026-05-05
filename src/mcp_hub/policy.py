@@ -130,6 +130,35 @@ class IdentityPolicy(BaseModel):
     secrets: dict[str, SecretRefModel]
 
 
+class TokenRefresherPlugin(BaseModel):
+    """One side (source or sink) of a refresher entry.
+
+    ``type`` is the plugin lookup key (entry-point name in
+    ``mcp_hub.token_sources`` / ``mcp_hub.token_sinks``, or a dotted-path
+    import string for in-repo plugins). ``config`` is passed to the
+    resolved class as ``**kwargs``; the class is responsible for its
+    own kwarg validation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    type: str
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class TokenRefresherConfig(BaseModel):
+    """One refresher entry under ``token_refresh.<name>``."""
+
+    model_config = ConfigDict(extra="forbid")
+    source: TokenRefresherPlugin
+    sink: TokenRefresherPlugin
+    # Duration string in "unit=N" form ("minutes=10", "hours=1", "days=30",
+    # "seconds=30"). Parsed to a timedelta in the factory.
+    rotate_every: str
+    safety_buffer: str = "seconds=30"
+    initial_backoff: str = "seconds=5"
+    max_backoff: str = "minutes=2"
+
+
 class HubConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: int
@@ -140,6 +169,10 @@ class HubConfig(BaseModel):
     audit: AuditConfig = Field(default_factory=AuditConfig)
     mcps: dict[str, MCPConfig] = Field(min_length=1)
     identities: dict[str, IdentityPolicy] = Field(min_length=1)
+    # Optional. Empty / absent = no token rotation, the operator is
+    # responsible for keeping any tokens-on-disk fresh. Production
+    # policy MUST set this for fanout_jwt.
+    token_refresh: dict[str, TokenRefresherConfig] = Field(default_factory=dict)
 
     @field_validator("version")
     @classmethod

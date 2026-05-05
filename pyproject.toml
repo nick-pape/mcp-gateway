@@ -32,6 +32,21 @@ dependencies = [
 [project.scripts]
 mcp-hub = "mcp_hub.__main__:main"
 
+# -----------------------------------------------------------------------------
+# Token-refresher plugins
+# -----------------------------------------------------------------------------
+# The hub looks up TokenSource/TokenSink classes via these entry points.
+# Third-party plugins declare their own under the same group names in their
+# own pyproject.toml — install side-by-side with the hub and they're picked
+# up automatically. See src/mcp_hub/refresher/registry.py for resolution
+# order (entry points first, then dotted-path fallback).
+
+[project.entry-points."mcp_hub.token_sources"]
+authentik_client_credentials = "mcp_hub.refresher.builtins.authentik:AuthentikClientCredentialsSource"
+
+[project.entry-points."mcp_hub.token_sinks"]
+file = "mcp_hub.refresher.builtins.file_sink:FileSink"
+
 [dependency-groups]
 dev = [
     "pytest>=8,<9",

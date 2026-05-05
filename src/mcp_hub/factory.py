@@ -8,9 +8,16 @@ all "if name == 'bao': ..." branching lives here, not scattered.
 Both production and test fakes are wired here so tests can drop the
 hub config into ``{name: env}`` / ``{name: auto}`` and integration-test
 the full server without bao or ntfy.
+
+Token-refresher entries (``token_refresh:`` block) are also assembled
+here — but their source/sink classes are looked up via the plugin
+registry (entry points + dotted-path), not hardcoded. Built-ins ship
+in ``mcp_hub.refresher.builtins``.
 """
 
 from __future__ import annotations
+
+from datetime import timedelta
 
 import httpx
 
@@ -20,6 +27,12 @@ from .approvers.reject import RejectApprover
 from .bao_client import BaoClient
 from .interfaces import Approver, SecretBackend
 from .policy import HubConfig
+from .refresher import (
+    RefresherManager,
+    TokenRefresher,
+    resolve_sink,
+    resolve_source,
+)
 from .secrets.bao import BaoSecretBackend
 from .secrets.env import EnvSecretBackend
 
@@ -106,3 +119,82 @@ def _required_str(d: dict[str, object], key: str, label: str) -> str:
     if not isinstance(v, str) or not v:
         raise ValueError(f"missing or non-string config value: {label}")
     return v
+
+
+# ---------------------------------------------------------------------------
+# Token refresher
+# ---------------------------------------------------------------------------
+
+
+_DURATION_UNITS = {"seconds", "minutes", "hours", "days", "weeks"}
+
+
+def parse_duration(s: str) -> timedelta:
+    """Parse a ``"unit=N"`` duration string into a timedelta.
+
+    Examples: ``"seconds=30"``, ``"minutes=10"``, ``"days=1"``. Matches
+    the format Authentik uses for its own durations, which is the
+    convention the rest of this codebase follows.
+    """
+    if not isinstance(s, str) or "=" not in s:
+        raise ValueError(
+            f"duration must be a 'unit=N' string (e.g. 'minutes=10'), got {s!r}"
+        )
+    unit, _, n_str = s.partition("=")
+    unit = unit.strip()
+    if unit not in _DURATION_UNITS:
+        raise ValueError(
+            f"unknown duration unit {unit!r}; valid: {sorted(_DURATION_UNITS)}"
+        )
+    try:
+        n = int(n_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"duration value must be an integer, got {n_str!r}"
+        ) from exc
+    if n < 0:
+        raise ValueError(f"duration must be non-negative, got {n}")
+    return timedelta(**{unit: n})
+
+
+def build_refresher_manager(config: HubConfig) -> RefresherManager:
+    """Instantiate every ``token_refresh.<name>`` entry into a manager.
+
+    Plugin classes are looked up via the registry (entry points first,
+    dotted-path fallback). Each plugin's ``config`` dict is passed as
+    ``**kwargs`` to its constructor — kwarg validation belongs to the
+    plugin, not here.
+    """
+    refreshers: list[TokenRefresher] = []
+    for name, rc in config.token_refresh.items():
+        try:
+            source_cls = resolve_source(rc.source.type)
+            source = source_cls(**rc.source.config)
+        except Exception as exc:
+            raise ValueError(
+                f"token_refresh.{name}.source: failed to build source "
+                f"{rc.source.type!r}: {exc}"
+            ) from exc
+        try:
+            sink_cls = resolve_sink(rc.sink.type)
+            sink = sink_cls(**rc.sink.config)
+        except Exception as exc:
+            # Source is orphaned but interpreter exit at startup-fail
+            # path will tear it down; httpx will warn about the unclosed
+            # client, which is the right loud signal for a config bug.
+            raise ValueError(
+                f"token_refresh.{name}.sink: failed to build sink "
+                f"{rc.sink.type!r}: {exc}"
+            ) from exc
+        refreshers.append(
+            TokenRefresher(
+                name=name,
+                source=source,
+                sink=sink,
+                rotate_every=parse_duration(rc.rotate_every),
+                safety_buffer=parse_duration(rc.safety_buffer),
+                initial_backoff=parse_duration(rc.initial_backoff),
+                max_backoff=parse_duration(rc.max_backoff),
+            )
+        )
+    return RefresherManager(refreshers=refreshers)

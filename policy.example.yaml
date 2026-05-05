@@ -32,7 +32,10 @@ secret_backend:
   name: bao
   config:
     addr: https://secrets.pape.house
-    role_jwt_path: /run/secrets/fanout_jwt
+    # Refresher OUTPUT path: the file at this path is rotated by
+    # mcp_hub.refresher every ~10min (see token_refresh.fanout_jwt
+    # below). bao login reads it freshly each time.
+    role_jwt_path: /etc/mcp-pape-house/fanout_jwt
     role_template: "mcp-{mcp}-{identity}"
 
 approver:
@@ -46,6 +49,35 @@ approver:
 audit:
   sink: stderr
   hash_args_default: true
+
+# Token-refresher entries. Each key is an arbitrary refresher name; the
+# mcp_hub.refresher subsystem writes a fresh credential to `sink.config.path`
+# every `rotate_every`. Plugins (source/sink classes) are looked up via
+# entry_points (group `mcp_hub.token_sources` / `mcp_hub.token_sinks`); a
+# dotted-path import string also works for in-repo or unpackaged plugins.
+#
+# fanout_jwt below is required when secret_backend.name = bao — Authentik
+# bug #16621 means access_token_validity is silently capped at 15 min, so
+# the hub MUST rotate this JWT itself.
+token_refresh:
+  fanout_jwt:
+    source:
+      type: authentik_client_credentials
+      config:
+        token_url: https://auth.pape.house/application/o/token/
+        client_id: mcp-fanout-svc
+        client_secret_path: /run/secrets/fanout_client_secret
+        scope: "openid mcp-fanout-svc"
+    sink:
+      type: file
+      config:
+        path: /etc/mcp-pape-house/fanout_jwt
+        # Quote the mode — YAML 1.1 does not parse 0o400 as octal.
+        mode: "0o400"
+    rotate_every: minutes=10
+    safety_buffer: seconds=30
+    initial_backoff: seconds=5
+    max_backoff: minutes=2
 
 mcps:
   technitium:

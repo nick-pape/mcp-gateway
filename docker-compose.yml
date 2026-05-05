@@ -8,21 +8,28 @@
 # ============================================================
 # Before first deploy, the LXC must have:
 #
-#   1. /etc/mcp-pape-house/policy.yaml — copied from policy.example.yaml,
-#      then filled in (Authentik issuer URL, identity audiences, secret
-#      paths). Bind-mounted read-only into the container.
+#   1. /etc/mcp-pape-house/ — directory, bind-mounted read-write. Owned
+#      by root, mode 0700. Contains:
 #
-#   2. /etc/mcp-pape-house/fanout_jwt — long-lived JWT identifying the
-#      hub to bao (used to log in and mint per-identity ephemeral
-#      tokens). Mounted as a docker secret. Generate by registering an
-#      Authentik OAuth client for "mcp-fanout-svc" and saving its
-#      machine token. See README § Authentik setup.
+#      - policy.yaml — copied from policy.example.yaml, then filled in
+#        (Authentik issuer URL, identity audiences, secret paths,
+#        token_refresh.<name>.* entries).
+#
+#      - fanout_jwt — refresher OUTPUT. Created by mcp_hub.refresher at
+#        startup; rotated every ~10min. Do NOT pre-place this file — if
+#        it exists, it will be overwritten. (The directory itself must
+#        exist and be writable by root inside the container.)
+#
+#   2. /etc/mcp-pape-house/fanout_client_secret — Authentik OAuth2
+#      client_secret for the mcp-fanout-svc provider. Mounted as a
+#      docker secret. The refresher reads this file on every mint to
+#      pick up rotations underneath.
 #
 #   3. /etc/mcp-pape-house/ntfy_publish_token — bearer token for
 #      publishing to the ntfy HITL topic. Mounted as a docker secret.
 #
-# Mode 0400, owned by root. Only root reads them; the entrypoint
-# verifies they exist when the policy references them.
+# Mode 0400 on every secret file, owned by root. The entrypoint
+# verifies they exist when the policy references their backend.
 # ============================================================
 
 name: mcp-pape-house
@@ -66,14 +73,22 @@ services:
     tmpfs:
       - /run/mcp-tokens:size=16m,mode=0711
 
-    # Read-only policy file from the LXC host. Edit + restart container
-    # to apply changes (live reload deferred to v2).
+    # Bind-mount the WHOLE config directory (not just policy.yaml as a
+    # single file) so the refresher can atomically write the rotated
+    # fanout_jwt into it. A single-file bind mount would block the
+    # rename(2) the refresher does (inode-bound to the host's file).
+    # Read-write because of the refresher; the hub never modifies
+    # policy.yaml itself.
     volumes:
-      - /etc/mcp-pape-house/policy.yaml:/etc/mcp-pape-house/policy.yaml:ro
+      - /etc/mcp-pape-house:/etc/mcp-pape-house:rw
 
     # Docker secrets land at /run/secrets/<name> automatically.
+    # fanout_client_secret = Authentik OAuth2 client_secret used by the
+    # token refresher to mint a fresh fanout_jwt every ~10min. Was
+    # previously fanout_jwt (a static long-lived JWT); replaced because
+    # Authentik silently caps validity at 15min (bug #16621).
     secrets:
-      - fanout_jwt
+      - fanout_client_secret
       - ntfy_publish_token
 
     # Healthcheck via /health (no auth required — see __main__.py).
@@ -103,7 +118,7 @@ services:
 # Secrets — file-backed, mode 0400 on the host
 # ============================================================
 secrets:
-  fanout_jwt:
-    file: /etc/mcp-pape-house/fanout_jwt
+  fanout_client_secret:
+    file: /etc/mcp-pape-house/fanout_client_secret
   ntfy_publish_token:
     file: /etc/mcp-pape-house/ntfy_publish_token

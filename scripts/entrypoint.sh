@@ -14,7 +14,11 @@ set -eu
 
 POLICY_PATH="${MCP_HUB_CONFIG:-/etc/mcp-pape-house/policy.yaml}"
 RUNTIME_DIR="${MCP_HUB_RUNTIME_DIR:-/run/mcp-tokens}"
-FANOUT_JWT="/run/secrets/fanout_jwt"
+# fanout_jwt is now refresher-managed: written by the hub at startup
+# (see mcp_hub.refresher) into the bind-mounted /etc/mcp-pape-house/
+# directory. We don't sanity-check its existence at entrypoint time
+# anymore — the refresher creates it during the initial mint.
+FANOUT_CLIENT_SECRET="/run/secrets/fanout_client_secret"
 NTFY_PUBLISH_TOKEN="/run/secrets/ntfy_publish_token"
 
 fatal() {
@@ -37,7 +41,7 @@ chmod 0711 "$RUNTIME_DIR"
 # may use the env / auto backends and skip these — only fail if the
 # referenced policy actually selects bao or ntfy.
 if grep -q '^[[:space:]]*name:[[:space:]]*bao' "$POLICY_PATH" 2>/dev/null; then
-    [ -f "$FANOUT_JWT" ] || fatal "secret_backend=bao but no $FANOUT_JWT mounted"
+    [ -f "$FANOUT_CLIENT_SECRET" ] || fatal "secret_backend=bao but no $FANOUT_CLIENT_SECRET mounted (token refresher needs it)"
 fi
 if grep -q '^[[:space:]]*name:[[:space:]]*ntfy' "$POLICY_PATH" 2>/dev/null; then
     [ -f "$NTFY_PUBLISH_TOKEN" ] || fatal "approver=ntfy but no $NTFY_PUBLISH_TOKEN mounted"
