@@ -213,11 +213,13 @@ class Hub:
         description = tool_def.get("description", "")
         input_schema = tool_def.get("inputSchema") or {"type": "object", "properties": {}}
 
-        # FastMCP's tool functions cannot use **kwargs; they need explicit
-        # parameters. We use a single dict parameter and OVERRIDE the
-        # generated parameters schema with the upstream's so the LLM sees
-        # the correct shape.
-        async def handler(arguments: dict[str, Any]) -> str:
+        # FastMCP introspects the function's signature for both schema
+        # generation AND argument unpacking. **kwargs is rejected by its
+        # validator, but a function with __signature__ overridden to a
+        # Signature of KEYWORD_ONLY params (matching the upstream tool's
+        # input schema) passes validation AND tells FastMCP what arg
+        # names to extract from the call's `arguments` dict.
+        async def handler(**arguments: Any) -> str:
             from fastmcp.server.dependencies import get_context
 
             ctx = get_context()
@@ -252,6 +254,30 @@ class Hub:
 
             return _json.dumps(result, separators=(",", ":"))
 
+        # Forge the signature: one KEYWORD_ONLY param per upstream-tool input
+        # property. FastMCP's validator only rejects VAR_POSITIONAL / VAR_KEYWORD
+        # kinds; explicit named params pass through.
+        import inspect as _inspect
+
+        properties: dict[str, Any] = input_schema.get("properties", {})
+        required = set(input_schema.get("required", []))
+        forged_params = [
+            _inspect.Parameter(
+                name=prop_name,
+                kind=_inspect.Parameter.KEYWORD_ONLY,
+                default=_inspect.Parameter.empty if prop_name in required else None,
+                annotation=Any,
+            )
+            for prop_name in properties
+        ]
+        handler.__signature__ = _inspect.Signature(  # type: ignore[attr-defined]
+            parameters=forged_params, return_annotation=str
+        )
+        # Pydantic walks __annotations__ (via typing.get_type_hints) for
+        # arguments-schema validation; __signature__ alone isn't enough.
+        handler.__annotations__ = {p.name: Any for p in forged_params}
+        handler.__annotations__["return"] = str
+
         from fastmcp.tools.tool import FunctionTool
 
         tool = FunctionTool.from_function(
@@ -259,9 +285,8 @@ class Hub:
             name=prefixed_name,
             description=description,
         )
-        # Replace the auto-generated parameters schema (which describes
-        # the single ``arguments: dict`` param) with the upstream's
-        # actual tool schema.
+        # Replace the auto-generated parameters schema with the upstream's
+        # actual tool schema so the LLM sees correct field names/types.
         tool.parameters = input_schema
         self.mcp._tool_manager.add_tool(tool)  # noqa: SLF001
 
