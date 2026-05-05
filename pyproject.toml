@@ -76,7 +76,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S", "B"]   # tests legitimately do things bandit dislikes
+"tests/**" = [
+    "S",         # tests legitimately do things bandit dislikes
+    "B",         # tests legitimately raise things flake8-bugbear flags
+    "ASYNC240",  # sync pathlib in async tests is fine; not a real perf issue
+]
 
 [tool.mypy]
 python_version = "3.13"
