@@ -63,10 +63,10 @@ identities:
         technitium_dns_add_record: push-approve
     secrets:
       technitium:
-        path: secret/data/services/technitium/ironclaw
+        path: services/technitium/ironclaw
         field: api_token
       paperless:
-        path: secret/data/services/paperless/shared
+        path: services/paperless/shared
         field: api_token
 
   paperless-bot:
@@ -78,7 +78,7 @@ identities:
       defaults: auto-approve
     secrets:
       paperless:
-        path: secret/data/services/paperless/shared
+        path: services/paperless/shared
         field: api_token
 
   claude-code-dev:
@@ -95,8 +95,8 @@ identities:
         "technitium_dhcp_remove_*": push-approve
     secrets:
       technitium:
-        path: secret/data/services/technitium/claude-code-dev
+        path: services/technitium/claude-code-dev
         field: api_token
       paperless:
-        path: secret/data/services/paperless/shared
+        path: services/paperless/shared
         field: api_token
