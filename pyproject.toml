@@ -70,6 +70,7 @@ select = [
     "S",            # bandit (security)
     "ASYNC",        # async-correctness
     "RUF",          # ruff-specific
+    "SLF",          # private-member access (flagged in src/, ignored in tests)
 ]
 ignore = [
     "S101",         # asserts in tests are fine
@@ -80,6 +81,7 @@ ignore = [
     "S",         # tests legitimately do things bandit dislikes
     "B",         # tests legitimately raise things flake8-bugbear flags
     "ASYNC240",  # sync pathlib in async tests is fine; not a real perf issue
+    "SLF001",    # tests reach into private state for assertions
 ]
 
 [tool.mypy]
