@@ -265,7 +265,8 @@ async def test_hitl_push_approve_calls_approver(policy: Policy) -> None:
     assert req.tool == "technitium_dns_delete_record"
     assert req.mcp_name == "technitium"
     assert req.justification == "stale record from leftover test data"
-    # Justification must be stripped from args before forwarding upstream.
+    # ApprovalRequest.args excludes justification (notification body
+    # renders justification on its own line above the args block).
     assert "justification" not in req.args
 
 

@@ -202,12 +202,12 @@ class HITLMiddleware(Middleware):
             )
 
         if action == HITLAction.PUSH_APPROVE:
-            # Pull justification out of args. Required for push-approve;
-            # the registered tool schema includes it as a string property
-            # for any tool that could be HITL-gated, so a well-behaved
-            # agent always sends it. Strip from args before forwarding so
-            # the upstream MCP doesn't receive an unknown parameter.
-            justification_raw = args.pop("justification", None)
+            # Read justification from args without removing it — the
+            # FunctionTool's pydantic validator runs AFTER this middleware
+            # and will reject if it's missing from the args. The
+            # registered tool handler in server.py is what strips it
+            # before forwarding to the upstream MCP.
+            justification_raw = args.get("justification")
             justification = (
                 justification_raw.strip()
                 if isinstance(justification_raw, str)
@@ -222,22 +222,22 @@ class HITLMiddleware(Middleware):
                         f"argument explaining why this call should be approved",
                     )
                 )
-            # Mutate the message args so the downstream handler sees the
-            # cleaned dict (no ``justification`` leak to upstream MCP).
-            # CallToolRequestParams.arguments is a mutable dict in
-            # FastMCP; replacing it works in 2.14.x.
-            context.message.arguments = args  # type: ignore[union-attr]
 
             request_id = _ctx(context).get_state("request_id") or new_request_id()
             mcp_name = tool_name.split("_", 1)[0]
+            # Build the approval request with args MINUS justification so
+            # the notification body shows only the upstream tool's args
+            # (justification is its own field on ApprovalRequest, rendered
+            # as its own line above the args block).
+            args_for_approval = {k: v for k, v in args.items() if k != "justification"}
             req = ApprovalRequest(
                 request_id=request_id,
                 identity=identity,
                 mcp_name=mcp_name,
                 tool=tool_name,
                 justification=justification,
-                args=args,
-                args_summary=_args_summary(args),
+                args=args_for_approval,
+                args_summary=_args_summary(args_for_approval),
             )
             result = await self._approver.request_approval(req, timeout_s=120.0)
             _ctx(context).set_state("hitl_decision", str(result))
