@@ -95,11 +95,20 @@ def build_approver(
             jwt_path=bao_jwt_path,
             http_client=http_client,
         )
+        # Accept either ``topic_template`` (recommended; supports
+        # ``{identity}`` substitution per call) or ``topic`` (legacy
+        # static name, no substitution). At least one must be set.
+        topic_template = cfg.get("topic_template") or cfg.get("topic")
+        if not isinstance(topic_template, str) or not topic_template:
+            raise ValueError(
+                "approver.config: provide either topic_template "
+                "(e.g. 'mcp-hitl-{identity}') or topic (static)"
+            )
         return NtfyApprover(
             bao_client=bao,
             bao_role=bao_role,
             ntfy_server=_required_str(cfg, "server", "approver.config.server"),
-            ntfy_topic=_required_str(cfg, "topic", "approver.config.topic"),
+            topic_template=topic_template,
             publish_token_path=_required_str(
                 cfg, "publish_token_path", "approver.config.publish_token_path"
             ),

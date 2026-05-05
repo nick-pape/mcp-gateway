@@ -75,7 +75,7 @@ def approver(
         bao_client=bao,
         bao_role=BAO_ROLE,
         ntfy_server=NTFY_SERVER,
-        ntfy_topic="mcp-hitl-approvals",
+        topic_template="mcp-hitl-approvals",
         publish_token_path=publish_token_file,
         webhook_base_url=WEBHOOK_BASE,
         rate_limit_per_identity=5,
@@ -90,7 +90,9 @@ def _request(
     return ApprovalRequest(
         request_id="01HXY00000000000000000000",
         identity=identity,
+        mcp_name=tool.split("_", 1)[0],
         tool=tool,
+        justification="user explicitly asked to remove the stale record",
         args={"domain": "stale.pape.house"},
         args_summary="domain=stale.pape.house",
     )
@@ -124,7 +126,7 @@ def test_rejects_non_http_ntfy_server(jwt_file: Path, publish_token_file: Path) 
             bao_client=bao,
             bao_role=BAO_ROLE,
             ntfy_server="ftp://nope",
-            ntfy_topic="x",
+            topic_template="x",
             publish_token_path=publish_token_file,
             webhook_base_url=WEBHOOK_BASE,
         )
@@ -137,10 +139,75 @@ def test_rejects_non_http_webhook_base(jwt_file: Path, publish_token_file: Path)
             bao_client=bao,
             bao_role=BAO_ROLE,
             ntfy_server=NTFY_SERVER,
-            ntfy_topic="x",
+            topic_template="x",
             publish_token_path=publish_token_file,
             webhook_base_url="ftp://nope",
         )
+
+
+def test_rejects_unknown_template_placeholder(
+    jwt_file: Path, publish_token_file: Path
+) -> None:
+    bao = BaoClient(addr=BAO_ADDR, jwt_path=jwt_file)
+    with pytest.raises(ValueError, match="unsupported placeholder"):
+        NtfyApprover(
+            bao_client=bao,
+            bao_role=BAO_ROLE,
+            ntfy_server=NTFY_SERVER,
+            topic_template="mcp-{user}-hitl",  # {user} not recognized
+            publish_token_path=publish_token_file,
+            webhook_base_url=WEBHOOK_BASE,
+        )
+
+
+async def test_topic_template_substitutes_identity(
+    approver: NtfyApprover, fake_ntfy: FakeNtfy
+) -> None:
+    """A {identity} placeholder in topic_template resolves per-call."""
+    # Hot-swap to a templated topic — unit test scope, private attr is
+    # fine. Production paths set this at construction via factory.py.
+    approver._topic_template = "mcp-hitl-{identity}"  # noqa: SLF001
+
+    async def tap() -> None:
+        await asyncio.sleep(0.05)
+        nonce, _ack, approve_body, _rej = _last_publish_secrets(fake_ntfy)
+        await approver.handle_webhook(nonce=nonce, body=json.loads(approve_body))
+
+    # First call: identity=ironclaw → topic mcp-hitl-ironclaw
+    task = asyncio.create_task(tap())
+    decision = await approver.request_approval(_request(identity="ironclaw"), timeout_s=5.0)
+    await task
+    assert decision == ApprovalResult.APPROVED
+    assert fake_ntfy.publishes[-1]["topic"] == "mcp-hitl-ironclaw"
+
+    # Second call: identity=paperless-bot → topic mcp-hitl-paperless-bot
+    fake_ntfy.publishes.clear()
+    task2 = asyncio.create_task(tap())
+    await approver.request_approval(_request(identity="paperless-bot"), timeout_s=5.0)
+    await task2
+    assert fake_ntfy.publishes[-1]["topic"] == "mcp-hitl-paperless-bot"
+
+
+async def test_static_topic_no_placeholder_is_unchanged(
+    approver: NtfyApprover, fake_ntfy: FakeNtfy
+) -> None:
+    """A static topic_template (no {identity}) ignores the request identity."""
+    # The default fixture uses static "mcp-hitl-approvals" — no template.
+    async def tap() -> None:
+        await asyncio.sleep(0.05)
+        nonce, _ack, approve_body, _rej = _last_publish_secrets(fake_ntfy)
+        await approver.handle_webhook(nonce=nonce, body=json.loads(approve_body))
+
+    task = asyncio.create_task(tap())
+    await approver.request_approval(_request(identity="ironclaw"), timeout_s=5.0)
+    await task
+    assert fake_ntfy.publishes[-1]["topic"] == "mcp-hitl-approvals"
+
+    fake_ntfy.publishes.clear()
+    task2 = asyncio.create_task(tap())
+    await approver.request_approval(_request(identity="paperless-bot"), timeout_s=5.0)
+    await task2
+    assert fake_ntfy.publishes[-1]["topic"] == "mcp-hitl-approvals"
 
 
 # ---------------------------------------------------------------------------

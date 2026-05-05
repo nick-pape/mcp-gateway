@@ -82,7 +82,14 @@ class NtfyApprover:
         bao_client: BaoClient,
         bao_role: str,
         ntfy_server: str,
-        ntfy_topic: str,
+        # Topic to publish to. May contain ``{identity}`` as a
+        # placeholder — substituted per-call from
+        # ``ApprovalRequest.identity``. A static string (no placeholder)
+        # works too: every approval lands on the same topic.
+        # Recommended for multi-human deployments:
+        # ``"mcp-hitl-{identity}"`` so each human only subscribes to
+        # the identities they own.
+        topic_template: str,
         publish_token_path: str | Path,
         webhook_base_url: str,
         webhook_path: str = "/hitl/ack",
@@ -98,10 +105,22 @@ class NtfyApprover:
             raise ValueError(
                 f"webhook_base_url must be http(s)://, got {webhook_base_url!r}"
             )
+        # Validate the topic_template at construction so config errors
+        # surface at boot, not at first push. Reject empty placeholders
+        # like ``{}`` or unknown ones like ``{user}``.
+        try:
+            topic_template.format(identity="probe")
+        except (KeyError, IndexError) as exc:
+            raise ValueError(
+                f"topic_template {topic_template!r} contains an unsupported "
+                f"placeholder; only {{identity}} is recognized: {exc}"
+            ) from exc
+        if not topic_template:
+            raise ValueError("topic_template must be non-empty")
         self._bao = bao_client
         self._bao_role = bao_role
         self._ntfy_server = ntfy_server.rstrip("/")
-        self._ntfy_topic = ntfy_topic
+        self._topic_template = topic_template
         self._publish_token_path = Path(publish_token_path)
         self._webhook_url = f"{webhook_base_url.rstrip('/')}{webhook_path}"
         self._timeout_default_s = timeout_default_s
@@ -248,8 +267,12 @@ class NtfyApprover:
         )
         message = _format_notification_body(request)
 
+        # Resolve {identity} into the topic for this call. Static
+        # templates (no placeholder) format() unchanged; templates with
+        # {identity} get the per-request value.
+        topic = self._topic_template.format(identity=request.identity)
         payload: dict[str, Any] = {
-            "topic": self._ntfy_topic,
+            "topic": topic,
             "title": title,
             "message": message,
             "priority": 4,
