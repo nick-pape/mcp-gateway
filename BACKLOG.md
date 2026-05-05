@@ -93,6 +93,22 @@ skill to do this automatically when add-service-ct is invoked.
 
 ## Operational polish
 
+### LXC template for "Docker host with Portainer + OAuth"
+Setting up a fresh Docker-in-LXC + Portainer + Authentik OIDC takes
+~15 manual steps and three rounds of "oh right, that env var" (see
+`TRUSTED_ORIGINS` memory). Worth scripting:
+- Proxmox CT bring-up (already a skill: `add-service-ct`)
+- Docker install (community script today; could be a baked template)
+- Portainer recreate with the right env vars (`TRUSTED_ORIGINS`,
+  optionally the `PORTAINER_OAUTH_*` family for fully-env-driven setup)
+- Authentik provider+app create (mirroring this session's pattern)
+- Caddy block for the public canonical name
+
+Right output is a single skill `add-portainer-host <ct-id> <slug>`
+that does all of the above. Out of scope for the current MCP work but
+the pattern is now documented well enough across this repo + memory
+to extract cleanly.
+
 ### Phase 12 — CT hostname cleanup workload
 The original motivating task (set every CT's `/etc/hostname` to
 `<name>.service` to prevent the shadow-DNS bug). Now possible to drive

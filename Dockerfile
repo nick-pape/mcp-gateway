@@ -102,5 +102,5 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 
 EXPOSE 8443
 
-ENTRYPOINT ["/usr/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["python", "-m", "mcp_hub"]
