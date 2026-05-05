@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+#
+# mcp.pape.house — homelab MCP gateway
+#
+# Multi-stage build:
+#   1. technitium-build: clone the user's fork + npm build
+#   2. hub-build: uv-resolve deps + install hub package as a non-editable
+#      wheel into a venv that we can COPY wholesale into runtime
+#   3. runtime: python:3.13-slim + Node 22 + gosu, no caps in compose,
+#      hub runs as root inside the container but cap_drop: [ALL] +
+#      cap_add: [SETUID, SETGID] limits root to setuid (for spawning
+#      stdio children as distinct UIDs)
+#
+# IMPORTANT: per-identity stdio children spawn as UIDs 1001-1099 via
+# gosu. Those users are pre-created in the runtime stage so the hub
+# never needs useradd at runtime.
+
+# ============================================================================
+# Stage 1 — Technitium MCP (TypeScript -> dist/)
+# ============================================================================
+FROM node:22-alpine AS technitium-build
+
+ARG TECHNITIUM_REPO=https://github.com/nick-pape/technitium-mcp-secure.git
+ARG TECHNITIUM_REF=main
+
+WORKDIR /src
+RUN apk add --no-cache git
+RUN git clone --depth 1 --branch ${TECHNITIUM_REF} ${TECHNITIUM_REPO} /src \
+ && npm ci \
+ && npm run build
+
+
+# ============================================================================
+# Stage 2 — Hub Python package (uv-managed)
+# ============================================================================
+FROM python:3.13-slim AS hub-build
+
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never
+
+# uv as the dependency manager; same one we use locally
+RUN pip install --no-cache-dir uv==0.11.9
+
+WORKDIR /app
+
+# Copy lockfile + project metadata first for cache friendliness
+COPY pyproject.toml uv.lock README.md ./
+COPY src/ ./src/
+
+# `--no-editable` produces a regular install (no .pth), so the resulting
+# venv is portable to /app/.venv in the runtime stage.
+# `--no-dev` excludes pytest/ruff/mypy.
+# `--frozen` requires uv.lock to be in sync (errors otherwise).
+RUN uv sync --frozen --no-dev --no-editable
+
+
+# ============================================================================
+# Stage 3 — Runtime
+# ============================================================================
+FROM python:3.13-slim AS runtime
+
+# Tini reaps the stdio children Fanout spawns. gosu drops privileges to
+# the per-identity UIDs the policy assigns. nodejs runs the Technitium
+# (and any future Node-based) MCPs.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg gosu tini; \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -; \
+    apt-get install -y --no-install-recommends nodejs; \
+    rm -rf /var/lib/apt/lists/*
+
+# Pre-create UIDs 1001-1099 to match policy.example.yaml's uid_base
+# range. Each identity in policy.yaml gets a UID in this range
+# (uid_base + per-MCP uid_offset). The hub runs as root and uses
+# `gosu <uid>` to spawn each child; cap_drop:[ALL]+cap_add:[SETUID,
+# SETGID] in compose limits what root in this container can actually do.
+RUN set -eux; \
+    for i in $(seq 1001 1099); do \
+        useradd -u "$i" -M -s /usr/sbin/nologin "mcp$i"; \
+    done
+
+# Hub Python venv — full /app/.venv copy from hub-build stage.
+COPY --from=hub-build /app/.venv /app/.venv
+
+# Technitium MCP build output. Future MCPs land at /app/mcps/<name>/...
+RUN mkdir -p /app/mcps/technitium
+COPY --from=technitium-build /src/dist /app/mcps/technitium/dist
+COPY --from=technitium-build /src/node_modules /app/mcps/technitium/node_modules
+
+# Entrypoint
+COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Runtime env
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MCP_HUB_CONFIG=/etc/mcp-pape-house/policy.yaml \
+    MCP_HUB_RUNTIME_DIR=/run/mcp-tokens
+
+EXPOSE 8443
+
+ENTRYPOINT ["/usr/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["python", "-m", "mcp_hub"]

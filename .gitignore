@@ -25,3 +25,5 @@ Thumbs.db
 *.pem
 *.key
 fanout_jwt
+ntfy_publish_token
+policy.yaml

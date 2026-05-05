@@ -1,0 +1,102 @@
+# mcp.pape.house — single-container MCP gateway
+#
+# Single source of truth. Portainer pulls this from GitHub; do NOT edit
+# in the UI. Matches the docker.service.pape.house convention.
+#
+# ============================================================
+# HOST BOOTSTRAP — required once on the LXC, do NOT skip
+# ============================================================
+# Before first deploy, the LXC must have:
+#
+#   1. /etc/mcp-pape-house/policy.yaml — copied from policy.example.yaml,
+#      then filled in (Authentik issuer URL, identity audiences, secret
+#      paths). Bind-mounted read-only into the container.
+#
+#   2. /etc/mcp-pape-house/fanout_jwt — long-lived JWT identifying the
+#      hub to bao (used to log in and mint per-identity ephemeral
+#      tokens). Mounted as a docker secret. Generate by registering an
+#      Authentik OAuth client for "mcp-fanout-svc" and saving its
+#      machine token. See README § Authentik setup.
+#
+#   3. /etc/mcp-pape-house/ntfy_publish_token — bearer token for
+#      publishing to the ntfy HITL topic. Mounted as a docker secret.
+#
+# Mode 0400, owned by root. Only root reads them; the entrypoint
+# verifies they exist when the policy references them.
+# ============================================================
+
+name: mcp-pape-house
+
+services:
+  mcp-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Pin / override the Technitium MCP source from CI by passing
+        # --build-arg on the build invocation.
+        TECHNITIUM_REPO: https://github.com/nick-pape/technitium-mcp-secure.git
+        TECHNITIUM_REF: main
+    container_name: mcp-hub
+    restart: unless-stopped
+
+    # Bind to docker bridge only; Caddy on the LXC host fronts 8443.
+    # See architecture.md § "Hub binds to docker-network only".
+    ports:
+      - "8443:8443"
+
+    # Capability minimization: drop everything, add only what's
+    # required to spawn stdio children as distinct UIDs via gosu.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+
+    # Per-identity token files live on a tmpfs. Mode 0700 limits to
+    # root inside the container; each token file is then chown'd to
+    # its child's UID with mode 0400 by Fanout._write_secret_file.
+    tmpfs:
+      - /run/mcp-tokens:size=16m,mode=0700
+
+    # Read-only policy file from the LXC host. Edit + restart container
+    # to apply changes (live reload deferred to v2).
+    volumes:
+      - /etc/mcp-pape-house/policy.yaml:/etc/mcp-pape-house/policy.yaml:ro
+
+    # Docker secrets land at /run/secrets/<name> automatically.
+    secrets:
+      - fanout_jwt
+      - ntfy_publish_token
+
+    # Healthcheck via /health (no auth required — see __main__.py).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8443/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+
+    # Useful for forensics; bounded so logs don't fill the volume.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+# ============================================================
+# Secrets — file-backed, mode 0400 on the host
+# ============================================================
+secrets:
+  fanout_jwt:
+    file: /etc/mcp-pape-house/fanout_jwt
+  ntfy_publish_token:
+    file: /etc/mcp-pape-house/ntfy_publish_token
