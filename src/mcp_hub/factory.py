@@ -18,15 +18,24 @@ in ``mcp_hub.refresher.builtins``.
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import httpx
+
+from mcp_fanout import Fanout, HttpFanout, IdentityConfig
 
 from .approvers.auto import AutoApprover
 from .approvers.ntfy import NtfyApprover
 from .approvers.reject import RejectApprover
+from .auth_strategies import (
+    DEFAULT_BAO_CACHE_TTL_S,
+    AuthStrategy,
+    BaoBackedBearer,
+    JwtPassthrough,
+)
 from .bao_client import BaoClient
-from .interfaces import Approver, SecretBackend
-from .policy import HubConfig
+from .interfaces import Approver, SecretBackend, SecretRef
+from .policy import AuthStrategyConfig, HubConfig, IdentityPolicy, MCPConfig
 from .refresher import (
     RefresherManager,
     TokenRefresher,
@@ -128,6 +137,168 @@ def _required_str(d: dict[str, object], key: str, label: str) -> str:
     if not isinstance(v, str) or not v:
         raise ValueError(f"missing or non-string config value: {label}")
     return v
+
+
+# ---------------------------------------------------------------------------
+# Auth strategies (HTTP fanout)
+# ---------------------------------------------------------------------------
+
+
+def build_auth_strategy(
+    *,
+    mcp_name: str,
+    config: AuthStrategyConfig,
+    secret_backend: SecretBackend,
+) -> AuthStrategy:
+    """Construct an :class:`AuthStrategy` from a policy config block.
+
+    Dispatches on ``config.type``. Adding a new strategy: extend this
+    function and document the new ``type`` in ``policy.example.yaml``.
+    """
+    cfg = config.config
+    if config.type == "bao_backed_bearer":
+        path_template = _required_str(
+            cfg, "path_template", f"mcps.{mcp_name}.auth.config.path_template"
+        )
+        # field defaults to api_token to match the bao convention used
+        # elsewhere in the homelab; explicit override allowed.
+        field = cfg.get("field", "api_token")
+        if not isinstance(field, str) or not field:
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config.field must be a non-empty string"
+            )
+        cache_ttl_raw = cfg.get("cache_ttl_s", DEFAULT_BAO_CACHE_TTL_S)
+        try:
+            cache_ttl_s = float(cache_ttl_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config.cache_ttl_s must be a number"
+            ) from exc
+        return BaoBackedBearer(
+            secret_backend=secret_backend,
+            mcp_name=mcp_name,
+            path_template=path_template,
+            field=field,
+            cache_ttl_s=cache_ttl_s,
+        )
+    if config.type == "jwt_passthrough":
+        if cfg:
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config: jwt_passthrough takes no config"
+            )
+        return JwtPassthrough()
+    raise ValueError(
+        f"mcps.{mcp_name}.auth.type: unknown strategy {config.type!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fanout dispatch
+# ---------------------------------------------------------------------------
+
+
+def _identities_for_http_mcp(
+    mcp_name: str,
+    identities: dict[str, IdentityPolicy],
+) -> list[str]:
+    """Identities allowed to call any tool of an HTTP MCP.
+
+    HTTP MCPs don't need a per-identity ``secrets:`` entry (the auth
+    strategy's path_template handles that). Membership is therefore
+    derived from ``allowed_tools`` globs whose prefix matches the MCP
+    name. An identity with ``allowed_tools: ["outline_*"]`` is
+    registered with the ``outline`` HttpFanout.
+
+    We use prefix-match-on-glob (split on first ``_``) consistent with
+    :meth:`Policy.mcp_name_for_tool`. Wildcard-only globs like ``"*"``
+    register the identity for every HTTP MCP, matching the stdio
+    semantics where ``allowed_tools: ["*"]`` plus a ``secrets`` entry
+    grants access to every MCP listed in secrets.
+    """
+    out: list[str] = []
+    for name, ident in identities.items():
+        for glob in ident.allowed_tools:
+            prefix = glob.split("_", 1)[0]
+            if prefix == mcp_name or prefix == "*":
+                out.append(name)
+                break
+    return out
+
+
+def build_fanout(
+    mcp_name: str,
+    mcp_config: MCPConfig,
+    *,
+    identities: dict[str, IdentityPolicy],
+    secret_backend: SecretBackend,
+    runtime_dir: Path,
+    http_client: httpx.AsyncClient | None = None,
+) -> Fanout | HttpFanout:
+    """Dispatch to the right Fanout impl based on ``mcp_config.transport``.
+
+    For ``stdio``: builds the per-identity :class:`IdentityConfig` list
+    from each identity's ``secrets[mcp_name]`` entry, exactly as the
+    pre-HTTP server.py did.
+
+    For ``http``: builds an :class:`HttpFanout` with the strategy from
+    ``mcp_config.auth``. Identities are derived from ``allowed_tools``
+    globs (no per-MCP secret entry required for HTTP).
+    """
+    if mcp_config.transport == "stdio":
+        # Mypy: model_validator guaranteed these are non-None for stdio.
+        assert mcp_config.command is not None
+        assert mcp_config.secret_env_name is not None
+        stdio_identities: list[IdentityConfig] = []
+        for identity_name, identity_policy in identities.items():
+            secret_model = identity_policy.secrets.get(mcp_name)
+            if secret_model is None:
+                continue
+            ref = SecretRef(path=secret_model.path, field=secret_model.field)
+            uid = identity_policy.uid_base + mcp_config.uid_offset
+            stdio_identities.append(
+                IdentityConfig(
+                    identity=identity_name,
+                    uid=uid,
+                    ref=ref,
+                    secret_env_name=mcp_config.secret_env_name,
+                )
+            )
+        if not stdio_identities:
+            raise ValueError(
+                f"MCP {mcp_name!r} (stdio) is configured but no identity has "
+                f"a secret entry for it"
+            )
+        return Fanout(
+            mcp_name=mcp_name,
+            command=list(mcp_config.command),
+            identities=stdio_identities,
+            secret_backend=secret_backend,
+            runtime_dir=runtime_dir,
+            extra_env=mcp_config.extra_env,
+        )
+
+    # http transport
+    assert mcp_config.url is not None
+    assert mcp_config.auth is not None
+    http_identities = _identities_for_http_mcp(mcp_name, identities)
+    if not http_identities:
+        raise ValueError(
+            f"MCP {mcp_name!r} (http) is configured but no identity's "
+            f"allowed_tools globs cover it (no glob with prefix "
+            f"{mcp_name!r} or '*')"
+        )
+    strategy = build_auth_strategy(
+        mcp_name=mcp_name,
+        config=mcp_config.auth,
+        secret_backend=secret_backend,
+    )
+    return HttpFanout(
+        mcp_name=mcp_name,
+        url=mcp_config.url,
+        auth_strategy=strategy,
+        identities=http_identities,
+        http_client=http_client,
+    )
 
 
 # ---------------------------------------------------------------------------

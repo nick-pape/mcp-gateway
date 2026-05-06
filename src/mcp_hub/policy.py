@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class PolicyError(Exception):
@@ -107,12 +107,111 @@ class SecretRefModel(BaseModel):
     field: str
 
 
-class MCPConfig(BaseModel):
+class AuthStrategyConfig(BaseModel):
+    """Discriminated config for an HTTP MCP's auth strategy.
+
+    The ``type`` field selects which :mod:`mcp_hub.auth_strategies`
+    impl the factory builds. ``config`` is passed to that impl as
+    ``**kwargs``-shaped values (the factory adapts them).
+
+    Built-in types:
+
+    - ``bao_backed_bearer`` — config: ``path_template`` (str, required;
+      e.g. ``"services/outline/{identity}"``), ``field`` (str, default
+      ``"api_token"``), ``cache_ttl_s`` (float, default 30).
+    - ``jwt_passthrough`` — config: empty.
+    """
+
     model_config = ConfigDict(extra="forbid")
-    command: list[str] = Field(min_length=1)
-    secret_env_name: str
+    type: str
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPConfig(BaseModel):
+    """One backend MCP entry.
+
+    Two transports are supported, selected by ``transport``:
+
+    - ``stdio`` (default): the historical pattern. Spawns subprocesses
+      via :class:`mcp_fanout.Fanout`. Requires ``command`` and
+      ``secret_env_name``.
+    - ``http``: federates an external Streamable-HTTP MCP via
+      :class:`mcp_fanout.HttpFanout`. Requires ``url`` and ``auth``.
+
+    Field-presence is validated post-hoc (a single config can't satisfy
+    both transports' requirements without listing fields irrelevant to
+    one) — see :meth:`_check_transport_fields`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    transport: Literal["stdio", "http"] = "stdio"
+
+    # stdio fields (required when transport == "stdio")
+    command: list[str] | None = Field(default=None)
+    secret_env_name: str | None = None
     uid_offset: int = 0
     extra_env: dict[str, str] = Field(default_factory=dict)
+
+    # http fields (required when transport == "http")
+    url: str | None = None
+    auth: AuthStrategyConfig | None = None
+
+    @field_validator("command")
+    @classmethod
+    def _check_command_nonempty_when_set(
+        cls, v: list[str] | None
+    ) -> list[str] | None:
+        if v is not None and len(v) == 0:
+            raise ValueError("command must be non-empty when set")
+        return v
+
+    @model_validator(mode="after")
+    def _check_transport_fields(self) -> MCPConfig:
+        if self.transport == "stdio":
+            missing: list[str] = []
+            if not self.command:
+                missing.append("command")
+            if not self.secret_env_name:
+                missing.append("secret_env_name")
+            if missing:
+                raise ValueError(
+                    f"transport=stdio requires fields: {missing}"
+                )
+            # http-only fields must NOT be set on a stdio entry
+            for forbidden in ("url", "auth"):
+                if getattr(self, forbidden) is not None:
+                    raise ValueError(
+                        f"transport=stdio: field {forbidden!r} is http-only"
+                    )
+        else:  # transport == "http"
+            missing_http: list[str] = []
+            if self.url is None or not self.url:
+                missing_http.append("url")
+            if self.auth is None:
+                missing_http.append("auth")
+            if missing_http:
+                raise ValueError(
+                    f"transport=http requires fields: {missing_http}"
+                )
+            # stdio-only fields must NOT be set on an http entry
+            if self.command is not None:
+                raise ValueError("transport=http: field 'command' is stdio-only")
+            if self.secret_env_name is not None:
+                raise ValueError(
+                    "transport=http: field 'secret_env_name' is stdio-only"
+                )
+            if self.uid_offset != 0:
+                raise ValueError("transport=http: field 'uid_offset' is stdio-only")
+            if self.extra_env:
+                raise ValueError("transport=http: field 'extra_env' is stdio-only")
+            # url is non-None per the missing-list check above; reassert
+            # for the type checker.
+            assert self.url is not None
+            if not self.url.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"transport=http: url must be http(s)://, got {self.url!r}"
+                )
+        return self
 
 
 class HITLPolicy(BaseModel):

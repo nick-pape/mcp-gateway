@@ -110,6 +110,11 @@ class IdentityMiddleware(Middleware):
 
         _ctx(context).set_state("identity", identity.name)
         _ctx(context).set_state("request_id", new_request_id())
+        # Stash the validated bearer token for HTTP-fanout auth strategies
+        # that need to forward it (e.g., JwtPassthrough). Stdio fanouts
+        # never read this; the cost of always setting it is negligible.
+        # The key matches mcp_hub.auth_strategies.CTX_KEY_BEARER_TOKEN.
+        _ctx(context).set_state("bearer_token", token)
         return await call_next(context)
 
 

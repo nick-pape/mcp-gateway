@@ -1,16 +1,25 @@
-"""Multi-tenant stdio MCP multiplexer.
+"""Multi-tenant MCP multiplexers.
 
-Spawns N stdio child processes per MCP type — one per identity — and
-routes incoming JSON-RPC requests to the correct child by identity tag.
-Designed for eventual standalone OSS publication; until then, lives
-alongside the hub that imports it.
+The package exposes two fanout implementations sharing one external
+shape:
+
+- :class:`Fanout` (stdio) — spawns N stdio child subprocesses, one per
+  identity, each running as a distinct UID with a per-identity 0400
+  token file. The historical (and only, until V2) backend.
+- :class:`HttpFanout` (HTTP) — forwards JSON-RPC over HTTP to a
+  federated upstream MCP, injecting per-identity auth headers via a
+  pluggable :class:`mcp_hub.auth_strategies.AuthStrategy`.
+
+Both expose ``mcp_name``, ``identities``, ``start_eager_or_die``,
+``call``, and ``close``. Server.py duck-types them.
 
 Public API::
 
-    from mcp_fanout import Fanout, IdentityConfig
+    from mcp_fanout import Fanout, HttpFanout, IdentityConfig
     from mcp_fanout.exceptions import (
         BackendChildDead,
         ChildSpawnFailed,
+        HttpUpstreamFailed,
         IdentityNotFound,
     )
 """
@@ -21,6 +30,7 @@ from .exceptions import (
     BackendChildDead,
     ChildSpawnFailed,
     FanoutError,
+    HttpUpstreamFailed,
     IdentityNotFound,
 )
 from .fanout import (
@@ -28,13 +38,20 @@ from .fanout import (
     Fanout,
     IdentityConfig,
 )
+from .http_fanout import (
+    DEFAULT_REQUEST_TIMEOUT_S,
+    HttpFanout,
+)
 
 __all__ = [
     "DEFAULT_MAX_RESPONSE_BYTES",
+    "DEFAULT_REQUEST_TIMEOUT_S",
     "BackendChildDead",
     "ChildSpawnFailed",
     "Fanout",
     "FanoutError",
+    "HttpFanout",
+    "HttpUpstreamFailed",
     "IdentityConfig",
     "IdentityNotFound",
 ]

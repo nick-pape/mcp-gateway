@@ -30,3 +30,16 @@ class BackendChildDead(FanoutError):
     - Child wrote invalid JSON to stdout
     - Stream closed mid-read
     """
+
+
+class HttpUpstreamFailed(FanoutError):
+    """Raised when an HTTP MCP upstream cannot be reached or responds badly.
+
+    The HTTP analogue of :class:`BackendChildDead`: surfaces network
+    errors, non-2xx responses, oversized bodies, and unparseable JSON
+    from a Streamable-HTTP MCP federated by :class:`HttpFanout`.
+
+    Distinct from BackendChildDead so server.py can map both to the
+    same ``BACKEND_*`` MCP error codes while keeping the error
+    taxonomy honest about the failure mode.
+    """

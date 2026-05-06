@@ -36,12 +36,14 @@ from typing import Any
 from fastmcp import FastMCP
 from mcp.types import TextContent
 
-from mcp_fanout import Fanout, IdentityConfig
+from mcp_fanout import Fanout, HttpFanout
 
 from .audit import Audit
 from .auth import AuthentikJWTValidator
+from .auth_strategies import CTX_KEY_BEARER_TOKEN
 from .errors import ErrorCode
-from .interfaces import Approver, SecretBackend, SecretRef
+from .factory import build_fanout
+from .interfaces import Approver, SecretBackend
 from .middleware import (
     AuditMiddleware,
     HITLMiddleware,
@@ -51,6 +53,12 @@ from .middleware import (
 from .policy import Policy
 
 logger = logging.getLogger(__name__)
+
+
+# Both fanouts implement this duck-typed interface (mcp_name,
+# identities, start_eager_or_die, call, close). server.py treats them
+# uniformly via this union.
+FanoutLike = Fanout | HttpFanout
 
 
 class Hub:
@@ -72,7 +80,7 @@ class Hub:
         self._validator = validator
         self._audit = audit
         self._runtime_dir = runtime_dir
-        self._fanouts: dict[str, Fanout] = {}
+        self._fanouts: dict[str, FanoutLike] = {}
         # FastMCP app — middleware installed at __init__ so tests can drive
         # it before start() is called.
         self.mcp = FastMCP(
@@ -87,7 +95,7 @@ class Hub:
         return self._approver
 
     @property
-    def fanouts(self) -> Mapping[str, Fanout]:
+    def fanouts(self) -> Mapping[str, FanoutLike]:
         return self._fanouts
 
     # -----------------------------------------------------------------------
@@ -99,9 +107,17 @@ class Hub:
 
         Failure during any fanout's start aborts the whole hub.
         """
-        # 1. Build all fanouts — one per MCP defined in policy.
+        # 1. Build all fanouts — one per MCP defined in policy. The
+        #    factory dispatches to stdio Fanout vs HttpFanout based on
+        #    each MCP's transport setting.
         for mcp_name, mcp_config in self._policy.config.mcps.items():
-            self._fanouts[mcp_name] = self._build_fanout(mcp_name, mcp_config)
+            self._fanouts[mcp_name] = build_fanout(
+                mcp_name,
+                mcp_config,
+                identities=self._policy.config.identities,
+                secret_backend=self._secret_backend,
+                runtime_dir=self._runtime_dir,
+            )
         # 2. Eager-spawn each in turn. If any fails, close already-started
         #    ones before re-raising.
         try:
@@ -150,39 +166,6 @@ class Hub:
         )
         self.mcp.add_middleware(AuditMiddleware(self._audit, self._policy))
 
-    def _build_fanout(self, mcp_name: str, mcp_config: Any) -> Fanout:
-        """Instantiate a Fanout for one backend MCP from policy config."""
-        identities: list[IdentityConfig] = []
-        for identity_name, identity_policy in self._policy.config.identities.items():
-            secret_model = identity_policy.secrets.get(mcp_name)
-            if secret_model is None:
-                # This identity isn't authorized for this MCP. Skip — no
-                # child spawned, no token consumed.
-                continue
-            ref = SecretRef(path=secret_model.path, field=secret_model.field)
-            uid = identity_policy.uid_base + mcp_config.uid_offset
-            identities.append(
-                IdentityConfig(
-                    identity=identity_name,
-                    uid=uid,
-                    ref=ref,
-                    secret_env_name=mcp_config.secret_env_name,
-                )
-            )
-        if not identities:
-            raise ValueError(
-                f"MCP {mcp_name!r} is configured but no identity has a "
-                f"secret entry for it"
-            )
-        return Fanout(
-            mcp_name=mcp_name,
-            command=list(mcp_config.command),
-            identities=identities,
-            secret_backend=self._secret_backend,
-            runtime_dir=self._runtime_dir,
-            extra_env=mcp_config.extra_env,
-        )
-
     async def _register_all_tools(self) -> None:
         """Discover and register tools from each running fanout.
 
@@ -193,20 +176,22 @@ class Hub:
         """
         for mcp_name, fanout in self._fanouts.items():
             sample_identity = next(iter(fanout.identities))
-            list_response = await fanout.call(
+            list_response = await _fanout_call(
+                fanout,
                 identity=sample_identity,
                 request={
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "tools/list",
                 },
+                request_context={},
             )
             upstream_tools = list_response.get("result", {}).get("tools", [])
             for tool_def in upstream_tools:
                 self._register_one_tool(mcp_name, fanout, tool_def)
 
     def _register_one_tool(
-        self, mcp_name: str, fanout: Fanout, tool_def: dict[str, Any]
+        self, mcp_name: str, fanout: FanoutLike, tool_def: dict[str, Any]
     ) -> None:
         """Register one upstream tool with FastMCP under prefix.
 
@@ -267,7 +252,14 @@ class Hub:
             # the middleware mutation. Justification is hub-only metadata
             # and the upstream MCP would reject it as an unknown parameter.
             arguments.pop("justification", None)
-            response = await fanout.call(
+            # Build request_context for HTTP-fanout auth strategies.
+            # Only HttpFanout reads it; stdio Fanout ignores the kwarg.
+            bearer_token = ctx.get_state(CTX_KEY_BEARER_TOKEN)
+            request_context: dict[str, Any] = {}
+            if isinstance(bearer_token, str):
+                request_context[CTX_KEY_BEARER_TOKEN] = bearer_token
+            response = await _fanout_call(
+                fanout,
                 identity=identity,
                 request={
                     "jsonrpc": "2.0",
@@ -275,6 +267,7 @@ class Hub:
                     "method": "tools/call",
                     "params": {"name": upstream_name, "arguments": arguments},
                 },
+                request_context=request_context,
             )
             if "error" in response:
                 err = response["error"]
@@ -327,6 +320,33 @@ class Hub:
         # actual tool schema so the LLM sees correct field names/types.
         tool.parameters = input_schema
         self.mcp._tool_manager.add_tool(tool)  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# Generic fanout-call shim
+# ---------------------------------------------------------------------------
+
+
+async def _fanout_call(
+    fanout: FanoutLike,
+    *,
+    identity: str,
+    request: dict[str, Any],
+    request_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Dispatch ``call`` across either Fanout impl.
+
+    Stdio :class:`Fanout.call` doesn't take ``request_context``; HTTP
+    :class:`HttpFanout.call` does. We isolate the type-narrow here so
+    every other call site stays uniform.
+    """
+    if isinstance(fanout, HttpFanout):
+        return await fanout.call(
+            identity=identity,
+            request=request,
+            request_context=request_context,
+        )
+    return await fanout.call(identity=identity, request=request)
 
 
 # ---------------------------------------------------------------------------
