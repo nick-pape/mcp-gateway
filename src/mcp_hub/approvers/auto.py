@@ -15,7 +15,7 @@ gate at all.
 
 from __future__ import annotations
 
-from mcp_hub.interfaces import ApprovalRequest, ApprovalResult
+from mcp_hub.interfaces import ApprovalRequest, ApprovalResult, CallOutcome
 
 
 class AutoApprover:
@@ -29,6 +29,18 @@ class AutoApprover:
         timeout_s: float,
     ) -> ApprovalResult:
         return ApprovalResult.APPROVED
+
+    async def publish_outcome(
+        self,
+        request: ApprovalRequest,
+        outcome: CallOutcome,
+        *,
+        result_snippet: str | None,
+        wait_ms: int,
+        execution_ms: int | None,
+    ) -> None:
+        # No human to notify; receipts are a NtfyApprover concept.
+        return None
 
     async def close(self) -> None:
         return None

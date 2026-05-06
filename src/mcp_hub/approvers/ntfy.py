@@ -51,7 +51,7 @@ from typing import Any
 import httpx
 
 from mcp_hub.bao_client import BaoClient, BaoError, compare_digest
-from mcp_hub.interfaces import ApprovalRequest, ApprovalResult
+from mcp_hub.interfaces import ApprovalRequest, ApprovalResult, CallOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,69 @@ class NtfyApprover:
     async def close(self) -> None:
         if self._owns_client:
             await self._http.aclose()
+
+    # -----------------------------------------------------------------------
+    # Outcome receipt (fire-and-forget after a push-approve resolves)
+    # -----------------------------------------------------------------------
+
+    async def publish_outcome(
+        self,
+        request: ApprovalRequest,
+        outcome: CallOutcome,
+        *,
+        result_snippet: str | None,
+        wait_ms: int,
+        execution_ms: int | None,
+    ) -> None:
+        """Send a follow-up "receipt" notification to the operator.
+
+        Different visual cue than the prompt notifications: lower
+        priority (informational, not urgent), no action buttons,
+        outcome-specific tag/icon. Pairs with the original push so the
+        operator gets explicit feedback that their tap took effect (or
+        the system timed out, etc.).
+        """
+        try:
+            publish_token = self._publish_token_path.read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError as exc:
+            logger.warning(
+                "ntfy approver: cannot read publish token for receipt: %s; "
+                "skipping receipt for tool=%s",
+                exc, request.tool,
+            )
+            return
+
+        topic = self._topic_template.format(identity=request.identity)
+        title = _format_receipt_title(request, outcome)
+        message = _format_receipt_body(
+            request, outcome, result_snippet, wait_ms, execution_ms
+        )
+        payload: dict[str, Any] = {
+            "topic": topic,
+            "title": title,
+            "message": message,
+            # Lower priority than the prompt (4) — receipts are
+            # informational, the user already chose / was timed out.
+            "priority": 2,
+            "tags": [_RECEIPT_TAGS[outcome]],
+            # Deliberately no actions — receipts are read-only.
+        }
+        try:
+            response = await self._http.post(
+                self._ntfy_server,
+                json=payload,
+                headers={"Authorization": f"Bearer {publish_token}"},
+            )
+            response.raise_for_status()
+        except Exception:
+            # MUST NOT raise — log and swallow per the Approver protocol.
+            logger.exception(
+                "ntfy approver: receipt publish failed for "
+                "tool=%s outcome=%s; agent response NOT affected",
+                request.tool, outcome,
+            )
 
     # -----------------------------------------------------------------------
     # Approval flow (called by the hub for each push-approve tool call)
@@ -349,8 +412,12 @@ class NtfyApprover:
             bao_token = await self._bao.jwt_login(role=self._bao_role)
             stored = await self._bao.kv_read(token=bao_token, path=bao_path)
         except BaoError as exc:
+            # Most common cause: stale ack — TTL expired or already
+            # consumed (e.g., user double-tapped the notification).
+            # Per the no-oracle property, we still return 200 regardless.
             logger.info(
-                "ntfy webhook: bao read failed for nonce=%s (%s); ignoring",
+                "ntfy webhook: stale ack ignored for nonce=%s "
+                "(already consumed or expired): %s",
                 _redact(nonce),
                 exc,
             )
@@ -464,3 +531,81 @@ def _short_value(v: object, max_len: int) -> str:
     if len(s) > max_len:
         s = s[: max_len - 1] + "…"
     return s
+
+
+# ---------------------------------------------------------------------------
+# Receipt formatters
+# ---------------------------------------------------------------------------
+
+
+# ntfy emoji tags per outcome — render as a small icon on the
+# notification, distinct from the prompt notification's lack of tags.
+_RECEIPT_TAGS = {
+    CallOutcome.APPROVED_SUCCESS: "white_check_mark",
+    CallOutcome.APPROVED_ERROR: "warning",
+    CallOutcome.REJECTED: "x",
+    CallOutcome.TIMEOUT: "alarm_clock",
+}
+
+_RECEIPT_LABELS = {
+    CallOutcome.APPROVED_SUCCESS: "Approved",
+    CallOutcome.APPROVED_ERROR: "Approved (errored)",
+    CallOutcome.REJECTED: "Rejected",
+    CallOutcome.TIMEOUT: "Timed out",
+}
+
+_RECEIPT_ICONS = {
+    CallOutcome.APPROVED_SUCCESS: "✓",
+    CallOutcome.APPROVED_ERROR: "⚠",
+    CallOutcome.REJECTED: "✗",
+    CallOutcome.TIMEOUT: "⏱",
+}
+
+
+def _format_receipt_title(request: ApprovalRequest, outcome: CallOutcome) -> str:
+    icon = _RECEIPT_ICONS[outcome]
+    label = _RECEIPT_LABELS[outcome]
+    unprefixed = request.tool.removeprefix(f"{request.mcp_name}_")
+    return f"{icon} {label} · {request.mcp_name} {unprefixed}"
+
+
+def _format_receipt_body(
+    request: ApprovalRequest,
+    outcome: CallOutcome,
+    result_snippet: str | None,
+    wait_ms: int,
+    execution_ms: int | None,
+    *,
+    max_snippet_len: int = 280,
+) -> str:
+    """Receipt body — short, scannable, plain text (no markdown)."""
+    parts: list[str] = []
+
+    if outcome == CallOutcome.APPROVED_SUCCESS and result_snippet:
+        snippet = result_snippet
+        if len(snippet) > max_snippet_len:
+            snippet = snippet[: max_snippet_len - 1] + "…"
+        parts.append(snippet)
+    elif outcome == CallOutcome.APPROVED_ERROR and result_snippet:
+        snippet = result_snippet
+        if len(snippet) > max_snippet_len:
+            snippet = snippet[: max_snippet_len - 1] + "…"
+        parts.append(f"Error: {snippet}")
+    elif outcome == CallOutcome.TIMEOUT and request.justification:
+        parts.append(f"Justification was: {request.justification[:200]}")
+
+    # Timing line — always present, last
+    if parts:
+        parts.append("")
+    if outcome in (CallOutcome.APPROVED_SUCCESS, CallOutcome.APPROVED_ERROR):
+        wait_s = wait_ms / 1000
+        exec_part = (
+            f"{execution_ms}ms exec" if execution_ms is not None else "exec ?"
+        )
+        parts.append(f"Took {wait_s:.0f}s waiting + {exec_part}")
+    elif outcome == CallOutcome.REJECTED:
+        parts.append(f"Rejected after {wait_ms / 1000:.0f}s")
+    elif outcome == CallOutcome.TIMEOUT:
+        parts.append(f"Timed out after {wait_ms / 1000:.0f}s")
+
+    return "\n".join(parts) if parts else "(no details)"

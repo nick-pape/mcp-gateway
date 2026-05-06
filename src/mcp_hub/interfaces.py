@@ -126,6 +126,20 @@ class ApprovalResult(StrEnum):
     TIMEOUT = "timeout"
 
 
+class CallOutcome(StrEnum):
+    """Final outcome of a HITL-gated call, used for receipt notifications.
+
+    Distinguishes "approved + tool succeeded" from "approved + tool errored"
+    because the human reviewer wants to know whether the work they
+    authorized actually completed cleanly.
+    """
+
+    APPROVED_SUCCESS = "approved-success"
+    APPROVED_ERROR = "approved-error"
+    REJECTED = "rejected"
+    TIMEOUT = "timeout"
+
+
 @runtime_checkable
 class Approver(Protocol):
     """Decides approval for HITL-gated tool calls.
@@ -147,6 +161,35 @@ class Approver(Protocol):
         Must always return one of :class:`ApprovalResult`'s values; never
         raise to the caller. Internal errors map to ``REJECTED`` to fail
         closed.
+        """
+        ...
+
+    async def publish_outcome(
+        self,
+        request: ApprovalRequest,
+        outcome: CallOutcome,
+        *,
+        result_snippet: str | None,
+        wait_ms: int,
+        execution_ms: int | None,
+    ) -> None:
+        """Send a receipt to the operator after the call resolves.
+
+        Called by HITLMiddleware after a push-approve outcome lands —
+        for every terminal state (approved+success, approved+error,
+        rejected, timeout). Implementations that don't notify a human
+        (AutoApprover, RejectApprover) should no-op.
+
+        - ``result_snippet`` — for APPROVED_SUCCESS, a short rendering
+          of the tool's response (truncated by middleware). For
+          APPROVED_ERROR, the error message. ``None`` for REJECTED
+          and TIMEOUT.
+        - ``wait_ms`` — time between publish and human action / timeout.
+        - ``execution_ms`` — only set for APPROVED_* outcomes; how long
+          the upstream tool took to run.
+
+        MUST NOT raise — internal errors should be logged and swallowed
+        so a notification failure doesn't break the agent's response.
         """
         ...
 

@@ -43,6 +43,36 @@ Current notification: `[claude-code-dev] technitium_dns_health_check?`
 Pairs naturally with the per-identity topic change — both touch
 NtfyApprover._publish.
 
+### HITL: closure feedback to phone after approval
+Today: user taps Approve, agent gets result, phone shows... nothing
+new. User has no signal that their tap actually took, so they
+double-tap or context-switch to Claude Code to verify. Caught when
+nick double-tapped a real test (replay-protection caught it cleanly,
+but the trigger was a UX gap).
+
+Fix options (start with #1):
+
+1. **Confirmation push.** After NtfyApprover returns APPROVED to the
+   middleware AND the result returns from the upstream MCP, fire a
+   second ntfy publish to the same topic: title `✓ approved`, body
+   echoing the tool name + identity + a short "result delivered to
+   agent" sentence. Cheap; no client-side change needed.
+
+2. **Message update.** ntfy supports updating a previously-sent
+   message via the `X-Update` header on the same topic with the prior
+   message ID. Mutate the original notification's body in place
+   (`✓ approved` instead of the original prompt). Cleaner UX where
+   supported; client behavior varies (good in iOS, mixed in Android).
+
+3. **Better log line for stale-ack**. The current log message
+   `ntfy webhook: bao read failed for nonce=...` is alarming but
+   actually correct (no-oracle replay rejection). Reword to
+   `webhook: stale ack ignored (already consumed or expired)` so
+   `grep -i fail` doesn't surface false positives.
+
+Pairs with the eventual HITL approval web UI (separate backlog
+entry) — both close the same gap from different angles.
+
 ### Required `justification` arg for push-approve tools
 Every tool that resolves to push-approve for the calling identity
 gets a *required* `justification` string parameter, enforced by

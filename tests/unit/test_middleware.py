@@ -225,8 +225,11 @@ async def test_hitl_no_identity_rejected(policy: Policy) -> None:
 
 
 async def test_hitl_push_approve_calls_approver(policy: Policy) -> None:
-    """A push-approve tool routes through the Approver."""
+    """A push-approve tool routes through the Approver + fires receipt."""
+    import asyncio
     import copy
+
+    from mcp_hub.interfaces import CallOutcome
 
     raw: dict[str, Any] = copy.deepcopy(MINIMAL)
     raw["identities"]["ironclaw"]["allowed_tools"] = ["technitium_*"]
@@ -237,6 +240,7 @@ async def test_hitl_push_approve_calls_approver(policy: Policy) -> None:
     p = Policy(HubConfig.model_validate(raw))
 
     seen: list[ApprovalRequest] = []
+    receipts: list[tuple[CallOutcome, str | None, int, int | None]] = []
 
     class _CapturingApprover:
         name = "capturing"
@@ -246,6 +250,13 @@ async def test_hitl_push_approve_calls_approver(policy: Policy) -> None:
         ) -> ApprovalResult:
             seen.append(req)
             return ApprovalResult.APPROVED
+
+        async def publish_outcome(
+            self, request: ApprovalRequest, outcome: CallOutcome,
+            *, result_snippet: str | None, wait_ms: int,
+            execution_ms: int | None,
+        ) -> None:
+            receipts.append((outcome, result_snippet, wait_ms, execution_ms))
 
         async def close(self) -> None:
             return None
@@ -257,6 +268,8 @@ async def test_hitl_push_approve_calls_approver(policy: Policy) -> None:
         identity="ironclaw",
         extra_args={"justification": "stale record from leftover test data"},
     )
+    # Yield so the create_task'd receipt gets scheduled.
+    await asyncio.sleep(0)
     assert result == "ok"
     assert ctx.fastmcp_context.get_state("hitl_decision") == "approved"
     assert len(seen) == 1
@@ -268,6 +281,152 @@ async def test_hitl_push_approve_calls_approver(policy: Policy) -> None:
     # ApprovalRequest.args excludes justification (notification body
     # renders justification on its own line above the args block).
     assert "justification" not in req.args
+
+    # Receipt fires after success
+    assert len(receipts) == 1
+    outcome, snippet, wait_ms, exec_ms = receipts[0]
+    assert outcome == CallOutcome.APPROVED_SUCCESS
+    assert snippet == "ok"  # _result_snippet on the upstream "ok" return
+    assert wait_ms >= 0
+    assert exec_ms is not None and exec_ms >= 0
+
+
+async def test_hitl_push_approve_error_fires_approved_error_receipt(policy: Policy) -> None:
+    """Approved tool that errors during call_next → APPROVED_ERROR receipt."""
+    import asyncio
+    import copy
+
+    from mcp import McpError
+    from mcp.types import ErrorData
+
+    from mcp_hub.interfaces import CallOutcome
+
+    raw: dict[str, Any] = copy.deepcopy(MINIMAL)
+    raw["identities"]["ironclaw"]["hitl"] = {"defaults": "push-approve"}
+    p = Policy(HubConfig.model_validate(raw))
+
+    receipts: list[tuple[CallOutcome, str | None]] = []
+
+    class _ApproveOnlyCaptureReceipt:
+        name = "approve-only"
+
+        async def request_approval(self, req: ApprovalRequest, timeout_s: float) -> ApprovalResult:
+            return ApprovalResult.APPROVED
+
+        async def publish_outcome(
+            self, request: ApprovalRequest, outcome: CallOutcome,
+            *, result_snippet: str | None, wait_ms: int,
+            execution_ms: int | None,
+        ) -> None:
+            receipts.append((outcome, result_snippet))
+
+        async def close(self) -> None:
+            return None
+
+    middleware = HITLMiddleware(p, _ApproveOnlyCaptureReceipt())
+
+    # Custom call_next that raises
+    ctx = _make_ctx("ironclaw")
+    ctx.message = _StubMessage(
+        name="technitium_dns_list",
+        arguments={"x": 1, "justification": "approved but tool will fail"},
+    )
+
+    async def failing_call_next(_c: Any) -> Any:
+        raise McpError(ErrorData(code=-32002, message="BACKEND_CHILD_DEAD: simulated"))
+
+    with pytest.raises(McpError, match="BACKEND_CHILD_DEAD"):
+        await middleware.on_call_tool(ctx, failing_call_next)  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+
+    assert len(receipts) == 1
+    outcome, snippet = receipts[0]
+    assert outcome == CallOutcome.APPROVED_ERROR
+    assert snippet is not None and "BACKEND_CHILD_DEAD" in snippet
+
+
+async def test_hitl_push_approve_rejected_fires_rejected_receipt(policy: Policy) -> None:
+    """Rejected outcome → REJECTED receipt fires before raising."""
+    import asyncio
+    import copy
+
+    from mcp_hub.interfaces import CallOutcome
+
+    raw: dict[str, Any] = copy.deepcopy(MINIMAL)
+    raw["identities"]["ironclaw"]["hitl"] = {"defaults": "push-approve"}
+    p = Policy(HubConfig.model_validate(raw))
+
+    receipts: list[CallOutcome] = []
+
+    class _RejectingCaptureReceipt:
+        name = "rejecting"
+
+        async def request_approval(self, req: ApprovalRequest, timeout_s: float) -> ApprovalResult:
+            return ApprovalResult.REJECTED
+
+        async def publish_outcome(
+            self, request: ApprovalRequest, outcome: CallOutcome,
+            *, result_snippet: str | None, wait_ms: int,
+            execution_ms: int | None,
+        ) -> None:
+            receipts.append(outcome)
+
+        async def close(self) -> None:
+            return None
+
+    middleware = HITLMiddleware(p, _RejectingCaptureReceipt())
+    from mcp import McpError
+
+    with pytest.raises(McpError, match="POLICY_HITL_REJECTED"):
+        await _call_tool_via_middleware(
+            middleware, tool_name="technitium_dns_list", identity="ironclaw",
+            extra_args={"justification": "test"},
+        )
+    await asyncio.sleep(0)
+
+    assert receipts == [CallOutcome.REJECTED]
+
+
+async def test_hitl_push_approve_timeout_fires_timeout_receipt(policy: Policy) -> None:
+    """Timeout outcome → TIMEOUT receipt fires before raising."""
+    import asyncio
+    import copy
+
+    from mcp_hub.interfaces import CallOutcome
+
+    raw: dict[str, Any] = copy.deepcopy(MINIMAL)
+    raw["identities"]["ironclaw"]["hitl"] = {"defaults": "push-approve"}
+    p = Policy(HubConfig.model_validate(raw))
+
+    receipts: list[CallOutcome] = []
+
+    class _TimingOutCaptureReceipt:
+        name = "timing-out"
+
+        async def request_approval(self, req: ApprovalRequest, timeout_s: float) -> ApprovalResult:
+            return ApprovalResult.TIMEOUT
+
+        async def publish_outcome(
+            self, request: ApprovalRequest, outcome: CallOutcome,
+            *, result_snippet: str | None, wait_ms: int,
+            execution_ms: int | None,
+        ) -> None:
+            receipts.append(outcome)
+
+        async def close(self) -> None:
+            return None
+
+    middleware = HITLMiddleware(p, _TimingOutCaptureReceipt())
+    from mcp import McpError
+
+    with pytest.raises(McpError, match="POLICY_HITL_TIMEOUT"):
+        await _call_tool_via_middleware(
+            middleware, tool_name="technitium_dns_list", identity="ironclaw",
+            extra_args={"justification": "test"},
+        )
+    await asyncio.sleep(0)
+
+    assert receipts == [CallOutcome.TIMEOUT]
 
 
 async def test_hitl_push_approve_rejected_raises(policy: Policy) -> None:

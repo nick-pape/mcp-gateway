@@ -13,7 +13,7 @@ to the agent. Useful as a chaos toggle during integration testing.
 
 from __future__ import annotations
 
-from mcp_hub.interfaces import ApprovalRequest, ApprovalResult
+from mcp_hub.interfaces import ApprovalRequest, ApprovalResult, CallOutcome
 
 
 class RejectApprover:
@@ -27,6 +27,17 @@ class RejectApprover:
         timeout_s: float,
     ) -> ApprovalResult:
         return ApprovalResult.REJECTED
+
+    async def publish_outcome(
+        self,
+        request: ApprovalRequest,
+        outcome: CallOutcome,
+        *,
+        result_snippet: str | None,
+        wait_ms: int,
+        execution_ms: int | None,
+    ) -> None:
+        return None
 
     async def close(self) -> None:
         return None

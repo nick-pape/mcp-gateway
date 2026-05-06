@@ -17,6 +17,7 @@ Order matters:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -33,7 +34,7 @@ from mcp.types import CallToolRequestParams, ErrorData, ListToolsRequest
 from .audit import Audit, AuditLine, hash_args, new_request_id, now_iso
 from .auth import AuthentikJWTValidator, AuthFailed
 from .errors import ErrorCode
-from .interfaces import ApprovalRequest, ApprovalResult, Approver
+from .interfaces import ApprovalRequest, ApprovalResult, Approver, CallOutcome
 from .policy import HITLAction, Policy
 
 
@@ -239,9 +240,13 @@ class HITLMiddleware(Middleware):
                 args=args_for_approval,
                 args_summary=_args_summary(args_for_approval),
             )
+            wait_start = time.monotonic()
             result = await self._approver.request_approval(req, timeout_s=120.0)
+            wait_ms = int((time.monotonic() - wait_start) * 1000)
             _ctx(context).set_state("hitl_decision", str(result))
+
             if result == ApprovalResult.REJECTED:
+                self._fire_receipt(req, CallOutcome.REJECTED, None, wait_ms, None)
                 raise McpError(
                     ErrorData(
                         code=_RPC_POLICY_REJECTED,
@@ -249,17 +254,77 @@ class HITLMiddleware(Middleware):
                     )
                 )
             if result == ApprovalResult.TIMEOUT:
+                self._fire_receipt(req, CallOutcome.TIMEOUT, None, wait_ms, None)
                 raise McpError(
                     ErrorData(
                         code=_RPC_POLICY_REJECTED,
                         message=f"{ErrorCode.POLICY_HITL_TIMEOUT}: no response in time",
                     )
                 )
-        else:
-            # auto-approve
-            _ctx(context).set_state("hitl_decision", "auto-approve")
 
+            # APPROVED: run the upstream call, capture outcome + duration,
+            # send the receipt, and return the result (or re-raise the error).
+            exec_start = time.monotonic()
+            try:
+                tool_result = await call_next(context)
+            except McpError as exc:
+                exec_ms = int((time.monotonic() - exec_start) * 1000)
+                self._fire_receipt(
+                    req, CallOutcome.APPROVED_ERROR,
+                    str(exc)[:300], wait_ms, exec_ms,
+                )
+                raise
+            except Exception as exc:
+                exec_ms = int((time.monotonic() - exec_start) * 1000)
+                self._fire_receipt(
+                    req, CallOutcome.APPROVED_ERROR,
+                    f"{type(exc).__name__}: {exc}"[:300], wait_ms, exec_ms,
+                )
+                raise
+
+            exec_ms = int((time.monotonic() - exec_start) * 1000)
+            self._fire_receipt(
+                req, CallOutcome.APPROVED_SUCCESS,
+                _result_snippet(tool_result), wait_ms, exec_ms,
+            )
+            return tool_result
+
+        # auto-approve path
+        _ctx(context).set_state("hitl_decision", "auto-approve")
         return await call_next(context)
+
+    def _fire_receipt(
+        self,
+        req: ApprovalRequest,
+        outcome: CallOutcome,
+        result_snippet: str | None,
+        wait_ms: int,
+        execution_ms: int | None,
+    ) -> None:
+        """Schedule a fire-and-forget receipt publish.
+
+        Wrapping in create_task means the agent's response isn't blocked
+        on the receipt publish; the publish runs concurrently. Errors in
+        the approver's publish_outcome are swallowed inside the task.
+        """
+        try:
+            asyncio.create_task(
+                self._approver.publish_outcome(
+                    req, outcome,
+                    result_snippet=result_snippet,
+                    wait_ms=wait_ms,
+                    execution_ms=execution_ms,
+                ),
+                name=f"hitl-receipt-{req.request_id}",
+            )
+        except Exception:
+            # Even create_task can fail if the loop is shutting down.
+            # Don't let receipt machinery affect the actual response.
+            logger.exception(
+                "hitl middleware: failed to schedule receipt for "
+                "tool=%s outcome=%s",
+                req.tool, outcome,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +434,38 @@ class AuditMiddleware(Middleware):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _result_snippet(tool_result: Any, max_len: int = 280) -> str | None:
+    """Extract a short, human-readable snippet from a tool's response.
+
+    Used by HITLMiddleware to populate the receipt body for
+    approved-success outcomes. Returns ``None`` if no readable text is
+    discoverable; the receipt then renders without a result line.
+
+    FastMCP tool results take a few shapes (CallToolResult,
+    StructuredResult, plain str, etc.). This walks the common cases
+    defensively — a malformed result MUST NOT crash the receipt path.
+    """
+    try:
+        # Plain string return from a registered handler.
+        if isinstance(tool_result, str):
+            text = tool_result
+        else:
+            content = getattr(tool_result, "content", None)
+            if content and len(content) > 0:
+                first = content[0]
+                text = getattr(first, "text", None) or str(first)
+            else:
+                text = str(tool_result)
+        if not text:
+            return None
+        text = text.strip()
+        if len(text) > max_len:
+            text = text[: max_len - 1] + "…"
+        return text
+    except Exception:
+        return None
 
 
 def _args_summary(args: dict[str, Any], max_len: int = 200) -> str:
