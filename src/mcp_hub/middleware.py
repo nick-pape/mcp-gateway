@@ -259,7 +259,15 @@ class HITLMiddleware(Middleware):
                 raise McpError(
                     ErrorData(
                         code=_RPC_POLICY_REJECTED,
-                        message=f"{ErrorCode.POLICY_HITL_REJECTED}: operator rejected",
+                        message=(
+                            f"{ErrorCode.POLICY_HITL_REJECTED}: the operator "
+                            f"explicitly rejected this call. This is a "
+                            f"deliberate human decision, NOT a tool failure. "
+                            f"Do not retry the same call — reconsider whether "
+                            f"the action is appropriate, and if you do retry, "
+                            f"provide a different justification that addresses "
+                            f"why the prior request was likely declined."
+                        ),
                     )
                 )
             if result == ApprovalResult.TIMEOUT:
@@ -267,7 +275,15 @@ class HITLMiddleware(Middleware):
                 raise McpError(
                     ErrorData(
                         code=_RPC_POLICY_REJECTED,
-                        message=f"{ErrorCode.POLICY_HITL_TIMEOUT}: no response in time",
+                        message=(
+                            f"{ErrorCode.POLICY_HITL_TIMEOUT}: the operator did "
+                            f"not respond within {self._default_timeout_s:.0f}s. "
+                            f"This is a TIMEOUT, NOT a tool failure — the "
+                            f"upstream tool was never called. The operator may "
+                            f"have been away from their phone. You may retry "
+                            f"the same call (the user will get a fresh push); "
+                            f"consider whether the timing is appropriate."
+                        ),
                     )
                 )
 
