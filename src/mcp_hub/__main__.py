@@ -125,40 +125,99 @@ async def _async_main() -> int:
 
     hub.mcp.custom_route("/health", methods=["GET"])(health)
 
-    # OAuth Protected Resource Metadata (RFC 9728) — MCP-spec required so
-    # interactive clients (Claude Code, Copilot, etc.) can discover where
-    # to OAuth. We don't run our own OAuth server; we point at Authentik's
-    # mcp-interactive provider which handles authorization_code + PKCE.
-    # The Authentik provider's discovery doc lives at
-    #   https://auth.pape.house/application/o/mcp-interactive/.well-known/openid-configuration
-    # and clients walk that to find the actual authorize/token endpoints.
-    interactive_issuer = (
-        f"{auth.issuer.rstrip('/')}/application/o/mcp-interactive/"
-    )
+    # OAuth discovery + DCR shim. The hub doesn't run its own OAuth server;
+    # we proxy discovery to Authentik (mcp-interactive provider) and fake
+    # Dynamic Client Registration since Authentik's /application/o/register/
+    # endpoint requires a per-tenant feature flag we haven't enabled. All
+    # MCP clients land on the same registered Authentik client_id —
+    # acceptable because Authentik's redirect_uri regex on that provider
+    # already allows any http://localhost:* loopback (Claude Code's pattern),
+    # and the OAuth flow + JWT validation downstream is identical regardless
+    # of which client requested registration.
+    #
+    # Three endpoints:
+    # - /.well-known/oauth-protected-resource  (RFC 9728) — points at us
+    # - /.well-known/oauth-authorization-server (RFC 8414) — full metadata
+    #   copying Authentik's endpoints + registration_endpoint=us
+    # - POST /oauth/register (RFC 7591) — static response, ignores body
+    #   except echoing redirect_uris back
 
-    async def oauth_protected_resource(request: Request) -> Response:
-        # Resource URL must reflect what the client used to reach us.
-        # Caddy terminates TLS in front; we read the X-Forwarded-* headers
-        # to construct the public-facing URL rather than the internal bind.
+    INTERACTIVE_CLIENT_ID = "mcp-interactive"
+    AUTHENTIK_BASE = "https://auth.pape.house"
+
+    def _public_base(request: Request) -> str:
         scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
         host = request.headers.get("x-forwarded-host", request.url.netloc)
+        return f"{scheme}://{host}"
+
+    async def oauth_protected_resource(request: Request) -> Response:
+        base = _public_base(request)
         return JSONResponse({
-            "resource": f"{scheme}://{host}/mcp",
-            "authorization_servers": [interactive_issuer],
+            "resource": f"{base}/mcp",
+            "authorization_servers": [base],
             "bearer_methods_supported": ["header"],
             "scopes_supported": ["openid", "profile", "email"],
         })
 
+    async def oauth_authorization_server(request: Request) -> Response:
+        base = _public_base(request)
+        return JSONResponse({
+            # Issuer matches the JWT's iss claim (Authentik), not the
+            # discovery host, per RFC 8414 §3 — clients verify token iss
+            # against this value.
+            "issuer": auth.issuer,
+            "authorization_endpoint": f"{AUTHENTIK_BASE}/application/o/authorize/",
+            "token_endpoint": f"{AUTHENTIK_BASE}/application/o/token/",
+            "userinfo_endpoint": f"{AUTHENTIK_BASE}/application/o/userinfo/",
+            "jwks_uri": f"{AUTHENTIK_BASE}/application/o/{INTERACTIVE_CLIENT_ID}/jwks/",
+            "registration_endpoint": f"{base}/oauth/register",
+            "scopes_supported": ["openid", "profile", "email"],
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })
+
+    async def oauth_register(request: Request) -> Response:
+        # RFC 7591 minimal response. We don't actually persist anything —
+        # every caller gets the same INTERACTIVE_CLIENT_ID. Echo back the
+        # redirect_uris the client provided so it can verify the response.
+        try:
+            body: dict[str, Any] = await request.json()
+        except (ValueError, RuntimeError):
+            body = {}
+        redirect_uris = body.get("redirect_uris") or []
+        # Keep the response shape strict to RFC 7591 — clients vary in
+        # how they parse extra fields.
+        return JSONResponse({
+            "client_id": INTERACTIVE_CLIENT_ID,
+            "client_id_issued_at": int(__import__("time").time()),
+            "redirect_uris": redirect_uris,
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "client_name": body.get("client_name", "MCP Client"),
+        }, status_code=201)
+
+    # Both /.well-known paths — clients vary on which they probe first.
     hub.mcp.custom_route(
         "/.well-known/oauth-protected-resource",
         methods=["GET"],
     )(oauth_protected_resource)
-    # Some clients also probe the more-specific path that includes the
-    # MCP endpoint suffix.
     hub.mcp.custom_route(
         "/.well-known/oauth-protected-resource/mcp",
         methods=["GET"],
     )(oauth_protected_resource)
+    hub.mcp.custom_route(
+        "/.well-known/oauth-authorization-server",
+        methods=["GET"],
+    )(oauth_authorization_server)
+    hub.mcp.custom_route(
+        "/oauth/register",
+        methods=["POST"],
+    )(oauth_register)
 
     bind_host, _, bind_port_s = server_cfg.bind.partition(":")
     bind_port = int(bind_port_s) if bind_port_s else 8443
