@@ -136,12 +136,14 @@ class HttpFanout:
         if self._started:
             return
         if self._http is None:
-            # http2=True so the connection pool can multiplex; sensible
-            # timeouts to keep request bodies from hanging the loop. The
-            # default httpx 5s connect / read timeout is too aggressive
-            # for some federated MCPs that may be GC-paused at handshake.
+            # HTTP/1.1 only — h2 isn't in deps and the federated upstreams
+            # are LAN-local single-call workloads where multiplexing isn't
+            # the bottleneck. If a real perf case for HTTP/2 emerges, add
+            # `httpx[http2]` to pyproject.toml and flip http2=True back on.
+            # Sensible timeouts to keep request bodies from hanging the
+            # loop; default 5s connect/read is too aggressive for federated
+            # MCPs that may be GC-paused at handshake.
             self._http = httpx.AsyncClient(
-                http2=True,
                 timeout=httpx.Timeout(
                     connect=10.0,
                     read=self._request_timeout_s,
@@ -326,24 +328,30 @@ class HttpFanout:
                 f"{self._max_response_bytes}"
             )
 
-        # Detect SSE responses: the server may have chosen to stream.
-        # We don't currently parse SSE here; surface as an error so the
-        # operator knows to switch upstreams or extend the fanout.
+        # MCP Streamable-HTTP transport: server picks JSON or SSE per
+        # response. Many upstreams (e.g., Outline's native MCP) always
+        # reply with SSE even for single-result responses, so we must
+        # handle both. For SSE we only support single-message replies
+        # (one `event: message` block with one `data:` payload) — that's
+        # all every known MCP upstream emits today. Multi-message
+        # streaming would require a different return shape from `call()`.
         content_type = response.headers.get("content-type", "")
         if "text/event-stream" in content_type.lower():
-            raise HttpUpstreamFailed(
-                f"HttpFanout({self._mcp_name}): upstream chose SSE "
-                f"streaming (content-type={content_type!r}); only "
-                f"application/json responses are currently supported"
-            )
-
-        try:
-            parsed = response.json()
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise HttpUpstreamFailed(
-                f"HttpFanout({self._mcp_name}): upstream returned "
-                f"unparseable JSON: {exc}"
-            ) from exc
+            try:
+                parsed = _parse_single_sse_message(response.text)
+            except ValueError as exc:
+                raise HttpUpstreamFailed(
+                    f"HttpFanout({self._mcp_name}): upstream returned "
+                    f"unparseable SSE: {exc}"
+                ) from exc
+        else:
+            try:
+                parsed = response.json()
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise HttpUpstreamFailed(
+                    f"HttpFanout({self._mcp_name}): upstream returned "
+                    f"unparseable JSON: {exc}"
+                ) from exc
 
         if not isinstance(parsed, dict):
             raise HttpUpstreamFailed(
@@ -398,3 +406,54 @@ class HttpFanout:
                 f"HttpFanout({self._mcp_name}): notification rejected: "
                 f"HTTP {response.status_code}"
             )
+
+
+# ---------------------------------------------------------------------------
+# SSE single-message parser
+# ---------------------------------------------------------------------------
+
+
+def _parse_single_sse_message(body: str) -> dict[str, Any]:
+    """Parse a single-message SSE response body and return the JSON payload.
+
+    The MCP Streamable-HTTP transport allows servers to reply with SSE for
+    request/response calls (Outline's native MCP always does). For our
+    federation pattern each request expects exactly one response, so we
+    handle the simplest case: one ``event: ...`` block, one or more
+    ``data:`` lines whose joined value is JSON.
+
+    SSE spec: events are separated by blank lines; ``data:`` lines within
+    an event concatenate with newlines (we strip any leading single space
+    after the colon, per the spec).
+
+    Raises :class:`ValueError` if the body has no parseable data line or
+    the joined payload isn't valid JSON.
+    """
+    import json as _json
+
+    # Take everything up to the first blank line (single event).
+    head, _sep, _tail = body.partition("\n\n")
+    if not head:
+        head = body  # tolerate missing terminator
+
+    data_lines: list[str] = []
+    for raw_line in head.splitlines():
+        if not raw_line.startswith("data:"):
+            continue
+        # SSE spec: strip a single leading space after "data:" if present.
+        line = raw_line[len("data:") :]
+        if line.startswith(" "):
+            line = line[1:]
+        data_lines.append(line)
+
+    if not data_lines:
+        raise ValueError(f"no data line in SSE body (first 200 chars: {body[:200]!r})")
+
+    payload = "\n".join(data_lines)
+    try:
+        parsed = _json.loads(payload)
+    except _json.JSONDecodeError as exc:
+        raise ValueError(f"SSE data is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"SSE data is JSON but not an object: {type(parsed).__name__}")
+    return parsed
