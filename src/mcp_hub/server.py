@@ -141,7 +141,13 @@ class Hub:
         # log success/failure of the whole chain.
         self.mcp.add_middleware(IdentityMiddleware(self._validator))
         self.mcp.add_middleware(ToolCurationMiddleware(self._policy))
-        self.mcp.add_middleware(HITLMiddleware(self._policy, self._approver))
+        # Pull HITL timeout from approver config (policy.yaml's
+        # approver.config.timeout_default_s). Falls back to 120s if absent.
+        approver_cfg = self._policy.config.approver.config or {}
+        hitl_timeout = float(approver_cfg.get("timeout_default_s", 120.0))
+        self.mcp.add_middleware(
+            HITLMiddleware(self._policy, self._approver, default_timeout_s=hitl_timeout)
+        )
         self.mcp.add_middleware(AuditMiddleware(self._audit, self._policy))
 
     def _build_fanout(self, mcp_name: str, mcp_config: Any) -> Fanout:

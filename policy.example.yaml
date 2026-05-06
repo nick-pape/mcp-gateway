@@ -142,3 +142,47 @@ identities:
       paperless:
         path: services/paperless/shared
         field: api_token
+
+  # Human-driven (interactive) identity. Distinct from service identities
+  # (which are usually auto-approve broadly). Default-gated so any
+  # destructive action requires a phone tap; explicit auto-approves below
+  # cover pure reads + trivial idempotent ops.
+  interactive:
+    aud: mcp-interactive
+    uid_base: 1004
+    allowed_tools:
+      - "technitium_*"
+      - "paperless_*"
+    hitl:
+      defaults: push-approve
+      overrides:
+        # ─── Pure reads (auto-approve, never gated) ───
+        "technitium_*list*": auto-approve
+        "technitium_*get*": auto-approve
+        "technitium_*query*": auto-approve
+        technitium_dns_health_check: auto-approve
+        technitium_dns_resolve: auto-approve         # just a DNS lookup
+        technitium_dns_check_update: auto-approve    # checks only, doesn't apply
+        technitium_dns_dnssec_info: auto-approve
+        technitium_dns_zone_options: auto-approve    # read-only inspector
+        technitium_dns_export_zone: auto-approve
+
+        # ─── Trivial cache ops (auto-approve) ───
+        # Cache regenerates immediately on next query — no real loss.
+        technitium_dns_delete_cached: auto-approve
+        technitium_dns_flush_cache: auto-approve
+
+        # NOT auto-approved (push-approve via defaults):
+        #   - flush_allowed / flush_blocked → destroys user-curated lists
+        #   - temp_disable_blocking → security gate; lets through normally-blocked traffic
+        #   - add/update/delete records, zones, blocklists, allow/block entries
+        #   - DHCP scope/reservation/lease create/update/delete/convert
+        #   - install/uninstall apps, set_settings, set_zone_options
+        #   - enable/disable zones
+    secrets:
+      technitium:
+        path: services/technitium/claude-code-dev
+        field: api_token
+      paperless:
+        path: services/paperless/shared
+        field: api_token

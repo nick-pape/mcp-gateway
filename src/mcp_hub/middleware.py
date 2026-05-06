@@ -162,9 +162,16 @@ class HITLMiddleware(Middleware):
     the LLM tried to call a tool name it wasn't shown.
     """
 
-    def __init__(self, policy: Policy, approver: Approver) -> None:
+    def __init__(
+        self,
+        policy: Policy,
+        approver: Approver,
+        *,
+        default_timeout_s: float = 120.0,
+    ) -> None:
         self._policy = policy
         self._approver = approver
+        self._default_timeout_s = default_timeout_s
 
     async def on_call_tool(
         self,
@@ -241,7 +248,9 @@ class HITLMiddleware(Middleware):
                 args_summary=_args_summary(args_for_approval),
             )
             wait_start = time.monotonic()
-            result = await self._approver.request_approval(req, timeout_s=120.0)
+            result = await self._approver.request_approval(
+                req, timeout_s=self._default_timeout_s
+            )
             wait_ms = int((time.monotonic() - wait_start) * 1000)
             _ctx(context).set_state("hitl_decision", str(result))
 
