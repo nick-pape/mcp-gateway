@@ -125,6 +125,41 @@ async def _async_main() -> int:
 
     hub.mcp.custom_route("/health", methods=["GET"])(health)
 
+    # OAuth Protected Resource Metadata (RFC 9728) — MCP-spec required so
+    # interactive clients (Claude Code, Copilot, etc.) can discover where
+    # to OAuth. We don't run our own OAuth server; we point at Authentik's
+    # mcp-interactive provider which handles authorization_code + PKCE.
+    # The Authentik provider's discovery doc lives at
+    #   https://auth.pape.house/application/o/mcp-interactive/.well-known/openid-configuration
+    # and clients walk that to find the actual authorize/token endpoints.
+    interactive_issuer = (
+        f"{auth.issuer.rstrip('/')}/application/o/mcp-interactive/"
+    )
+
+    async def oauth_protected_resource(request: Request) -> Response:
+        # Resource URL must reflect what the client used to reach us.
+        # Caddy terminates TLS in front; we read the X-Forwarded-* headers
+        # to construct the public-facing URL rather than the internal bind.
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host", request.url.netloc)
+        return JSONResponse({
+            "resource": f"{scheme}://{host}/mcp",
+            "authorization_servers": [interactive_issuer],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["openid", "profile", "email"],
+        })
+
+    hub.mcp.custom_route(
+        "/.well-known/oauth-protected-resource",
+        methods=["GET"],
+    )(oauth_protected_resource)
+    # Some clients also probe the more-specific path that includes the
+    # MCP endpoint suffix.
+    hub.mcp.custom_route(
+        "/.well-known/oauth-protected-resource/mcp",
+        methods=["GET"],
+    )(oauth_protected_resource)
+
     bind_host, _, bind_port_s = server_cfg.bind.partition(":")
     bind_port = int(bind_port_s) if bind_port_s else 8443
     logger.info("hub starting on %s:%d", bind_host, bind_port)

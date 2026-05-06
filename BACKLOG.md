@@ -146,6 +146,33 @@ its API.
 
 ## Security hardening
 
+### SSH certificate authority (replace shared root key)
+Today: one SSH key → `root@proxmox.service.pape.house` → `pct exec`
+to every CT → root in every CT. That key on a laptop or in an agent
+env is the same blast radius as the bao root token before sealing.
+
+**Plan: bao SSH secrets engine signs short-lived certs on demand.**
+
+- Enable bao's SSH engine (`bao secrets enable ssh`); generate a CA
+  key pair, distribute the CA public key to every host
+- Configure each host's `sshd_config` with `TrustedUserCAKeys
+  /etc/ssh/bao-ca.pub`; remove all `authorized_keys` entries
+- Define bao SSH roles per (identity × target) tuple — e.g.,
+  `ssh-claude-code-dev-proxmox` allows principal `root` on the
+  Proxmox host with TTL=5min; `ssh-ironclaw-ct-110` allows
+  principal `root` on CT 110 only
+- JWT swap: Authentik JWT → bao login → bao SSH sign → cert with
+  named principal + host restrictions + 5-minute TTL → `ssh -i cert`
+- `add-service-ct` skill becomes: bootstrap CT → fetch SSH cert from
+  bao → ssh in (cert expires before the CT finishes booting in some
+  cases — set TTL=15min for that role)
+- Cuts the blast radius from "all CTs forever" to
+  "one CT for 5 minutes, audited per request"
+
+Same JWT-swap shape as the existing fanout secrets pattern. The
+Proxmox MCP fork is a natural integration point: instead of holding
+an SSH key, it requests a cert per call.
+
 ### bao LXC SSH separation
 Root key (`/root/.vault-token`) is on the bao LXC's disk and reachable
 by anyone with root SSH (which is anyone with the proxmox key). Lock
@@ -170,6 +197,98 @@ default) does it migrate to the reservation. Workaround: `pct set
 skill to do this automatically when add-service-ct is invoked.
 
 ## Operational polish
+
+### MCP integration roadmap
+Audit conducted against the full homelab inventory (CT 100–120 + Proxmox
+host + 4 Portainer instances). Categorized by integration strategy:
+
+**Drop-ins (low effort, vendor or well-architected community MCPs):**
+- **Portainer** — `portainer/portainer-mcp` (vendor, Go). Built-in
+  `-read-only` flag. One MCP per Portainer URL with per-instance
+  scoped API tokens via bao. Highest ROI/hour in the inventory.
+- **OpenBao / Vault** — HashiCorp `vault-mcp-server` (vendor). Native
+  policy scoping. Federating this also makes bao the auth-token
+  broker for every other MCP behind the gateway.
+- **ntfy** — `cyanheads/ntfy-mcp-server` or `gitmotion/ntfy-me-mcp`.
+  Send-only; per-topic ACL token gives natural scoping.
+- **SearxNG** — `ihor-sokoliuk/mcp-searxng`. Pure search, no auth model
+  needed beyond network ACL.
+- **Stirling-PDF** — `gufao/mcp-server-stirling-pdf`. Stateless ops.
+- **Whisper STT** — `SmartLittleApps/local-stt-mcp` for whisper-cpp.
+
+**Fork & harden (mirror the technitium-mcp-secure split-tools pattern):**
+- **Proxmox** — `canvrno/ProxmoxMCP` (Python, ~249 stars). Single API
+  token currently; needs read-only audit tools (vm.list, ct.config)
+  separated from write tools (vm.create, ct.start, snapshot.delete)
+  behind a separate Authentik-mapped scope. **Keystone MCP** —
+  the gateway's reason for existing.
+- **Caddy** — `lum8rjack/caddy-mcp` (Go). `update_caddy_config` is
+  the entire admin API — rogue agent can rewrite every site block.
+  Need a `caddy-mcp-readonly` fork for diagnosis (get_config + upstream
+  health) without write capability.
+- **n8n** — `czlonkowski/n8n-mcp` (active, heavily used). n8n holds
+  credentials for half the homelab; an unscoped MCP here pierces the
+  whole isolation model. Fork to gate `workflow.execute` and
+  `credential.*` behind a separate scope.
+- **OpenWebUI** — `marccyberleda/openwebui-mcp-server`. Admin token
+  exposes user/group/knowledge-base mgmt — full takeover surface.
+- **Docmost** — `MrMartiniMo/docmost-mcp` (community-only, no vendor).
+  Pick one fork, audit, harden.
+- **JupyterHub** — `datalayer/jupyter-mcp-server`. Multi-user Hub
+  support marked "in development". Code-execution surface = highest
+  rogue-agent risk in inventory; defer until per-user JWT-scoped
+  exec lands upstream.
+- **Qdrant / Neo4j** — vendor MCPs (`qdrant/mcp-server-qdrant`,
+  `neo4j/mcp`). Need per-tenant collection/Cypher scoping.
+
+**Skip / defer (no MCP or wrong abstraction):**
+- **Authentik** — `cdmx-in/authentik-mcp` exists and is well-split
+  (separate `authentik-diag-mcp` binary for read-only). Skip for now;
+  you have direct API access. **Reference architecture** for the
+  fork pattern — closest analog to technitium-mcp-secure today.
+- **WireGuard** — no MCP, no real API. Config is `wg-quick` + files.
+- **Coder** — no real MCP (the `coder-mcp/coder-mcp` repo is a name
+  collision unrelated to coder.com). From-scratch only.
+- **pocket-tts, llama.cpp** — wrong abstraction; model calls go via
+  LiteLLM, not MCP.
+- **LiteLLM admin MCP** — wraps the master key; do via direct API.
+  Note LiteLLM itself is an MCP gateway per their docs — long-term
+  possible federation candidate.
+
+**Recommended order (top 5 leverage moves):**
+1. **Portainer** — drop-in × 4 instances, biggest immediate surface
+2. **Bao** — drop-in vendor MCP, becomes the auth broker for all others
+3. **Proxmox** — fork+harden the keystone (canvrno/ProxmoxMCP)
+4. **n8n** — fork to gate execute/credentials before more workflows depend on it
+5. **Caddy** — small fork for diagnostic/observability use cases
+
+### Authentik blueprints — kill the admin-token tax
+Every time we provision a new OAuth provider/application in Authentik
+(MCP integrations, Portainer instances, future services), we mint a
+short-lived admin API token, run a few API calls, and the token
+expires before we want it to. This is exactly the "expiring static
+secret" pattern the rest of the architecture is designed to avoid.
+
+**Fix: Authentik blueprints** — declarative YAML in a watched
+directory. Authentik applies on startup or hot-reload; no admin token
+needed at provision time.
+
+- Drop blueprint files into `/blueprints/custom/` on the Authentik
+  CT (mounted from host or a git-sync container)
+- One YAML per provider+app pair; commit to a repo (could be
+  `homelab-authentik-blueprints` separate from the main repo or
+  alongside in `infra/authentik/`)
+- Authentik picks them up on next restart or `ak blueprint apply`
+- Bonus: blueprint state is declarative, so config drift is impossible
+
+Specifically for the MCP gateway path: every time we add a new
+MCP-client provider (Claude Code, Copilot, n8n service, etc.), it's a
+blueprint commit instead of a curl-with-admin-token dance.
+
+Also moves the "I forgot to set Expires=1yr on the API token" problem
+out of the loop entirely — bootstrap just doesn't need a token.
+
+Docs: https://docs.goauthentik.io/customize/blueprints/
 
 ### LXC template for "Docker host with Portainer + OAuth"
 Setting up a fresh Docker-in-LXC + Portainer + Authentik OIDC takes
