@@ -301,7 +301,7 @@ class ContainerFanout:
             )
         request_context = request_context or {}
 
-        handle = await self._get_or_spawn(identity)
+        handle = await self._get_or_spawn(identity, request_context)
         handle.in_flight += 1
         try:
             return await self._post(handle, identity, request, request_context)
@@ -339,7 +339,9 @@ class ContainerFanout:
     def _spawn_key(self, identity: str) -> str:
         return identity if self._scope == "per-identity" else SHARED_KEY
 
-    async def _get_or_spawn(self, identity: str) -> _ContainerHandle:
+    async def _get_or_spawn(
+        self, identity: str, request_context: dict[str, Any]
+    ) -> _ContainerHandle:
         key = self._spawn_key(identity)
         async with self._handle_lock:
             existing = self._handles.get(key)
@@ -353,7 +355,7 @@ class ContainerFanout:
                 with contextlib.suppress(Exception):
                     await self._remove_container(existing)
                 self._handles.pop(key, None)
-            handle = await self._spawn_container(identity)
+            handle = await self._spawn_container(identity, request_context)
             self._handles[key] = handle
             return handle
 
@@ -372,7 +374,9 @@ class ContainerFanout:
             volumes[name] = {"bind": vm.container_path, "mode": "rw"}
         return volumes
 
-    async def _spawn_container(self, identity: str) -> _ContainerHandle:
+    async def _spawn_container(
+        self, identity: str, request_context: dict[str, Any]
+    ) -> _ContainerHandle:
         env = await self._build_env(identity)
         volumes = self._build_volumes(identity)
         labels = {
@@ -431,6 +435,12 @@ class ContainerFanout:
         )
         try:
             await self._wait_ready(handle)
+            # MCP protocol handshake: every freshly-spawned upstream needs
+            # ``initialize`` + ``notifications/initialized`` before any
+            # other request. FastMCP-based servers (texas-grocery-mcp etc.)
+            # explicitly reject pre-initialize requests; even non-FastMCP
+            # MCPs are within their rights to require the handshake.
+            await self._initialize_handshake(handle, identity, request_context)
         except HttpUpstreamFailed:
             with contextlib.suppress(Exception):
                 await self._remove_container(handle)
@@ -441,6 +451,52 @@ class ContainerFanout:
             identity, self._scope, handle.url,
         )
         return handle
+
+    async def _initialize_handshake(
+        self,
+        handle: _ContainerHandle,
+        identity: str,
+        request_context: dict[str, Any],
+    ) -> None:
+        """Run the MCP initialize handshake against a freshly-spawned container.
+
+        MCP spec: client sends ``initialize`` request, server responds; client
+        then sends ``notifications/initialized`` (no id, no response). After
+        that, normal tool calls are accepted. The wrapper image's stdio child
+        won't accept tool calls until this runs.
+        """
+        init_resp = await self._post(
+            handle,
+            identity,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "clientInfo": {
+                        "name": "mcp-fanout-container",
+                        "version": "0.0.0",
+                    },
+                },
+            },
+            request_context,
+        )
+        if "error" in init_resp:
+            raise HttpUpstreamFailed(
+                f"ContainerFanout({self._mcp_name}): initialize handshake "
+                f"failed: {init_resp['error']}"
+            )
+        # Best-effort fire-and-forget notification per spec; failure is
+        # logged but doesn't kill the spawn (some servers tolerate skipping).
+        with contextlib.suppress(HttpUpstreamFailed):
+            await self._post(
+                handle,
+                identity,
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                request_context,
+            )
 
     async def _build_env(self, identity: str) -> dict[str, str]:
         """Compose the env dict the spawned container starts with.

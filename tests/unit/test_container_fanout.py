@@ -594,10 +594,15 @@ async def test_auth_strategy_called_with_identity_and_request_context() -> None:
         request={"id": 1},
         request_context={"bearer_token": "agent-jwt"},
     )
-    # auth_header was called once with alice + the request_context
+    # auth_header was called for alice with the right request_context.
+    # First call spawns the container, which triggers initialize +
+    # notifications/initialized + the actual user call — three POSTs
+    # against /mcp, all routed through auth_header with the same context.
     assert any(call[0] == "alice" and call[1] == {"bearer_token": "agent-jwt"} for call in auth.calls)
-    # The Authorization header reached the upstream POST
     posts = [r for r in routed.requests if r.url.path == "/mcp"]
-    assert len(posts) == 1
-    assert posts[0].headers["authorization"] == "Bearer xyz"
+    assert len(posts) >= 1, "expected at least one /mcp POST (the user call)"
+    # Every /mcp POST should carry the same Authorization header — the
+    # auth strategy is consulted afresh per request.
+    for p in posts:
+        assert p.headers["authorization"] == "Bearer xyz"
     await fan.close()

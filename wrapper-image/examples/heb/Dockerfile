@@ -26,7 +26,7 @@
 #   /home/appuser/.texas-grocery-mcp
 # (auth.json + .credentials + .credentials.key persist across spawns).
 
-FROM mcr.microsoft.com/playwright/python:v1.49.0-noble
+FROM mcr.microsoft.com/playwright/python:v1.59.0-noble
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -38,6 +38,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # session state goes into the user's HOME so a per-identity volume mount
 # at /home/appuser/.texas-grocery-mcp persists it independently.
 RUN useradd --create-home --shell /usr/sbin/nologin --uid 2001 appuser
+
+# Install xvfb (virtual X server) — texas-grocery-mcp's
+# session_refresh launches Chromium in headed mode for the
+# saved-credentials login flow even when headless=True is passed.
+# Wrapping the stdio child with xvfb-run gives Playwright a DISPLAY
+# without rendering anything.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends xvfb \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -56,7 +65,13 @@ RUN pip install --no-cache-dir "texas-grocery-mcp[browser]"
 COPY entrypoint.py /app/entrypoint.py
 COPY examples/heb/bootstrap.py /app/bootstrap.py
 
-RUN chown -R appuser:appuser /app
+# Pre-create the texas-grocery-mcp state dir with appuser ownership BEFORE
+# the volume mount lands here. Docker's named-volume behavior is: when the
+# target dir exists in the image, its ownership/permissions are copied into
+# the freshly-created volume. Without this, the volume comes up as root:root
+# and the appuser-running bootstrap can't write .credentials.key.
+RUN mkdir -p /home/appuser/.texas-grocery-mcp \
+ && chown -R appuser:appuser /app /home/appuser
 
 USER appuser
 

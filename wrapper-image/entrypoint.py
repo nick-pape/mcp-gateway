@@ -55,6 +55,12 @@ MCP_COMMAND = _required_env("MCP_COMMAND")
 OIDC_ISSUER = _required_env("OIDC_ISSUER")
 OIDC_DISCOVERY_URL = _required_env("OIDC_DISCOVERY_URL").rstrip("/")
 OIDC_AUDIENCE = _required_env("OIDC_AUDIENCE")
+# OIDC_BOOT_AUDIENCE: alternate audience accepted for hub-side bootstrap
+# calls (the hub queries tools/list at startup using its own fanout_jwt,
+# which has aud=mcp-fanout-svc — an audience valid only for the hub
+# itself). Defaults to "mcp-fanout-svc" because that's the universal
+# trusted-hub audience for this homelab. Empty string disables.
+OIDC_BOOT_AUDIENCE = os.environ.get("OIDC_BOOT_AUDIENCE", "mcp-fanout-svc").strip()
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 JWT_CLOCK_SKEW_S = int(os.environ.get("JWT_CLOCK_SKEW_S", "30"))
@@ -114,12 +120,26 @@ class JWKSCache:
 _jwks_cache = JWKSCache(OIDC_DISCOVERY_URL, JWKS_CACHE_TTL_S)
 
 
+_ACCEPTED_AUDIENCES: tuple[str, ...] = (
+    (OIDC_AUDIENCE,) + ((OIDC_BOOT_AUDIENCE,) if OIDC_BOOT_AUDIENCE else ())
+)
+
+
 async def validate_token(http: httpx.AsyncClient, token: str) -> dict[str, Any]:
-    """Validate signature + iss + aud + exp; return the decoded claims."""
+    """Validate signature + iss + aud + exp; return the decoded claims.
+
+    The ``aud`` claim is accepted if it matches ``OIDC_AUDIENCE`` (the
+    per-identity audience this container was spawned for) OR
+    ``OIDC_BOOT_AUDIENCE`` (the universal trusted-hub audience used by
+    mcp-hub itself when it queries tools/list at startup). The boot
+    audience exists because the hub doesn't have a per-identity JWT
+    available at boot — it has only its own service-account JWT
+    (fanout_jwt with aud=mcp-fanout-svc).
+    """
     jwks = await _jwks_cache.get(http)
+    # Don't constrain aud at decode time; we validate against the list manually.
     claims_options = {
         "iss": {"essential": True, "value": OIDC_ISSUER},
-        "aud": {"essential": True, "value": OIDC_AUDIENCE},
         "exp": {"essential": True},
     }
     try:
@@ -127,6 +147,13 @@ async def validate_token(http: httpx.AsyncClient, token: str) -> dict[str, Any]:
         claims.validate(leeway=JWT_CLOCK_SKEW_S)
     except JoseError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"invalid token: {exc}")
+    aud = claims.get("aud")
+    aud_list = aud if isinstance(aud, list) else [aud] if aud else []
+    if not any(a in _ACCEPTED_AUDIENCES for a in aud_list):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            f"invalid token: aud {aud!r} not in accepted set {_ACCEPTED_AUDIENCES}",
+        )
     return dict(claims)
 
 

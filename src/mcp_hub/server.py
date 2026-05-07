@@ -28,6 +28,7 @@ __main__.py).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Mapping
 from pathlib import Path
@@ -195,7 +196,37 @@ class Hub:
         ``tools/list``, and register each returned tool with FastMCP
         under the prefix ``<mcp_name>_``. The handler routes through the
         Fanout using the per-request identity from context state.
+
+        The hub doesn't have a per-identity JWT at boot — IdentityMiddleware
+        only populates ``request_context.bearer_token`` for inbound user
+        requests. So for boot-time tools/list against fanouts that need a
+        bearer token (JwtPassthrough on container fanouts), we fall back
+        to the hub's own service-account JWT (fanout_jwt). Wrappers
+        accept aud=mcp-fanout-svc as a trusted-hub bootstrap audience
+        alongside their per-identity audience. See entrypoint.py's
+        OIDC_BOOT_AUDIENCE for the wrapper side.
         """
+        # Best-effort read of the hub's own JWT for boot-time discovery.
+        # If the file doesn't exist (e.g. test deploys with no refresher),
+        # we fall back to no token — works fine for fanouts that don't
+        # need one (BaoBackedBearer-only HTTP federations).
+        boot_bearer: str | None = None
+        from pathlib import Path as _P
+        for candidate in ("/etc/mcp-pape-house/fanout_jwt",):
+            p = _P(candidate)
+            if p.exists():
+                with contextlib.suppress(OSError):
+                    boot_bearer = p.read_text().strip() or None
+                if boot_bearer:
+                    logger.info(
+                        "registering tools with boot-time bearer from %s (len=%d)",
+                        candidate, len(boot_bearer),
+                    )
+                    break
+        boot_request_context: dict[str, Any] = {}
+        if boot_bearer is not None:
+            boot_request_context[CTX_KEY_BEARER_TOKEN] = boot_bearer
+
         for mcp_name, fanout in self._fanouts.items():
             sample_identity = next(iter(fanout.identities))
             list_response = await _fanout_call(
@@ -206,7 +237,7 @@ class Hub:
                     "id": 1,
                     "method": "tools/list",
                 },
-                request_context={},
+                request_context=boot_request_context,
             )
             upstream_tools = list_response.get("result", {}).get("tools", [])
             for tool_def in upstream_tools:
@@ -363,13 +394,14 @@ async def _fanout_call(
     request: dict[str, Any],
     request_context: dict[str, Any],
 ) -> dict[str, Any]:
-    """Dispatch ``call`` across either Fanout impl.
+    """Dispatch ``call`` across all three Fanout impls.
 
-    Stdio :class:`Fanout.call` doesn't take ``request_context``; HTTP
-    :class:`HttpFanout.call` does. We isolate the type-narrow here so
-    every other call site stays uniform.
+    Stdio :class:`Fanout.call` doesn't take ``request_context``; the two
+    HTTP-shaped fanouts (:class:`HttpFanout` and :class:`ContainerFanout`)
+    do. We isolate the type-narrow here so every other call site stays
+    uniform.
     """
-    if isinstance(fanout, HttpFanout):
+    if isinstance(fanout, (HttpFanout, ContainerFanout)):
         return await fanout.call(
             identity=identity,
             request=request,
