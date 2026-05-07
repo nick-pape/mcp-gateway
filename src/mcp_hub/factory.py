@@ -27,6 +27,7 @@ from mcp_fanout import (
     Fanout,
     HttpFanout,
     IdentityConfig,
+    VolumeMountSpec,
 )
 
 from .approvers.auto import AutoApprover
@@ -348,6 +349,13 @@ def build_fanout(
         env_var: SecretRef(path=ref.path, field=ref.field)
         for env_var, ref in mcp_config.secrets_to_env.items()
     }
+    volumes_per_identity = [
+        VolumeMountSpec(
+            container_path=vm.container_path,
+            volume_name_template=vm.volume_name_template,
+        )
+        for vm in mcp_config.volumes_per_identity
+    ]
     return ContainerFanout(
         mcp_name=mcp_name,
         image=mcp_config.image,
@@ -358,6 +366,7 @@ def build_fanout(
         audience_template=mcp_config.audience_template,
         env=mcp_config.env,
         secrets_to_env=secrets_to_env,
+        volumes_per_identity=volumes_per_identity,
         auth_strategy=container_strategy,
         secret_backend=secret_backend,
         docker_client=docker_client,

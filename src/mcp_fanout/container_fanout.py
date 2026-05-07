@@ -34,6 +34,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -67,6 +68,27 @@ DEFAULT_EVICTION_INTERVAL_S: float = 60.0
 DEFAULT_CONTAINER_PORT: int = 8080
 DEFAULT_AUDIENCE_TEMPLATE: str = "mcp-{identity}"
 SHARED_KEY: str = "__shared__"
+
+
+# --- Volume mount spec ----------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class VolumeMountSpec:
+    """One Docker named-volume mount for a spawned container.
+
+    ``volume_name_template`` may contain ``{identity}``; the orchestrator
+    formats it at spawn time. Volumes are auto-created by Docker on first
+    mount; the orchestrator does NOT remove them on container teardown,
+    so session state persists across spawn/evict cycles.
+
+    Used only by MCPs that legitimately need persistent state beyond an
+    env-injected token (e.g. HEB's Playwright cookies + auth.json). Most
+    MCPs leave this empty.
+    """
+
+    container_path: str
+    volume_name_template: str
 
 
 # --- ContainerHandle -------------------------------------------------------
@@ -134,12 +156,13 @@ class ContainerFanout:
         auth_strategy: AuthStrategy,
         secret_backend: SecretBackend,
         docker_client: Any,
+        volumes_per_identity: Sequence[VolumeMountSpec] = (),
         audience_template: str = DEFAULT_AUDIENCE_TEMPLATE,
         idle_timeout_s: float = DEFAULT_IDLE_TIMEOUT_S,
         spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
         request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
         eviction_interval_s: float = DEFAULT_EVICTION_INTERVAL_S,
-        container_host: str = "docker.service.pape.house",
+        container_host: str = "host.docker.internal",
         container_port: int = DEFAULT_CONTAINER_PORT,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -171,6 +194,7 @@ class ContainerFanout:
         self._audience_template = audience_template
         self._env = dict(env)
         self._secrets_to_env = dict(secrets_to_env)
+        self._volumes_per_identity: tuple[VolumeMountSpec, ...] = tuple(volumes_per_identity)
         self._auth = auth_strategy
         self._secrets = secret_backend
         self._docker = docker_client
@@ -333,8 +357,24 @@ class ContainerFanout:
             self._handles[key] = handle
             return handle
 
+    def _build_volumes(self, identity: str) -> dict[str, dict[str, str]]:
+        """Format volume_name_template per identity and return the docker-py volumes dict."""
+        if not self._volumes_per_identity:
+            return {}
+        # For shared scope, format with identity="shared" so any literal
+        # `{identity}` (an unusual choice for shared scope) resolves
+        # deterministically. Schema validates that per-identity scope MUST
+        # have the placeholder, so we don't double-check here.
+        format_key = identity if self._scope == "per-identity" else "shared"
+        volumes: dict[str, dict[str, str]] = {}
+        for vm in self._volumes_per_identity:
+            name = vm.volume_name_template.format(identity=format_key)
+            volumes[name] = {"bind": vm.container_path, "mode": "rw"}
+        return volumes
+
     async def _spawn_container(self, identity: str) -> _ContainerHandle:
         env = await self._build_env(identity)
+        volumes = self._build_volumes(identity)
         labels = {
             "managed-by": "mcp-container-fanout",
             "mcp": self._mcp_name,
@@ -346,18 +386,22 @@ class ContainerFanout:
             f"{identity if self._scope == 'per-identity' else 'shared'}-"
             f"{int(time.time())}"
         )
+        run_kwargs: dict[str, Any] = {
+            "image": self._image,
+            "detach": True,
+            "environment": env,
+            "ports": {f"{self._container_port}/tcp": None},
+            "labels": labels,
+            "name": name,
+            # Resource hygiene defaults — override per-MCP via env if needed.
+            "mem_limit": "2g",
+            # Don't auto-restart; the orchestrator owns lifecycle.
+        }
+        if volumes:
+            run_kwargs["volumes"] = volumes
         try:
             container: Container = await asyncio.to_thread(
-                self._docker.containers.run,
-                image=self._image,
-                detach=True,
-                environment=env,
-                ports={f"{self._container_port}/tcp": None},
-                labels=labels,
-                name=name,
-                # Resource hygiene defaults — override per-MCP via env if needed.
-                mem_limit="2g",
-                # Don't auto-restart; the orchestrator owns lifecycle.
+                self._docker.containers.run, **run_kwargs,
             )
         except docker.errors.APIError as exc:
             raise HttpUpstreamFailed(

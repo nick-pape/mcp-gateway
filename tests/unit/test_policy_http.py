@@ -213,3 +213,74 @@ def test_http_mcp_rejects_image_field() -> None:
     }
     with pytest.raises(Exception, match="container-only"):
         MCPConfig.model_validate(bad)
+
+
+# ---------------------------------------------------------------------------
+# volumes_per_identity (container transport)
+# ---------------------------------------------------------------------------
+
+
+def test_container_mcp_volumes_per_identity_validates() -> None:
+    """Per-identity volumes are allowed when scope=per-identity and the template has {identity}."""
+    raw = _container_mcp() | {
+        "scope": "per-identity",
+        "volumes_per_identity": [
+            {
+                "container_path": "/home/appuser/.texas-grocery-mcp",
+                "volume_name_template": "heb-state-{identity}",
+            },
+        ],
+    }
+    cfg = MCPConfig.model_validate(raw)
+    assert len(cfg.volumes_per_identity) == 1
+    assert cfg.volumes_per_identity[0].container_path == "/home/appuser/.texas-grocery-mcp"
+    assert cfg.volumes_per_identity[0].volume_name_template == "heb-state-{identity}"
+
+
+def test_container_mcp_per_identity_rejects_volume_template_without_placeholder() -> None:
+    """A per-identity volume mount missing {identity} would collide all identities — reject."""
+    bad = _container_mcp() | {
+        "scope": "per-identity",
+        "volumes_per_identity": [
+            {"container_path": "/data", "volume_name_template": "heb-state"},
+        ],
+    }
+    with pytest.raises(Exception, match=r"\{identity\}"):
+        MCPConfig.model_validate(bad)
+
+
+def test_container_mcp_shared_scope_allows_static_volume_name() -> None:
+    """Shared-scope containers can use a static volume name (only one container exists)."""
+    raw = _container_mcp() | {
+        "scope": "shared",
+        "volumes_per_identity": [
+            {"container_path": "/data", "volume_name_template": "tech-state"},
+        ],
+    }
+    cfg = MCPConfig.model_validate(raw)
+    assert cfg.volumes_per_identity[0].volume_name_template == "tech-state"
+
+
+def test_stdio_mcp_rejects_volumes_field() -> None:
+    bad = {
+        "command": ["node", "x.js"],
+        "secret_env_name": "X",
+        "volumes_per_identity": [
+            {"container_path": "/data", "volume_name_template": "x"},
+        ],
+    }
+    with pytest.raises(Exception, match="container-only"):
+        MCPConfig.model_validate(bad)
+
+
+def test_http_mcp_rejects_volumes_field() -> None:
+    bad = {
+        "transport": "http",
+        "url": "https://x.example/mcp",
+        "auth": {"type": "jwt_passthrough"},
+        "volumes_per_identity": [
+            {"container_path": "/data", "volume_name_template": "x"},
+        ],
+    }
+    with pytest.raises(Exception, match="container-only"):
+        MCPConfig.model_validate(bad)

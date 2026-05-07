@@ -80,22 +80,21 @@ services:
     # Read-write because of the refresher; the hub never modifies
     # policy.yaml itself.
     #
-    # The same bind exposes /etc/mcp-pape-house/docker-certs/{ca,cert,key}.pem
-    # for ContainerFanout's Docker remote-API client (DOCKER_CERT_PATH below).
-    # The certs are placed there once during the docker.service.pape.house
-    # TLS-enable bootstrap; the hub treats them read-only.
+    # /var/run/docker.sock — bind-mounted so ContainerFanout can spawn
+    # wrapper containers on the SAME docker daemon (CT 120) as the hub.
+    # Means the hub container has root-equivalent on the host docker.
+    # Acceptable because cap_drop:[ALL] minimizes blast radius and the
+    # hub is the only thing on this LXC. Only consulted when at least
+    # one MCP has transport: container in policy.yaml.
     volumes:
       - /etc/mcp-pape-house:/etc/mcp-pape-house:rw
+      - /var/run/docker.sock:/var/run/docker.sock
 
-    # Per-MCP env: ContainerFanout needs DOCKER_HOST + TLS settings to talk
-    # to docker.service.pape.house's remote API. Only consulted when at
-    # least one MCP has transport: container in policy.yaml; deploys
-    # without container MCPs can leave the certs absent (the hub's startup
-    # check skips the docker client construction when not needed).
-    environment:
-      DOCKER_HOST: "tcp://docker.service.pape.house:2376"
-      DOCKER_TLS_VERIFY: "1"
-      DOCKER_CERT_PATH: "/etc/mcp-pape-house/docker-certs"
+    # ContainerFanout reaches spawned-sibling containers via the LXC
+    # host's gateway. host.docker.internal is the conventional name on
+    # Linux Docker since 20.10; resolved via the host-gateway sentinel.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # Docker secrets land at /run/secrets/<name> automatically.
     # fanout_client_secret = Authentik OAuth2 client_secret used by the

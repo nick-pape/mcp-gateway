@@ -21,6 +21,7 @@ from mcp_fanout import (
     ContainerFanout,
     HttpUpstreamFailed,
     IdentityNotFound,
+    VolumeMountSpec,
 )
 from mcp_hub.interfaces import (
     ResolvedSecret,
@@ -191,6 +192,7 @@ def _make_fanout(
     identities: list[str] | None = None,
     secrets_to_env: dict[str, SecretRef] | None = None,
     env: dict[str, str] | None = None,
+    volumes_per_identity: list[VolumeMountSpec] | None = None,
     idle_timeout_s: float = 60.0,
     spawn_timeout_s: float = 5.0,
     eviction_interval_s: float = 0.05,  # tests advance time manually; keep low
@@ -205,6 +207,7 @@ def _make_fanout(
         oidc_discovery_url="https://auth.example/application/o/mcp-fanout-svc",
         env=env or {},
         secrets_to_env=secrets_to_env or {},
+        volumes_per_identity=volumes_per_identity or [],
         auth_strategy=auth or _StaticBearer(),
         secret_backend=secret_backend,
         docker_client=docker_client,
@@ -485,6 +488,96 @@ async def test_close_tears_down_all_containers() -> None:
 # ---------------------------------------------------------------------------
 # Auth header forwarding
 # ---------------------------------------------------------------------------
+
+
+async def test_spawn_with_volumes_passes_per_identity_volume_to_docker() -> None:
+    """Volume name templates resolve to identity-specific names; docker-py shape is right."""
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        volumes_per_identity=[
+            VolumeMountSpec(
+                container_path="/home/appuser/.texas-grocery-mcp",
+                volume_name_template="heb-state-{identity}",
+            ),
+        ],
+    )
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"jsonrpc": "2.0", "id": 1}, request_context={})
+    assert len(docker.run_calls) == 1
+    volumes = docker.run_calls[0].get("volumes")
+    assert volumes is not None, "volumes kwarg should be passed to docker.containers.run"
+    assert volumes == {
+        "heb-state-alice": {
+            "bind": "/home/appuser/.texas-grocery-mcp",
+            "mode": "rw",
+        },
+    }
+    await fan.close()
+
+
+async def test_spawn_with_volumes_distinct_per_identity() -> None:
+    """Two identities → two containers → two distinct volume names."""
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        volumes_per_identity=[
+            VolumeMountSpec(container_path="/data", volume_name_template="x-{identity}"),
+        ],
+    )
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"id": 1}, request_context={})
+    await fan.call(identity="bob", request={"id": 2}, request_context={})
+    assert len(docker.run_calls) == 2
+    assert docker.run_calls[0]["volumes"] == {"x-alice": {"bind": "/data", "mode": "rw"}}
+    assert docker.run_calls[1]["volumes"] == {"x-bob": {"bind": "/data", "mode": "rw"}}
+    await fan.close()
+
+
+async def test_spawn_without_volumes_does_not_pass_volumes_kwarg() -> None:
+    """Empty volumes_per_identity: docker.containers.run gets NO `volumes` kwarg."""
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed,
+        volumes_per_identity=[],
+    )
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"id": 1}, request_context={})
+    assert "volumes" not in docker.run_calls[0]
+    await fan.close()
+
+
+async def test_spawn_with_volumes_shared_scope_uses_shared_key() -> None:
+    """Shared-scope containers can have static or {identity}-templated names; we format with 'shared'."""
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        scope="shared",
+        volumes_per_identity=[
+            VolumeMountSpec(container_path="/data", volume_name_template="static-name"),
+            VolumeMountSpec(container_path="/data2", volume_name_template="x-{identity}"),
+        ],
+    )
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"id": 1}, request_context={})
+    volumes = docker.run_calls[0]["volumes"]
+    assert volumes["static-name"]["bind"] == "/data"
+    assert volumes["x-shared"]["bind"] == "/data2"
+    await fan.close()
 
 
 async def test_auth_strategy_called_with_identity_and_request_context() -> None:

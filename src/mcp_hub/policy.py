@@ -107,6 +107,26 @@ class SecretRefModel(BaseModel):
     field: str
 
 
+class VolumeMount(BaseModel):
+    """A persistent Docker volume mount for a container-transport MCP.
+
+    For per-identity scope, ``volume_name_template`` MUST contain
+    ``{identity}`` so each identity gets its own volume (otherwise all
+    identities collide on a single shared volume — defeats the purpose).
+    For shared scope, the placeholder is optional (a static name is fine
+    since there's only one container).
+
+    Volumes are auto-created by Docker on first mount; the orchestrator
+    does NOT remove them on container teardown — they persist across
+    spawn/evict cycles, which is the whole point. Operator removes
+    manually if an identity is decommissioned.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    container_path: str
+    volume_name_template: str
+
+
 class AuthStrategyConfig(BaseModel):
     """Discriminated config for an HTTP MCP's auth strategy.
 
@@ -178,6 +198,12 @@ class MCPConfig(BaseModel):
     # resolved value as that env var. ``path`` may include ``{identity}``
     # which is formatted at spawn time. Token never lands on disk.
     secrets_to_env: dict[str, SecretRefModel] = Field(default_factory=dict)
+    # volumes_per_identity: Docker named-volume mounts that persist across
+    # container teardown/respawn. Use ONLY for MCPs that legitimately need
+    # persistent session state beyond an env-injected token (e.g. HEB's
+    # Playwright cookies + auth.json). Most MCPs leave this empty — tokens
+    # flow via `secrets_to_env`, which is in-memory only.
+    volumes_per_identity: list[VolumeMount] = Field(default_factory=list)
 
     # http + container shared field (required for both)
     auth: AuthStrategyConfig | None = None
@@ -281,6 +307,25 @@ class MCPConfig(BaseModel):
                     f"transport=container: audience_template must contain "
                     f"{{identity}} placeholder, got: {self.audience_template!r}"
                 )
+            # volumes_per_identity: per-identity scope MUST have {identity}
+            # in the volume name template; otherwise all identities collide
+            # on a single shared volume (defeats the per-identity isolation
+            # this transport exists to provide).
+            if self.scope == "per-identity":
+                for vm in self.volumes_per_identity:
+                    if "{identity}" not in vm.volume_name_template:
+                        raise ValueError(
+                            f"transport=container, scope=per-identity: "
+                            f"volumes_per_identity entry's volume_name_template "
+                            f"must contain {{identity}}, got: "
+                            f"{vm.volume_name_template!r}"
+                        )
+        # stdio + http transports reject volumes_per_identity (container-only).
+        if self.transport != "container" and self.volumes_per_identity:
+            raise ValueError(
+                f"transport={self.transport}: field 'volumes_per_identity' is "
+                f"container-only"
+            )
         return self
 
 

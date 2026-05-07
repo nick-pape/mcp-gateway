@@ -39,6 +39,7 @@ from .container_fanout import (
     DEFAULT_IDLE_TIMEOUT_S,
     DEFAULT_SPAWN_TIMEOUT_S,
     ContainerFanout,
+    VolumeMountSpec,
 )
 from .exceptions import (
     BackendChildDead,
@@ -74,4 +75,5 @@ __all__ = [
     "HttpUpstreamFailed",
     "IdentityConfig",
     "IdentityNotFound",
+    "VolumeMountSpec",
 ]
