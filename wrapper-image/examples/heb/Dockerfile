@@ -57,9 +57,26 @@ RUN pip install --no-cache-dir \
         "httpx>=0.28,<1.0" \
         "authlib>=1.3,<2.0"
 
-# texas-grocery-mcp + browser extra. Playwright Python is already in the
-# base image; the [browser] extra pulls in the Python-side helpers.
-RUN pip install --no-cache-dir "texas-grocery-mcp[browser]"
+# texas-grocery-mcp + browser extra. Pinned to nick-pape/main @ 70be2eb
+# (our fork of mgwalkerjr95/texas-grocery-mcp). The fork adds in-process
+# self-heal for HEB's GraphQL persisted-query rotations: on a stale-hash
+# error the client runs a Playwright sweep over a few HEB pages, captures
+# the rotated sha256Hash, persists the override to
+# /home/appuser/.texas-grocery-mcp/hash_overrides.json (volume-backed),
+# and retries the original call once. First call after a rotation pays
+# ~10-15s rediscovery; subsequent calls are fast and cold spawns load
+# overrides from cache.
+#
+# The fork ships with upstream's now-stale `cartEstimated` and
+# `cartItemV2` defaults intentionally — the first heb_cart_* call IS
+# the smoke test for the self-heal loop. If that ever regresses,
+# revert this pin to `git+https://github.com/sleepgood/texas-grocery-mcp.git@6f797a8`
+# (which has the post-rotation hashes baked in but no self-heal).
+#
+# Playwright Python is already in the base image; the [browser] extra
+# pulls in the Python-side helpers.
+RUN pip install --no-cache-dir \
+    "texas-grocery-mcp[browser] @ git+https://github.com/nick-pape/texas-grocery-mcp.git@70be2eb"
 
 # The base entrypoint comes from wrapper-image/ (the build context).
 COPY entrypoint.py /app/entrypoint.py

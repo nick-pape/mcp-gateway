@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IDLE_TIMEOUT_S: float = 1200.0       # 20 min
 DEFAULT_SPAWN_TIMEOUT_S: float = 60.0
-DEFAULT_REQUEST_TIMEOUT_S: float = 30.0
+DEFAULT_REQUEST_TIMEOUT_S: float = 180.0  # tolerates HEB Playwright self-heal (~30-60s sweep)
 DEFAULT_EVICTION_INTERVAL_S: float = 60.0
 DEFAULT_CONTAINER_PORT: int = 8080
 DEFAULT_AUDIENCE_TEMPLATE: str = "mcp-{identity}"
