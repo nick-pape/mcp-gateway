@@ -156,7 +156,11 @@ async def _async_main() -> int:
             "resource": f"{base}/mcp",
             "authorization_servers": [base],
             "bearer_methods_supported": ["header"],
-            "scopes_supported": ["openid", "profile", "email"],
+            # offline_access is the standard scope a client requests to
+            # opt into refresh-token issuance (RFC 6749 §1.5 / SEP-2207).
+            # Claude Code today doesn't try refresh, but advertising the
+            # scope here means we're correct from the day it ships.
+            "scopes_supported": ["openid", "profile", "email", "offline_access"],
         })
 
     async def oauth_authorization_server(request: Request) -> Response:
@@ -171,7 +175,8 @@ async def _async_main() -> int:
             "userinfo_endpoint": f"{AUTHENTIK_BASE}/application/o/userinfo/",
             "jwks_uri": f"{AUTHENTIK_BASE}/application/o/{INTERACTIVE_CLIENT_ID}/jwks/",
             "registration_endpoint": f"{base}/oauth/register",
-            "scopes_supported": ["openid", "profile", "email"],
+            # See oauth_protected_resource for why offline_access is here.
+            "scopes_supported": ["openid", "profile", "email", "offline_access"],
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
