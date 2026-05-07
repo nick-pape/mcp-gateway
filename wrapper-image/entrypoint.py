@@ -18,6 +18,7 @@ Optional env:
     LOG_LEVEL              default INFO
     JWT_CLOCK_SKEW_S       default 30
     JWKS_CACHE_TTL_S       default 600
+    MCP_REQUEST_TIMEOUT_S  default 180  (per-request stdio child wait)
 """
 
 from __future__ import annotations
@@ -65,6 +66,14 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 JWT_CLOCK_SKEW_S = int(os.environ.get("JWT_CLOCK_SKEW_S", "30"))
 JWKS_CACHE_TTL_S = int(os.environ.get("JWKS_CACHE_TTL_S", "600"))
+# Upper bound on how long the wrapper waits for the stdio MCP child to
+# answer a single tools/call. Must be >= the slowest in-band operation
+# the child performs (HEB self-heal can run a 60s Playwright sweep).
+# Hub's ContainerFanout.DEFAULT_REQUEST_TIMEOUT_S is 180s; matching here
+# means the hub-side timeout fires first if anything is truly stuck,
+# rather than the wrapper returning 504 with a still-in-flight call
+# that pollutes the stdio buffer for the next request.
+MCP_REQUEST_TIMEOUT_S = float(os.environ.get("MCP_REQUEST_TIMEOUT_S", "180"))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -292,9 +301,14 @@ async def mcp(request: Request, _claims: dict[str, Any] = Depends(jwt_dep)):
     if not isinstance(body, dict):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "body must be a JSON object")
     try:
-        response = await asyncio.wait_for(app.state.child.call(body), timeout=60.0)
+        response = await asyncio.wait_for(
+            app.state.child.call(body), timeout=MCP_REQUEST_TIMEOUT_S
+        )
     except asyncio.TimeoutError:
-        raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, "stdio child did not respond within 60s")
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            f"stdio child did not respond within {MCP_REQUEST_TIMEOUT_S:.0f}s",
+        )
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc))
     if response is None:
