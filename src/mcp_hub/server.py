@@ -55,6 +55,18 @@ from .policy import Policy
 logger = logging.getLogger(__name__)
 
 
+# Sentinel used as the default value for non-required parameters in the
+# forged tool signature. FastMCP unpacks the call's arguments through the
+# forged signature; if the agent omitted an optional parameter, the
+# handler receives _UNSET for it. We strip _UNSET-valued kwargs before
+# forwarding to the upstream MCP. This preserves the agent's ability to
+# intentionally pass JSON null (which arrives as Python None) for tools
+# whose schemas declare a field nullable, while not forwarding a fake
+# null for fields the agent never set — Outline's Zod schemas reject
+# null on plain `string`/`boolean` optional fields.
+_UNSET: Any = object()
+
+
 # Both fanouts implement this duck-typed interface (mcp_name,
 # identities, start_eager_or_die, call, close). server.py treats them
 # uniformly via this union.
@@ -252,6 +264,13 @@ class Hub:
             # the middleware mutation. Justification is hub-only metadata
             # and the upstream MCP would reject it as an unknown parameter.
             arguments.pop("justification", None)
+            # Drop kwargs whose value is the _UNSET sentinel — these are
+            # optional parameters the agent didn't pass, which FastMCP
+            # filled in from the forged signature's default. Forwarding
+            # them as JSON null breaks upstream MCPs whose optional-field
+            # schemas don't declare nullable=true (e.g. Outline's Zod).
+            # Explicit None from the agent is preserved.
+            arguments = {k: v for k, v in arguments.items() if v is not _UNSET}
             # Build request_context for HTTP-fanout auth strategies.
             # Only HttpFanout reads it; stdio Fanout ignores the kwarg.
             bearer_token = ctx.get_state(CTX_KEY_BEARER_TOKEN)
@@ -296,7 +315,7 @@ class Hub:
             _inspect.Parameter(
                 name=prop_name,
                 kind=_inspect.Parameter.KEYWORD_ONLY,
-                default=_inspect.Parameter.empty if prop_name in required else None,
+                default=_inspect.Parameter.empty if prop_name in required else _UNSET,
                 annotation=Any,
             )
             for prop_name in properties
