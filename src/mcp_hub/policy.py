@@ -130,21 +130,25 @@ class AuthStrategyConfig(BaseModel):
 class MCPConfig(BaseModel):
     """One backend MCP entry.
 
-    Two transports are supported, selected by ``transport``:
+    Three transports are supported, selected by ``transport``:
 
     - ``stdio`` (default): the historical pattern. Spawns subprocesses
       via :class:`mcp_fanout.Fanout`. Requires ``command`` and
-      ``secret_env_name``.
-    - ``http``: federates an external Streamable-HTTP MCP via
-      :class:`mcp_fanout.HttpFanout`. Requires ``url`` and ``auth``.
+      ``secret_env_name``. Slated for deprecation once Technitium migrates
+      to ``container``.
+    - ``http``: federates an external already-running Streamable-HTTP MCP
+      via :class:`mcp_fanout.HttpFanout`. Requires ``url`` and ``auth``.
+      Used for upstreams the hub doesn't manage (Outline, KitchenOwl).
+    - ``container``: orchestrates wrapper containers on demand via
+      :class:`mcp_fanout.ContainerFanout`. Requires ``image``. Per-spawn
+      env injection (including bao-resolved secrets) lands in the
+      container's process env and never on disk.
 
-    Field-presence is validated post-hoc (a single config can't satisfy
-    both transports' requirements without listing fields irrelevant to
-    one) — see :meth:`_check_transport_fields`.
+    Field-presence is validated per-transport — see :meth:`_check_transport_fields`.
     """
 
     model_config = ConfigDict(extra="forbid")
-    transport: Literal["stdio", "http"] = "stdio"
+    transport: Literal["stdio", "http", "container"] = "stdio"
 
     # stdio fields (required when transport == "stdio")
     command: list[str] | None = Field(default=None)
@@ -154,6 +158,28 @@ class MCPConfig(BaseModel):
 
     # http fields (required when transport == "http")
     url: str | None = None
+
+    # container fields (required when transport == "container")
+    image: str | None = None
+    # "per-identity" → one container per identity (default; the per-user
+    # isolation case, e.g., HEB).
+    # "shared"       → one container regardless of caller (e.g., Technitium —
+    #                  one DNS API token, used by everyone).
+    scope: Literal["per-identity", "shared"] = "per-identity"
+    idle_timeout_s: float = 1200.0     # 20 min
+    spawn_timeout_s: float = 60.0
+    eviction_interval_s: float = 60.0
+    audience_template: str = "mcp-{identity}"
+    # env: pass-through env vars set on every spawned container of this MCP.
+    # Static — not bao-resolved. For sensitive runtime values use secrets_to_env.
+    env: dict[str, str] = Field(default_factory=dict)
+    # secrets_to_env: ENV_VAR -> SecretRef(path, field). The orchestrator
+    # resolves each ref via the SecretBackend at spawn time and injects the
+    # resolved value as that env var. ``path`` may include ``{identity}``
+    # which is formatted at spawn time. Token never lands on disk.
+    secrets_to_env: dict[str, SecretRefModel] = Field(default_factory=dict)
+
+    # http + container shared field (required for both)
     auth: AuthStrategyConfig | None = None
 
     @field_validator("command")
@@ -174,42 +200,86 @@ class MCPConfig(BaseModel):
             if not self.secret_env_name:
                 missing.append("secret_env_name")
             if missing:
-                raise ValueError(
-                    f"transport=stdio requires fields: {missing}"
-                )
-            # http-only fields must NOT be set on a stdio entry
+                raise ValueError(f"transport=stdio requires fields: {missing}")
+            # Fields that belong to other transports must NOT be set here.
             for forbidden in ("url", "auth"):
                 if getattr(self, forbidden) is not None:
                     raise ValueError(
                         f"transport=stdio: field {forbidden!r} is http-only"
                     )
-        else:  # transport == "http"
+            if self.image is not None:
+                raise ValueError("transport=stdio: field 'image' is container-only")
+            if self.secrets_to_env:
+                raise ValueError(
+                    "transport=stdio: field 'secrets_to_env' is container-only"
+                )
+            if self.env:
+                raise ValueError(
+                    "transport=stdio: use 'extra_env' instead of 'env'"
+                )
+        elif self.transport == "http":
             missing_http: list[str] = []
             if self.url is None or not self.url:
                 missing_http.append("url")
             if self.auth is None:
                 missing_http.append("auth")
             if missing_http:
-                raise ValueError(
-                    f"transport=http requires fields: {missing_http}"
-                )
-            # stdio-only fields must NOT be set on an http entry
+                raise ValueError(f"transport=http requires fields: {missing_http}")
+            # stdio/container-only fields must NOT be set on an http entry
             if self.command is not None:
                 raise ValueError("transport=http: field 'command' is stdio-only")
             if self.secret_env_name is not None:
-                raise ValueError(
-                    "transport=http: field 'secret_env_name' is stdio-only"
-                )
+                raise ValueError("transport=http: field 'secret_env_name' is stdio-only")
             if self.uid_offset != 0:
                 raise ValueError("transport=http: field 'uid_offset' is stdio-only")
             if self.extra_env:
                 raise ValueError("transport=http: field 'extra_env' is stdio-only")
-            # url is non-None per the missing-list check above; reassert
-            # for the type checker.
+            if self.image is not None:
+                raise ValueError("transport=http: field 'image' is container-only")
+            if self.env:
+                raise ValueError("transport=http: field 'env' is container-only")
+            if self.secrets_to_env:
+                raise ValueError(
+                    "transport=http: field 'secrets_to_env' is container-only"
+                )
             assert self.url is not None
             if not self.url.startswith(("http://", "https://")):
                 raise ValueError(
                     f"transport=http: url must be http(s)://, got {self.url!r}"
+                )
+        else:  # transport == "container"
+            missing_c: list[str] = []
+            if not self.image:
+                missing_c.append("image")
+            if self.auth is None:
+                missing_c.append("auth")
+            if missing_c:
+                raise ValueError(f"transport=container requires fields: {missing_c}")
+            # stdio/http-only fields must NOT be set
+            if self.command is not None:
+                raise ValueError("transport=container: field 'command' is stdio-only")
+            if self.secret_env_name is not None:
+                raise ValueError(
+                    "transport=container: field 'secret_env_name' is stdio-only"
+                )
+            if self.uid_offset != 0:
+                raise ValueError(
+                    "transport=container: field 'uid_offset' is stdio-only"
+                )
+            if self.extra_env:
+                raise ValueError(
+                    "transport=container: use 'env' instead of 'extra_env'"
+                )
+            if self.url is not None:
+                raise ValueError("transport=container: field 'url' is http-only")
+            if self.idle_timeout_s <= 0:
+                raise ValueError("transport=container: idle_timeout_s must be > 0")
+            if self.spawn_timeout_s <= 0:
+                raise ValueError("transport=container: spawn_timeout_s must be > 0")
+            if "{identity}" not in self.audience_template:
+                raise ValueError(
+                    f"transport=container: audience_template must contain "
+                    f"{{identity}} placeholder, got: {self.audience_template!r}"
                 )
         return self
 

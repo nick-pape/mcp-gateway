@@ -105,3 +105,111 @@ def test_jwt_passthrough_strategy_validates() -> None:
     cfg = HubConfig.model_validate(raw)
     assert cfg.mcps["outline"].auth is not None
     assert cfg.mcps["outline"].auth.type == "jwt_passthrough"
+
+
+# ---------------------------------------------------------------------------
+# Container-transport schema
+# ---------------------------------------------------------------------------
+
+
+def _container_mcp() -> dict[str, object]:
+    """A minimal valid container-transport MCP entry."""
+    return {
+        "transport": "container",
+        "image": "mcp-pape-house/heb-mcp-wrapper:test",
+        "auth": {"type": "jwt_passthrough"},
+    }
+
+
+def test_container_mcp_validates_with_defaults() -> None:
+    cfg = MCPConfig.model_validate(_container_mcp())
+    assert cfg.transport == "container"
+    assert cfg.scope == "per-identity"
+    assert cfg.idle_timeout_s == 1200.0
+    assert cfg.audience_template == "mcp-{identity}"
+    assert cfg.env == {}
+    assert cfg.secrets_to_env == {}
+
+
+def test_container_mcp_validates_with_full_config() -> None:
+    raw = _container_mcp() | {
+        "scope": "shared",
+        "idle_timeout_s": 600.0,
+        "spawn_timeout_s": 30.0,
+        "eviction_interval_s": 30.0,
+        "audience_template": "homelab-{identity}",
+        "env": {"MCP_COMMAND": "texas-grocery-mcp", "HEB_DEFAULT_STORE": "590"},
+        "secrets_to_env": {
+            "HEB_PROXY_TOKEN": {"path": "services/heb/{identity}", "field": "api_token"},
+        },
+    }
+    cfg = MCPConfig.model_validate(raw)
+    assert cfg.scope == "shared"
+    assert cfg.idle_timeout_s == 600.0
+    assert cfg.audience_template == "homelab-{identity}"
+    assert cfg.env["HEB_DEFAULT_STORE"] == "590"
+    assert "HEB_PROXY_TOKEN" in cfg.secrets_to_env
+    assert cfg.secrets_to_env["HEB_PROXY_TOKEN"].path == "services/heb/{identity}"
+
+
+def test_container_mcp_requires_image() -> None:
+    bad = _container_mcp()
+    del bad["image"]
+    with pytest.raises(Exception, match="image"):
+        MCPConfig.model_validate(bad)
+
+
+def test_container_mcp_requires_auth() -> None:
+    bad = _container_mcp()
+    del bad["auth"]
+    with pytest.raises(Exception, match="auth"):
+        MCPConfig.model_validate(bad)
+
+
+def test_container_mcp_rejects_stdio_command_field() -> None:
+    bad = _container_mcp()
+    bad["command"] = ["node", "x.js"]
+    with pytest.raises(Exception, match="stdio-only"):
+        MCPConfig.model_validate(bad)
+
+
+def test_container_mcp_rejects_http_url_field() -> None:
+    bad = _container_mcp()
+    bad["url"] = "https://x"
+    with pytest.raises(Exception, match="http-only"):
+        MCPConfig.model_validate(bad)
+
+
+def test_container_mcp_rejects_zero_idle_timeout() -> None:
+    bad = _container_mcp()
+    bad["idle_timeout_s"] = 0
+    with pytest.raises(Exception, match="idle_timeout_s"):
+        MCPConfig.model_validate(bad)
+
+
+def test_container_mcp_rejects_audience_template_without_placeholder() -> None:
+    bad = _container_mcp()
+    bad["audience_template"] = "fixed-audience"
+    with pytest.raises(Exception, match="\\{identity\\}"):
+        MCPConfig.model_validate(bad)
+
+
+def test_stdio_mcp_rejects_image_field() -> None:
+    bad = {
+        "command": ["node", "x.js"],
+        "secret_env_name": "X",
+        "image": "some-image",
+    }
+    with pytest.raises(Exception, match="container-only"):
+        MCPConfig.model_validate(bad)
+
+
+def test_http_mcp_rejects_image_field() -> None:
+    bad = {
+        "transport": "http",
+        "url": "https://x.example/mcp",
+        "auth": {"type": "jwt_passthrough"},
+        "image": "some-image",
+    }
+    with pytest.raises(Exception, match="container-only"):
+        MCPConfig.model_validate(bad)

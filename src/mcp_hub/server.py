@@ -36,13 +36,13 @@ from typing import Any
 from fastmcp import FastMCP
 from mcp.types import TextContent
 
-from mcp_fanout import Fanout, HttpFanout
+from mcp_fanout import ContainerFanout, Fanout, HttpFanout
 
 from .audit import Audit
 from .auth import AuthentikJWTValidator
 from .auth_strategies import CTX_KEY_BEARER_TOKEN
 from .errors import ErrorCode
-from .factory import build_fanout
+from .factory import build_docker_client, build_fanout
 from .interfaces import Approver, SecretBackend
 from .middleware import (
     AuditMiddleware,
@@ -67,10 +67,10 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
-# Both fanouts implement this duck-typed interface (mcp_name,
+# All three fanouts implement this duck-typed interface (mcp_name,
 # identities, start_eager_or_die, call, close). server.py treats them
 # uniformly via this union.
-FanoutLike = Fanout | HttpFanout
+FanoutLike = Fanout | HttpFanout | ContainerFanout
 
 
 class Hub:
@@ -120,8 +120,16 @@ class Hub:
         Failure during any fanout's start aborts the whole hub.
         """
         # 1. Build all fanouts — one per MCP defined in policy. The
-        #    factory dispatches to stdio Fanout vs HttpFanout based on
-        #    each MCP's transport setting.
+        #    factory dispatches to stdio Fanout vs HttpFanout vs
+        #    ContainerFanout based on each MCP's transport setting.
+        # 1a. Lazily construct a Docker client only if any container-transport
+        #     MCP is present. The hub deploys without DOCKER_HOST configured
+        #     don't pay the import cost for the docker SDK.
+        docker_client: object | None = None
+        if any(
+            mc.transport == "container" for mc in self._policy.config.mcps.values()
+        ):
+            docker_client = build_docker_client()
         for mcp_name, mcp_config in self._policy.config.mcps.items():
             self._fanouts[mcp_name] = build_fanout(
                 mcp_name,
@@ -129,6 +137,8 @@ class Hub:
                 identities=self._policy.config.identities,
                 secret_backend=self._secret_backend,
                 runtime_dir=self._runtime_dir,
+                auth_config=self._policy.config.auth,
+                docker_client=docker_client,
             )
         # 2. Eager-spawn each in turn. If any fails, close already-started
         #    ones before re-raising.

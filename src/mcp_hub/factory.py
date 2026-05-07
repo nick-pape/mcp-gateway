@@ -22,7 +22,12 @@ from pathlib import Path
 
 import httpx
 
-from mcp_fanout import Fanout, HttpFanout, IdentityConfig
+from mcp_fanout import (
+    ContainerFanout,
+    Fanout,
+    HttpFanout,
+    IdentityConfig,
+)
 
 from .approvers.auto import AutoApprover
 from .approvers.ntfy import NtfyApprover
@@ -35,7 +40,7 @@ from .auth_strategies import (
 )
 from .bao_client import BaoClient
 from .interfaces import Approver, SecretBackend, SecretRef
-from .policy import AuthStrategyConfig, HubConfig, IdentityPolicy, MCPConfig
+from .policy import AuthConfig, AuthStrategyConfig, HubConfig, IdentityPolicy, MCPConfig
 from .refresher import (
     RefresherManager,
     TokenRefresher,
@@ -232,17 +237,24 @@ def build_fanout(
     identities: dict[str, IdentityPolicy],
     secret_backend: SecretBackend,
     runtime_dir: Path,
+    auth_config: AuthConfig | None = None,
+    docker_client: object | None = None,
     http_client: httpx.AsyncClient | None = None,
-) -> Fanout | HttpFanout:
+) -> Fanout | HttpFanout | ContainerFanout:
     """Dispatch to the right Fanout impl based on ``mcp_config.transport``.
 
     For ``stdio``: builds the per-identity :class:`IdentityConfig` list
-    from each identity's ``secrets[mcp_name]`` entry, exactly as the
-    pre-HTTP server.py did.
+    from each identity's ``secrets[mcp_name]`` entry.
 
     For ``http``: builds an :class:`HttpFanout` with the strategy from
     ``mcp_config.auth``. Identities are derived from ``allowed_tools``
     globs (no per-MCP secret entry required for HTTP).
+
+    For ``container``: builds a :class:`ContainerFanout`. Requires
+    ``docker_client`` (caller passes one shared instance — see
+    :func:`build_docker_client`) and ``auth_config`` (for OIDC issuer +
+    discovery URL injected into spawned wrappers). Identities are
+    derived from ``allowed_tools`` globs, same as http transport.
     """
     if mcp_config.transport == "stdio":
         # Mypy: model_validator guaranteed these are non-None for stdio.
@@ -277,28 +289,103 @@ def build_fanout(
             extra_env=mcp_config.extra_env,
         )
 
-    # http transport
-    assert mcp_config.url is not None
+    if mcp_config.transport == "http":
+        assert mcp_config.url is not None
+        assert mcp_config.auth is not None
+        http_identities = _identities_for_http_mcp(mcp_name, identities)
+        if not http_identities:
+            raise ValueError(
+                f"MCP {mcp_name!r} (http) is configured but no identity's "
+                f"allowed_tools globs cover it (no glob with prefix "
+                f"{mcp_name!r} or '*')"
+            )
+        strategy = build_auth_strategy(
+            mcp_name=mcp_name,
+            config=mcp_config.auth,
+            secret_backend=secret_backend,
+        )
+        return HttpFanout(
+            mcp_name=mcp_name,
+            url=mcp_config.url,
+            auth_strategy=strategy,
+            identities=http_identities,
+            http_client=http_client,
+        )
+
+    # container transport
+    assert mcp_config.image is not None
     assert mcp_config.auth is not None
-    http_identities = _identities_for_http_mcp(mcp_name, identities)
-    if not http_identities:
+    if docker_client is None:
         raise ValueError(
-            f"MCP {mcp_name!r} (http) is configured but no identity's "
+            f"MCP {mcp_name!r} (container) requires a docker client; "
+            f"caller must pass docker_client= (typically constructed via "
+            f"build_docker_client())"
+        )
+    if auth_config is None:
+        raise ValueError(
+            f"MCP {mcp_name!r} (container) requires auth_config= (for OIDC "
+            f"issuer + discovery URL passed into spawned wrappers)"
+        )
+    container_identities = _identities_for_http_mcp(mcp_name, identities)
+    if not container_identities:
+        raise ValueError(
+            f"MCP {mcp_name!r} (container) is configured but no identity's "
             f"allowed_tools globs cover it (no glob with prefix "
             f"{mcp_name!r} or '*')"
         )
-    strategy = build_auth_strategy(
+    container_strategy = build_auth_strategy(
         mcp_name=mcp_name,
         config=mcp_config.auth,
         secret_backend=secret_backend,
     )
-    return HttpFanout(
+    if auth_config.oidc_discovery_url is None:
+        raise ValueError(
+            f"MCP {mcp_name!r} (container): policy.auth.oidc_discovery_url "
+            f"must be set when any container-transport MCP is configured "
+            f"(spawned wrappers fetch JWKS from it)"
+        )
+    secrets_to_env = {
+        env_var: SecretRef(path=ref.path, field=ref.field)
+        for env_var, ref in mcp_config.secrets_to_env.items()
+    }
+    return ContainerFanout(
         mcp_name=mcp_name,
-        url=mcp_config.url,
-        auth_strategy=strategy,
-        identities=http_identities,
+        image=mcp_config.image,
+        scope=mcp_config.scope,
+        identities=container_identities,
+        oidc_issuer=auth_config.issuer,
+        oidc_discovery_url=auth_config.oidc_discovery_url,
+        audience_template=mcp_config.audience_template,
+        env=mcp_config.env,
+        secrets_to_env=secrets_to_env,
+        auth_strategy=container_strategy,
+        secret_backend=secret_backend,
+        docker_client=docker_client,
+        idle_timeout_s=mcp_config.idle_timeout_s,
+        spawn_timeout_s=mcp_config.spawn_timeout_s,
+        eviction_interval_s=mcp_config.eviction_interval_s,
         http_client=http_client,
     )
+
+
+def build_docker_client(env_overrides: dict[str, str] | None = None) -> object:
+    """Construct a Docker SDK client from env (DOCKER_HOST, DOCKER_TLS_VERIFY, DOCKER_CERT_PATH).
+
+    Returns ``Any`` to keep ``factory.py``'s top-level imports clean of the
+    docker SDK in case some deploys never enable container-transport MCPs.
+    Caller passes the result to :func:`build_fanout` for container MCPs.
+    """
+    import os
+
+    import docker
+
+    if env_overrides:
+        # Apply overrides only for this client construction; restore after.
+        # In practice the orchestrator just relies on the deploy-time env
+        # of the hub container.
+        for k, v in env_overrides.items():
+            os.environ[k] = v
+    return docker.from_env(version="auto", timeout=10)
 
 
 # ---------------------------------------------------------------------------

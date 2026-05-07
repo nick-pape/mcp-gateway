@@ -1,0 +1,510 @@
+"""Tests for :class:`mcp_fanout.ContainerFanout`.
+
+Mocks the Docker SDK and a :class:`SecretBackend` to exercise the
+on-demand spawn / per-identity isolation / eviction / lifecycle paths
+without touching a real Docker daemon. The /ready and /mcp endpoints
+inside spawned containers are stubbed via :class:`httpx.MockTransport`
+keyed on the container's host:port URL.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Any
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
+
+from mcp_fanout import (
+    ContainerFanout,
+    HttpUpstreamFailed,
+    IdentityNotFound,
+)
+from mcp_hub.interfaces import (
+    ResolvedSecret,
+    SecretRef,
+    SecretResolutionError,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class _StaticBearer:
+    """Stub AuthStrategy returning a configured Bearer token verbatim."""
+
+    name: str = "static_bearer"
+
+    def __init__(self, token: str = "dummy-jwt") -> None:
+        self._token = token
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.closed = False
+
+    async def auth_header(
+        self, *, identity: str, request_context: dict[str, Any]
+    ) -> dict[str, str]:
+        self.calls.append((identity, dict(request_context)))
+        return {"Authorization": f"Bearer {self._token}"}
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _StubSecretBackend:
+    """In-memory SecretBackend keyed by (mcp, identity, path, field)."""
+
+    name: str = "stub"
+
+    def __init__(self, *, secrets: dict[tuple[str, str, str, str], str] | None = None) -> None:
+        self._secrets = dict(secrets or {})
+        self.resolutions: list[tuple[str, str, str, str]] = []
+        self.fail_for: set[tuple[str, str, str, str]] = set()
+
+    async def resolve(
+        self,
+        *,
+        mcp: str,
+        identity: str,
+        ref: SecretRef,
+    ) -> ResolvedSecret:
+        key = (mcp, identity, ref.path, ref.field)
+        self.resolutions.append(key)
+        if key in self.fail_for:
+            raise SecretResolutionError(f"stub: forced fail for {key}")
+        if key not in self._secrets:
+            raise SecretResolutionError(f"stub: no secret for {key}")
+        return ResolvedSecret(value=self._secrets[key])
+
+    async def close(self) -> None:
+        return None
+
+
+class _FakeContainer:
+    """Mimics docker.models.containers.Container's attribute surface."""
+
+    def __init__(self, *, name: str, host_port: int) -> None:
+        self.name = name
+        self.short_id = name[:12]
+        self.status = "running"
+        self.attrs = {
+            "NetworkSettings": {
+                "Ports": {"8080/tcp": [{"HostPort": str(host_port)}]},
+            },
+        }
+        self._host_port = host_port
+        self.removed: bool = False
+        self.removed_force: bool = False
+        self.reload_calls: int = 0
+
+    def reload(self) -> None:
+        self.reload_calls += 1
+
+    def remove(self, *, force: bool = False) -> None:
+        self.removed = True
+        self.removed_force = force
+
+
+class _FakeDockerClient:
+    """Mimics docker.DockerClient minimal surface used by ContainerFanout."""
+
+    def __init__(self, *, image_present: bool = True, ping_ok: bool = True) -> None:
+        self._image_present = image_present
+        self._ping_ok = ping_ok
+        self.spawned: list[_FakeContainer] = []
+        self.run_calls: list[dict[str, Any]] = []  # kwargs of each containers.run call
+        self._port_seq = 12000
+        self.images = MagicMock()
+        self.images.get = self._images_get
+        self.containers = MagicMock()
+        self.containers.run = self._containers_run
+
+    def ping(self) -> bool:
+        if not self._ping_ok:
+            import docker.errors  # type: ignore[import-untyped]
+
+            raise docker.errors.APIError("ping failed (forced)")
+        return True
+
+    def _images_get(self, image: str) -> Any:
+        if not self._image_present:
+            import docker.errors  # type: ignore[import-untyped]
+
+            raise docker.errors.ImageNotFound(f"image not found: {image}")
+        return MagicMock(id=f"sha256:{image}")
+
+    def _containers_run(self, **kwargs: Any) -> _FakeContainer:
+        # Record the kwargs for assertions (we replaced containers.run with
+        # a plain method, so MagicMock's call_args isn't available).
+        self.run_calls.append(dict(kwargs))
+        name = kwargs.get("name", f"container-{self._port_seq}")
+        self._port_seq += 1
+        c = _FakeContainer(name=name, host_port=self._port_seq)
+        self.spawned.append(c)
+        return c
+
+
+class _RoutedTransport:
+    """httpx MockTransport that routes by URL path.
+
+    The fanout calls ``GET http://<host>:<port>/ready`` and
+    ``POST http://<host>:<port>/mcp``. We respond per-path; tests can
+    override per-port if they want to simulate spawn-not-ready.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+        self.ready_status_per_port: dict[int, int] = {}
+        self.mcp_responses: list[tuple[int, dict[str, Any] | str]] = []
+        self.default_ready_status: int = 200
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handler)
+
+    def _handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        port = int(request.url.port or 0)
+        if request.url.path == "/ready":
+            status = self.ready_status_per_port.get(port, self.default_ready_status)
+            return httpx.Response(status, json={"status": "ready"})
+        if request.url.path == "/mcp":
+            if not self.mcp_responses:
+                return httpx.Response(
+                    200, json={"jsonrpc": "2.0", "id": 1, "result": {"ok": True}},
+                )
+            status, body = self.mcp_responses.pop(0)
+            if isinstance(body, dict):
+                return httpx.Response(status, json=body)
+            return httpx.Response(status, text=body)
+        return httpx.Response(404, text=f"unexpected path: {request.url.path}")
+
+
+def _make_fanout(
+    *,
+    docker_client: _FakeDockerClient,
+    secret_backend: _StubSecretBackend,
+    routed: _RoutedTransport,
+    scope: str = "per-identity",
+    identities: list[str] | None = None,
+    secrets_to_env: dict[str, SecretRef] | None = None,
+    env: dict[str, str] | None = None,
+    idle_timeout_s: float = 60.0,
+    spawn_timeout_s: float = 5.0,
+    eviction_interval_s: float = 0.05,  # tests advance time manually; keep low
+    auth: _StaticBearer | None = None,
+) -> ContainerFanout:
+    return ContainerFanout(
+        mcp_name="heb",
+        image="mcp-pape-house/heb-mcp-wrapper:test",
+        scope=scope,
+        identities=identities or ["alice", "bob"],
+        oidc_issuer="https://auth.example/",
+        oidc_discovery_url="https://auth.example/application/o/mcp-fanout-svc",
+        env=env or {},
+        secrets_to_env=secrets_to_env or {},
+        auth_strategy=auth or _StaticBearer(),
+        secret_backend=secret_backend,
+        docker_client=docker_client,
+        idle_timeout_s=idle_timeout_s,
+        spawn_timeout_s=spawn_timeout_s,
+        eviction_interval_s=eviction_interval_s,
+        container_host="127.0.0.1",
+        http_client=httpx.AsyncClient(transport=routed.transport()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# start_eager_or_die
+# ---------------------------------------------------------------------------
+
+
+async def test_start_eager_or_die_success() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient(ping_ok=True, image_present=True)
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(docker_client=docker, secret_backend=secrets, routed=routed)
+    await fan.start_eager_or_die()
+    assert fan.identities == ("alice", "bob")
+    assert fan.mcp_name == "heb"
+    await fan.close()
+
+
+async def test_start_eager_or_die_ping_failure() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient(ping_ok=False)
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(docker_client=docker, secret_backend=secrets, routed=routed)
+    with pytest.raises(HttpUpstreamFailed, match="docker ping failed"):
+        await fan.start_eager_or_die()
+
+
+async def test_start_eager_or_die_missing_image() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient(image_present=False)
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(docker_client=docker, secret_backend=secrets, routed=routed)
+    with pytest.raises(HttpUpstreamFailed, match="not found"):
+        await fan.start_eager_or_die()
+
+
+# ---------------------------------------------------------------------------
+# Spawn-on-call + per-identity vs shared scope
+# ---------------------------------------------------------------------------
+
+
+async def test_call_spawns_per_identity_on_first_call() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(docker_client=docker, secret_backend=secrets, routed=routed)
+    await fan.start_eager_or_die()
+
+    resp = await fan.call(
+        identity="alice",
+        request={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        request_context={},
+    )
+    assert resp == {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+    assert len(docker.spawned) == 1, "first call to alice must spawn one container"
+
+    # Same identity → reuses
+    await fan.call(
+        identity="alice",
+        request={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        request_context={},
+    )
+    assert len(docker.spawned) == 1, "second alice call must reuse"
+
+    # Different identity → new container
+    await fan.call(
+        identity="bob",
+        request={"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+        request_context={},
+    )
+    assert len(docker.spawned) == 2, "bob call must spawn its own container"
+
+    await fan.close()
+
+
+async def test_call_shared_scope_uses_one_container_for_all_identities() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed, scope="shared"
+    )
+    await fan.start_eager_or_die()
+
+    await fan.call(identity="alice", request={"jsonrpc": "2.0", "id": 1}, request_context={})
+    await fan.call(identity="bob", request={"jsonrpc": "2.0", "id": 2}, request_context={})
+
+    assert len(docker.spawned) == 1, "shared scope must spawn exactly one container"
+    await fan.close()
+
+
+async def test_call_unknown_identity_raises() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(docker_client=docker, secret_backend=secrets, routed=routed)
+    await fan.start_eager_or_die()
+    with pytest.raises(IdentityNotFound):
+        await fan.call(identity="charlie", request={"id": 1}, request_context={})
+    await fan.close()
+
+
+async def test_call_before_start_raises() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(docker_client=docker, secret_backend=secrets, routed=routed)
+    with pytest.raises(HttpUpstreamFailed, match="not started"):
+        await fan.call(identity="alice", request={"id": 1}, request_context={})
+
+
+# ---------------------------------------------------------------------------
+# Env injection: OIDC_* + policy env + bao secrets
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_injects_oidc_and_secrets_into_container_env() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend(
+        secrets={
+            ("heb", "alice", "services/heb/alice", "api_token"): "alice-token-XYZ",
+        }
+    )
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        env={"HEB_DEFAULT_STORE": "590", "MCP_COMMAND": "texas-grocery-mcp"},
+        secrets_to_env={
+            "HEB_PROXY_TOKEN": SecretRef(path="services/heb/{identity}", field="api_token"),
+        },
+    )
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"jsonrpc": "2.0", "id": 1}, request_context={})
+
+    # Inspect what containers.run was called with
+    assert len(docker.run_calls) == 1
+    kwargs = docker.run_calls[0]
+    env = kwargs["environment"]
+    assert env["OIDC_ISSUER"] == "https://auth.example/"
+    assert env["OIDC_DISCOVERY_URL"] == "https://auth.example/application/o/mcp-fanout-svc"
+    assert env["OIDC_AUDIENCE"] == "mcp-alice"
+    assert env["HEB_DEFAULT_STORE"] == "590"
+    assert env["MCP_COMMAND"] == "texas-grocery-mcp"
+    assert env["HEB_PROXY_TOKEN"] == "alice-token-XYZ"
+
+    # Secret resolution recorded with the formatted (per-identity) path
+    assert ("heb", "alice", "services/heb/alice", "api_token") in secrets.resolutions
+    await fan.close()
+
+
+async def test_secret_resolution_failure_propagates_as_http_upstream_failed() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    secrets.fail_for.add(("heb", "alice", "services/heb/alice", "api_token"))
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        secrets_to_env={
+            "HEB_PROXY_TOKEN": SecretRef(path="services/heb/{identity}", field="api_token"),
+        },
+    )
+    await fan.start_eager_or_die()
+    with pytest.raises(HttpUpstreamFailed, match="could not resolve secret"):
+        await fan.call(identity="alice", request={"id": 1}, request_context={})
+    await fan.close()
+
+
+# ---------------------------------------------------------------------------
+# Eviction
+# ---------------------------------------------------------------------------
+
+
+async def test_eviction_removes_idle_containers() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        idle_timeout_s=0.05,
+        eviction_interval_s=0.02,
+    )
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"id": 1}, request_context={})
+    assert len(docker.spawned) == 1
+    container = docker.spawned[0]
+    # Wait long enough for a couple of eviction ticks past idle_timeout
+    await asyncio.sleep(0.25)
+    assert container.removed is True, "idle container should have been evicted"
+    await fan.close()
+
+
+async def test_eviction_skips_in_flight_handles() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        idle_timeout_s=0.0,         # everything is "idle past timeout" by default
+        eviction_interval_s=0.02,
+    )
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"id": 1}, request_context={})
+    container = docker.spawned[0]
+    # Hand-bump in_flight to simulate a long-running call
+    handle = fan._handles[fan._spawn_key("alice")]  # noqa: SLF001 — test inspects internals
+    handle.in_flight = 1
+    await asyncio.sleep(0.15)
+    assert container.removed is False, "in-flight handle must not be evicted"
+    handle.in_flight = 0
+    await asyncio.sleep(0.15)
+    assert container.removed is True, "idle handle is evicted after in_flight returns to 0"
+    await fan.close()
+
+
+# ---------------------------------------------------------------------------
+# Wait-for-ready + spawn-failure cleanup
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_fails_if_ready_never_returns_200() -> None:
+    routed = _RoutedTransport()
+    routed.default_ready_status = 503
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker,
+        secret_backend=secrets,
+        routed=routed,
+        spawn_timeout_s=0.3,
+    )
+    await fan.start_eager_or_die()
+    with pytest.raises(HttpUpstreamFailed, match="did not become ready"):
+        await fan.call(identity="alice", request={"id": 1}, request_context={})
+    # The failed-spawn container should have been force-removed
+    assert len(docker.spawned) == 1
+    assert docker.spawned[0].removed is True
+    await fan.close()
+
+
+# ---------------------------------------------------------------------------
+# close()
+# ---------------------------------------------------------------------------
+
+
+async def test_close_tears_down_all_containers() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(docker_client=docker, secret_backend=secrets, routed=routed)
+    await fan.start_eager_or_die()
+    await fan.call(identity="alice", request={"id": 1}, request_context={})
+    await fan.call(identity="bob", request={"id": 2}, request_context={})
+    assert len(docker.spawned) == 2
+
+    await fan.close()
+
+    for c in docker.spawned:
+        assert c.removed is True
+
+
+# ---------------------------------------------------------------------------
+# Auth header forwarding
+# ---------------------------------------------------------------------------
+
+
+async def test_auth_strategy_called_with_identity_and_request_context() -> None:
+    routed = _RoutedTransport()
+    docker = _FakeDockerClient()
+    secrets = _StubSecretBackend()
+    auth = _StaticBearer(token="xyz")
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed, auth=auth,
+    )
+    await fan.start_eager_or_die()
+    await fan.call(
+        identity="alice",
+        request={"id": 1},
+        request_context={"bearer_token": "agent-jwt"},
+    )
+    # auth_header was called once with alice + the request_context
+    assert any(call[0] == "alice" and call[1] == {"bearer_token": "agent-jwt"} for call in auth.calls)
+    # The Authorization header reached the upstream POST
+    posts = [r for r in routed.requests if r.url.path == "/mcp"]
+    assert len(posts) == 1
+    assert posts[0].headers["authorization"] == "Bearer xyz"
+    await fan.close()

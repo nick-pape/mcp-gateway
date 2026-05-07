@@ -10,6 +10,7 @@ dist/
 
 # uv
 .venv/
+.venv-test/
 
 # IDE
 .vscode/

@@ -27,6 +27,11 @@ dependencies = [
 
     # Globally-unique IDs for audit request_id (lexicographically sortable).
     "python-ulid>=3,<4",
+
+    # Docker SDK — used by ContainerFanout to spawn wrapper containers on
+    # docker.service.pape.house. docker-py is sync; we wrap calls via
+    # asyncio.to_thread (see src/mcp_fanout/container_fanout.py).
+    "docker>=7,<8",
 ]
 
 [project.scripts]
@@ -117,6 +122,10 @@ warn_return_any = false  # json.loads returns Any; fighting that in tests is noi
 # Third-party libs without bundled stubs.
 [[tool.mypy.overrides]]
 module = "fastmcp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "docker.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

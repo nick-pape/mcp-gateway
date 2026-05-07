@@ -221,3 +221,101 @@ def test_build_fanout_unknown_transport_unreachable() -> None:
                 "secret_env_name": "X",
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# build_fanout: container
+# ---------------------------------------------------------------------------
+
+
+def _container_minimal_raw() -> dict[str, object]:
+    """Build a copy of MINIMAL with a `heb` container-transport MCP added.
+
+    Adds an identity glob covering it so the dispatcher doesn't reject as
+    "no eligible identities".
+    """
+    raw = copy.deepcopy(MINIMAL)
+    raw["auth"]["oidc_discovery_url"] = (  # type: ignore[index]
+        "https://auth.example/application/o/mcp-fanout-svc"
+    )
+    raw["mcps"]["heb"] = {  # type: ignore[index]
+        "transport": "container",
+        "image": "mcp-pape-house/heb-mcp-wrapper:test",
+        "scope": "per-identity",
+        "auth": {"type": "jwt_passthrough"},
+        "env": {"MCP_COMMAND": "texas-grocery-mcp"},
+        "secrets_to_env": {
+            "HEB_PROXY_TOKEN": {
+                "path": "services/heb/{identity}",
+                "field": "api_token",
+            },
+        },
+    }
+    raw["identities"]["ironclaw"]["allowed_tools"].append("heb_*")  # type: ignore[index]
+    return raw
+
+
+def test_build_fanout_container_returns_container_fanout(tmp_path: Path) -> None:
+    """A container-transport MCP entry produces a :class:`ContainerFanout`."""
+    from mcp_fanout import ContainerFanout
+
+    cfg = HubConfig.model_validate(_container_minimal_raw())
+    fanout = build_fanout(
+        "heb",
+        cfg.mcps["heb"],
+        identities=cfg.identities,
+        secret_backend=EnvSecretBackend(),
+        runtime_dir=tmp_path,
+        auth_config=cfg.auth,
+        docker_client=object(),  # ContainerFanout doesn't ping at construction
+    )
+    assert isinstance(fanout, ContainerFanout)
+    assert fanout.mcp_name == "heb"
+    assert "ironclaw" in fanout.identities
+
+
+def test_build_fanout_container_requires_docker_client(tmp_path: Path) -> None:
+    """Container transport without a docker_client kwarg raises clearly."""
+    cfg = HubConfig.model_validate(_container_minimal_raw())
+    with pytest.raises(ValueError, match="requires a docker client"):
+        build_fanout(
+            "heb",
+            cfg.mcps["heb"],
+            identities=cfg.identities,
+            secret_backend=EnvSecretBackend(),
+            runtime_dir=tmp_path,
+            auth_config=cfg.auth,
+            docker_client=None,
+        )
+
+
+def test_build_fanout_container_requires_auth_config(tmp_path: Path) -> None:
+    """Container transport without auth_config (for OIDC injection) raises clearly."""
+    cfg = HubConfig.model_validate(_container_minimal_raw())
+    with pytest.raises(ValueError, match="requires auth_config"):
+        build_fanout(
+            "heb",
+            cfg.mcps["heb"],
+            identities=cfg.identities,
+            secret_backend=EnvSecretBackend(),
+            runtime_dir=tmp_path,
+            auth_config=None,
+            docker_client=object(),
+        )
+
+
+def test_build_fanout_container_requires_oidc_discovery_url(tmp_path: Path) -> None:
+    """If no oidc_discovery_url is set on auth, container builds fail clearly."""
+    raw = _container_minimal_raw()
+    raw["auth"].pop("oidc_discovery_url", None)  # type: ignore[index, attr-defined]
+    cfg = HubConfig.model_validate(raw)
+    with pytest.raises(ValueError, match="oidc_discovery_url"):
+        build_fanout(
+            "heb",
+            cfg.mcps["heb"],
+            identities=cfg.identities,
+            secret_backend=EnvSecretBackend(),
+            runtime_dir=tmp_path,
+            auth_config=cfg.auth,
+            docker_client=object(),
+        )
