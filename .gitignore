@@ -26,4 +26,7 @@ Thumbs.db
 *.key
 fanout_jwt
 ntfy_publish_token
-policy.yaml
+
+# policy.yaml IS committed — it's pure configuration (bao paths, OIDC issuer,
+# tool allowlists, identity audiences). All actual secrets are referenced by
+# bao path or docker-secret file path; nothing sensitive is in the YAML body.
