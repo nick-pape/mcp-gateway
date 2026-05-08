@@ -8,7 +8,7 @@ Internally:
 
 - Holds a per-(mcp × identity) registry of running wrapper containers.
 - On the first :meth:`call` for an identity, lazily spawns a container
-  via the configured Docker remote API (typically docker.service.pape.house).
+  via the configured Docker remote API (typically ai.service.pape.house).
 - Per-spawn env injection — including bao-resolved secrets — happens
   once at container start. Tokens never hit disk inside the container;
   they live only in process memory of the spawned wrapper + its child.

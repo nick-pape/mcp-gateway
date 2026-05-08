@@ -1,7 +1,7 @@
 # mcp.pape.house — single-container MCP gateway
 #
 # Single source of truth. Portainer pulls this from GitHub; do NOT edit
-# in the UI. Matches the docker.service.pape.house convention.
+# in the UI. Matches the ai.service.pape.house convention.
 #
 # ============================================================
 # HOST BOOTSTRAP — required once on the LXC, do NOT skip

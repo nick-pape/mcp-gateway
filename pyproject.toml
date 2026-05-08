@@ -29,7 +29,7 @@ dependencies = [
     "python-ulid>=3,<4",
 
     # Docker SDK — used by ContainerFanout to spawn wrapper containers on
-    # docker.service.pape.house. docker-py is sync; we wrap calls via
+    # ai.service.pape.house. docker-py is sync; we wrap calls via
     # asyncio.to_thread (see src/mcp_fanout/container_fanout.py).
     "docker>=7,<8",
 ]
