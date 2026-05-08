@@ -169,11 +169,6 @@ Currently deployed via `docker compose up -d` directly on CT 120.
 Portainer sees it as "Unmanaged." Migrate to Repository (Git) stack so
 updates flow from `git push`. See § "GitOps stack migration" below.
 
-### Portainer OIDC for containers.mcp.pape.house
-Mirror docker.pape.house's pattern. Authentik provider for
-`portainer-mcp-containers`, Caddy block, configure Portainer OAuth via
-its API.
-
 ## Security hardening
 
 ### SSH certificate authority (replace shared root key)
