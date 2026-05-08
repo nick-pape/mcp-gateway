@@ -41,7 +41,7 @@ secret_backend:
 approver:
   name: ntfy
   config:
-    server: https://notify.service.pape.house
+    server: https://notify.pape.house
     topic: mcp-hitl-approvals
     publish_token_path: /run/secrets/ntfy_publish_token
     timeout_default_s: 120
