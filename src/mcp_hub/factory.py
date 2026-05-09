@@ -35,8 +35,10 @@ from .approvers.ntfy import NtfyApprover
 from .approvers.reject import RejectApprover
 from .auth_strategies import (
     DEFAULT_BAO_CACHE_TTL_S,
+    DEFAULT_FANOUT_JWT_PATH,
     AuthStrategy,
     BaoBackedBearer,
+    FanoutJwt,
     JwtPassthrough,
 )
 from .bao_client import BaoClient
@@ -193,6 +195,21 @@ def build_auth_strategy(
                 f"mcps.{mcp_name}.auth.config: jwt_passthrough takes no config"
             )
         return JwtPassthrough()
+    if config.type == "fanout_jwt":
+        path = cfg.get("path", DEFAULT_FANOUT_JWT_PATH)
+        if not isinstance(path, str) or not path:
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config.path must be a non-empty string"
+            )
+        # Reject unknown keys to catch typos at config-load rather than
+        # silently ignoring them at runtime.
+        unexpected = set(cfg) - {"path"}
+        if unexpected:
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config: fanout_jwt takes only 'path'; "
+                f"unexpected keys: {sorted(unexpected)}"
+            )
+        return FanoutJwt(path=path)
     raise ValueError(
         f"mcps.{mcp_name}.auth.type: unknown strategy {config.type!r}"
     )

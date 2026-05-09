@@ -140,6 +140,13 @@ class AuthStrategyConfig(BaseModel):
       e.g. ``"services/outline/{identity}"``), ``field`` (str, default
       ``"api_token"``), ``cache_ttl_s`` (float, default 30).
     - ``jwt_passthrough`` — config: empty.
+    - ``fanout_jwt`` — config: ``path`` (str, optional; default
+      ``/etc/mcp-pape-house/fanout_jwt``). Forwards the hub's own
+      service-account JWT (audience ``mcp-fanout-svc``) as the upstream
+      Bearer regardless of caller identity. Pair with ``scope: shared``
+      container MCPs whose wrapper accepts ``OIDC_BOOT_AUDIENCE``.
+      Per-identity HITL/audit still happens hub-side via the inbound
+      caller JWT — only the upstream-facing call uses the hub JWT.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -302,10 +309,19 @@ class MCPConfig(BaseModel):
                 raise ValueError("transport=container: idle_timeout_s must be > 0")
             if self.spawn_timeout_s <= 0:
                 raise ValueError("transport=container: spawn_timeout_s must be > 0")
-            if "{identity}" not in self.audience_template:
+            # audience_template requirements depend on scope:
+            # - per-identity: {identity} REQUIRED (each container is spawned
+            #   for one identity; the per-call JWT must match its OIDC_AUDIENCE)
+            # - shared: {identity} optional. The container is spawned once
+            #   with whichever identity called first, but per-call JWTs
+            #   from other identities won't match. Use auth: type=fanout_jwt
+            #   so the hub forwards its own service-account JWT (audience
+            #   mcp-fanout-svc) — accepted by the wrapper as OIDC_BOOT_AUDIENCE.
+            if self.scope == "per-identity" and "{identity}" not in self.audience_template:
                 raise ValueError(
-                    f"transport=container: audience_template must contain "
-                    f"{{identity}} placeholder, got: {self.audience_template!r}"
+                    f"transport=container, scope=per-identity: audience_template "
+                    f"must contain {{identity}} placeholder, got: "
+                    f"{self.audience_template!r}"
                 )
             # volumes_per_identity: per-identity scope MUST have {identity}
             # in the volume name template; otherwise all identities collide

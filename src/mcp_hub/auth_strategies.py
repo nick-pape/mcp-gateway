@@ -23,6 +23,15 @@ Built-in strategies:
   the upstream Bearer header. Useful for HTTP MCPs that natively trust
   the same Authentik issuer.
 
+- :class:`FanoutJwt` — forwards the hub's OWN service-account JWT
+  (the rotated ``fanout_jwt`` written by ``mcp_hub.refresher`` to
+  ``/etc/mcp-pape-house/fanout_jwt``) as the upstream Bearer
+  regardless of caller identity. Use with ``scope: shared`` container
+  MCPs whose wrapper accepts ``aud=mcp-fanout-svc`` via
+  ``OIDC_BOOT_AUDIENCE``. Per-identity HITL/audit still happens
+  hub-side via the inbound caller JWT — only the upstream-facing
+  request uses the hub's JWT.
+
 Adding a strategy:
 
 1. Implement the :class:`AuthStrategy` Protocol below.
@@ -35,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from .interfaces import SecretBackend, SecretRef, SecretResolutionError
@@ -219,6 +229,67 @@ class JwtPassthrough:
                 f"{CTX_KEY_BEARER_TOKEN!r}; ensure IdentityMiddleware "
                 "ran before this dispatch and stashed the bearer token"
             )
+        return {"Authorization": f"Bearer {token}"}
+
+    async def close(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# FanoutJwt
+# ---------------------------------------------------------------------------
+
+
+# Default path matches the refresher sink configured in policy.example.yaml
+# (``token_refresh.fanout_jwt.sink.config.path``). Can be overridden in
+# ``policy.yaml`` per fanout via ``auth.config.path``.
+DEFAULT_FANOUT_JWT_PATH: str = "/etc/mcp-pape-house/fanout_jwt"
+
+
+class FanoutJwt:
+    """AuthStrategy that forwards the hub's own ``fanout_jwt`` as the upstream Bearer.
+
+    Reads the rotated JWT from disk on each call so the refresher can
+    overwrite it without restarting the hub. Returns ``Authorization:
+    Bearer <fanout_jwt>`` regardless of the inbound caller identity.
+
+    Use with ``scope: shared`` container MCPs whose wrapper accepts
+    ``aud=mcp-fanout-svc`` via ``OIDC_BOOT_AUDIENCE`` — the per-call
+    JWT audiences vary by caller and won't match the spawn-time
+    ``OIDC_AUDIENCE``, so passthrough doesn't work for shared containers.
+
+    Per-identity audit/HITL is unaffected: those run inside the hub
+    against the inbound caller JWT *before* this strategy fires.
+
+    Raises ``ValueError`` if the JWT file is missing or empty (probably
+    a refresher misconfiguration; not transient).
+    """
+
+    name: str = "fanout_jwt"
+
+    def __init__(self, *, path: str = DEFAULT_FANOUT_JWT_PATH) -> None:
+        self._path = Path(path)
+
+    async def auth_header(
+        self,
+        *,
+        identity: str,
+        request_context: dict[str, Any],
+    ) -> dict[str, str]:
+        del identity, request_context  # not used; this is the hub-side JWT
+        try:
+            token = self._path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"FanoutJwt: {self._path} does not exist; refresher should "
+                f"have written it. Check token_refresh.fanout_jwt config."
+            ) from exc
+        except OSError as exc:
+            raise ValueError(
+                f"FanoutJwt: failed to read {self._path}: {exc}"
+            ) from exc
+        if not token:
+            raise ValueError(f"FanoutJwt: {self._path} is empty")
         return {"Authorization": f"Bearer {token}"}
 
     async def close(self) -> None:
