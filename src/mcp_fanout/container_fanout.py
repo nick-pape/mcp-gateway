@@ -179,10 +179,16 @@ class ContainerFanout:
             raise ValueError(
                 f"ContainerFanout({mcp_name!r}) has duplicate identities: {sorted(identities)}"
             )
-        if "{identity}" not in audience_template:
+        # audience_template requirements track the schema rule: per-identity
+        # scope MUST template {identity} (each container is spawned for one
+        # identity and the JWT must match its OIDC_AUDIENCE); shared scope
+        # may use a literal value because the per-call JWT comes from a
+        # hub-side strategy (e.g., FanoutJwt) accepted via OIDC_BOOT_AUDIENCE.
+        if scope == "per-identity" and "{identity}" not in audience_template:
             raise ValueError(
-                f"ContainerFanout({mcp_name!r}) audience_template must contain "
-                f"{{identity}} placeholder, got: {audience_template!r}"
+                f"ContainerFanout({mcp_name!r}, scope=per-identity) "
+                f"audience_template must contain {{identity}} placeholder, "
+                f"got: {audience_template!r}"
             )
 
         self._mcp_name = mcp_name
