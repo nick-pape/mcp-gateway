@@ -150,6 +150,17 @@ services:
     container_name: email-mcp
     restart: unless-stopped
 
+    # Override the image's USER=node so the entrypoint shim can read the
+    # docker secret files. Compose's `mode: 0444` directive in long-syntax
+    # secret refs is silently ignored in non-swarm deployments (long-known
+    # footgun), so secrets land at 0400 root and the default `node` (uid
+    # 1000) user can't cat them. Cleanest fix here is to run as root in
+    # the container; cap_drop: ALL would lock it down further but the
+    # base image isn't shipped that way and we don't enable docker-sock
+    # passthrough for this service. Single-tenant container, no privileged
+    # mode, network is the only attack surface.
+    user: "0:0"
+
     environment:
       # Explicit transport mode + bind. Without TRANSPORT_MODE the
       # default-from-bin/cli.mjs is heuristic; without PORT, the binary
