@@ -156,9 +156,19 @@ services:
       # Azure registration needed. Leave default unless we ever want to
       # use our own Authentik-registered app instead.
 
-    # DCR_SERVER_SECRET=... read from this file. Mode 0400 root:root on host.
-    env_file:
-      - /etc/mcp-pape-house/email-mcp.env
+    # DCR_SERVER_SECRET (HMAC seed for the MCP's dynamic-client-registration)
+    # arrives via docker secret. We can't use `env_file:` for an absolute host
+    # path because Portainer's compose runs INSIDE its own container and can't
+    # see CT 120's /etc/mcp-pape-house/ tree — only the docker daemon can
+    # (which is why `secrets: file:` works). The entrypoint shim below reads
+    # the secret file and exports it as env before exec'ing the MCP, since
+    # better-email-mcp expects DCR_SERVER_SECRET as an env var.
+    secrets:
+      - dcr_server_secret
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'export DCR_SERVER_SECRET="$$(cat /run/secrets/dcr_server_secret)" && exec node /usr/local/lib/node_modules/@n24q02m/better-email-mcp/bin/cli.mjs'
 
     # Host port 8081 exists for the one-time Caddy-fronted /authorize flow
     # only. Hub talks internally on the compose network without going out.
@@ -211,3 +221,5 @@ secrets:
     file: /etc/mcp-pape-house/fanout_client_secret
   ntfy_publish_token:
     file: /etc/mcp-pape-house/ntfy_publish_token
+  dcr_server_secret:
+    file: /etc/mcp-pape-house/email-mcp_dcr_secret
