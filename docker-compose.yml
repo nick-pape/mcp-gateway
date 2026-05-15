@@ -151,37 +151,54 @@ services:
     restart: unless-stopped
 
     environment:
+      # Explicit transport mode + bind. Without TRANSPORT_MODE the
+      # default-from-bin/cli.mjs is heuristic; without PORT, the binary
+      # picks an ephemeral port and listens on 127.0.0.1 only. Both bit
+      # us on the first deploy (random port 43739, Caddy got 502).
+      TRANSPORT_MODE: http
+      PORT: "8080"
+      HOST: 0.0.0.0
       PUBLIC_URL: https://email.mcp.pape.house
-      # Bundled public Azure client (Thunderbird-pattern) — no user-side
-      # Azure registration needed. Leave default unless we ever want to
-      # use our own Authentik-registered app instead.
+      # Bundled public Azure client (Thunderbird-pattern, baked in upstream)
+      # — no user-side Azure registration needed.
 
-    # DCR_SERVER_SECRET (HMAC seed for the MCP's dynamic-client-registration)
-    # arrives via docker secret. We can't use `env_file:` for an absolute host
-    # path because Portainer's compose runs INSIDE its own container and can't
-    # see CT 120's /etc/mcp-pape-house/ tree — only the docker daemon can
-    # (which is why `secrets: file:` works). The entrypoint shim below reads
-    # the secret file and exports it as env before exec'ing the MCP, since
-    # better-email-mcp expects DCR_SERVER_SECRET as an env var.
+    # Three secrets, all daemon-resolved from /etc/mcp-pape-house/ files on
+    # the host (Portainer's compose can't see absolute host paths in
+    # env_file: but the daemon can resolve secrets: file: directly). mode:
+    # 0444 makes them readable by the container's USER node (uid 1000) —
+    # default secret mount is 0400 root which fails the entrypoint cat.
+    # Source values live in bao at secret/services/email-mcp (fields
+    # dcr_server_secret, credential_secret, relay_password).
     secrets:
-      - dcr_server_secret
+      - source: dcr_server_secret
+        target: dcr_server_secret
+        mode: 0444
+      - source: email_mcp_credential_secret
+        target: email_mcp_credential_secret
+        mode: 0444
+      - source: email_mcp_relay_password
+        target: email_mcp_relay_password
+        mode: 0444
+
     entrypoint:
       - /bin/sh
       - -c
-      - 'export DCR_SERVER_SECRET="$$(cat /run/secrets/dcr_server_secret)" && exec node /usr/local/lib/node_modules/@n24q02m/better-email-mcp/bin/cli.mjs'
+      - |
+        export DCR_SERVER_SECRET="$$(cat /run/secrets/dcr_server_secret)"
+        export CREDENTIAL_SECRET="$$(cat /run/secrets/email_mcp_credential_secret)"
+        export MCP_RELAY_PASSWORD="$$(cat /run/secrets/email_mcp_relay_password)"
+        exec node /usr/local/lib/node_modules/@n24q02m/better-email-mcp/bin/cli.mjs
 
     # Host port 8081 exists for the one-time Caddy-fronted /authorize flow
     # only. Hub talks internally on the compose network without going out.
     ports:
       - "8081:8080"
 
-    # Token persistence — OAuth refresh tokens land somewhere under the
-    # `node` user's home dir (the image runs as USER node, no explicit
-    # WORKDIR in the http target). Mounting the whole home covers it.
-    # The path the upstream actually writes to is TBD; will pin once we
-    # see where tokens land after the first OAuth completion.
+    # /data is the upstream's documented persistence path (per their own
+    # docker-compose.http.yml). Per-account OAuth refresh tokens (Outlook
+    # device-code) land here so we only do the device-code flow once.
     volumes:
-      - email_mcp_state:/home/node
+      - email_mcp_state:/data
 
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/.well-known/oauth-authorization-server >/dev/null || exit 1"]
@@ -223,3 +240,7 @@ secrets:
     file: /etc/mcp-pape-house/ntfy_publish_token
   dcr_server_secret:
     file: /etc/mcp-pape-house/email-mcp_dcr_secret
+  email_mcp_credential_secret:
+    file: /etc/mcp-pape-house/email-mcp_credential_secret
+  email_mcp_relay_password:
+    file: /etc/mcp-pape-house/email-mcp_relay_password
