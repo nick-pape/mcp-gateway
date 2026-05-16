@@ -66,9 +66,10 @@ async def search(
     """
     coll = collection or settings.DEFAULT_COLLECTION
     query_vec = await _embed(query)
-    hits = _qdrant.search(
+    # qdrant-client>=1.16 deprecated `.search()` in favor of `.query_points()`.
+    response = _qdrant.query_points(
         collection_name=coll,
-        query_vector=query_vec,
+        query=query_vec,
         limit=max(1, min(top_k, 50)),
         with_payload=True,
     )
@@ -83,7 +84,7 @@ async def search(
             "chunk_end": h.payload.get("chunk_end"),
             "updated_at": h.payload.get("updated_at"),
         }
-        for h in hits
+        for h in response.points
     ]
 
 
