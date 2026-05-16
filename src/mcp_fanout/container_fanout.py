@@ -276,6 +276,14 @@ class ContainerFanout:
                 self._http = None
             raise
 
+        # Adopt any containers spawned by a previous hub lifetime. Without
+        # this, the in-memory _handles dict starts empty and every restart
+        # orphans the previous lifetime's containers (the eviction loop
+        # only iterates _handles, so it never sees them). Adoption runs
+        # BEFORE the eviction task starts to avoid racing with eviction
+        # over the same handle dict.
+        await self._adopt_existing()
+
         self._eviction_task = asyncio.create_task(
             self._eviction_loop(), name=f"container-fanout-evict-{self._mcp_name}"
         )
@@ -639,6 +647,149 @@ class ContainerFanout:
                 "ContainerFanout(%s): remove %s failed: %s",
                 self._mcp_name, getattr(handle.container, "short_id", "?"), exc,
             )
+
+    async def _adopt_existing(self) -> None:
+        """Reattach to containers spawned by a previous hub lifetime.
+
+        Self-heals the most common orphan source: hub restarts wipe
+        ``self._handles`` (in-memory), so without adoption every restart
+        spawns a fresh container while leaving the previous one running
+        indefinitely (the eviction loop only iterates ``self._handles``).
+
+        Filters on the labels written at spawn time (see
+        :meth:`_spawn_container`): ``managed-by=mcp-container-fanout`` AND
+        ``mcp=<self._mcp_name>``. For each spawn key (identity for
+        per-identity scope, ``SHARED_KEY`` for shared), keeps the newest
+        running container with a port binding and removes the rest.
+
+        Best-effort: any Docker error logs a warning and returns without
+        raising. Adoption never blocks hub startup — if it can't list
+        containers, the fanout just starts with an empty handle dict.
+
+        Notes:
+        - No ``_initialize_handshake`` is re-run. The adopted container
+          was initialized in its previous lifetime; ZeroClaw / MCP
+          servers handle re-init at their own layer if needed. First
+          failing call after adoption surfaces a dead handle and
+          :meth:`_get_or_spawn` respawns.
+        - ``last_active`` is initialized to ``time.monotonic()`` (now):
+          the monotonic clock can't represent times from before the hub
+          started. An adopted container therefore gets one full
+          ``idle_timeout_s`` window before eviction, regardless of how
+          long it had been idle pre-restart. Trade-off: today's orphan
+          survives ~one more idle window after adoption before cleanup;
+          acceptable since the loop disposes of it automatically.
+        """
+        label_filter: dict[str, list[str]] = {
+            "label": [
+                "managed-by=mcp-container-fanout",
+                f"mcp={self._mcp_name}",
+            ]
+        }
+        try:
+            existing = await asyncio.to_thread(
+                self._docker.containers.list, all=True, filters=label_filter
+            )
+        except docker.errors.APIError as exc:
+            logger.warning(
+                "ContainerFanout(%s): adoption list failed: %s; starting "
+                "with empty handles", self._mcp_name, exc,
+            )
+            return
+
+        # Group candidate containers by spawn key. For per-identity scope,
+        # the key is the identity label (drop containers labeled with an
+        # unknown identity — they're orphans from a removed identity).
+        # For shared scope, every candidate maps to SHARED_KEY.
+        by_key: dict[str, list[Any]] = {}
+        for c in existing:
+            try:
+                await asyncio.to_thread(c.reload)
+            except docker.errors.NotFound:
+                continue
+            except docker.errors.APIError as exc:
+                logger.warning(
+                    "ContainerFanout(%s): adoption reload %s failed: %s; skipping",
+                    self._mcp_name, getattr(c, "short_id", "?"), exc,
+                )
+                continue
+            labels = ((c.attrs or {}).get("Config") or {}).get("Labels") or {}
+            identity_label = labels.get("identity", "")
+            if self._scope == "per-identity":
+                if identity_label not in self._identities:
+                    logger.info(
+                        "ContainerFanout(%s): removing orphan container %s "
+                        "(unknown identity=%r)",
+                        self._mcp_name, getattr(c, "short_id", "?"),
+                        identity_label,
+                    )
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(c.remove, force=True)
+                    continue
+                key = identity_label
+            else:
+                key = SHARED_KEY
+            by_key.setdefault(key, []).append(c)
+
+        for key, candidates in by_key.items():
+            # Sort newest-first by Docker's Created timestamp string
+            # (ISO-8601 sortable). Ties (same second) are stable.
+            candidates.sort(
+                key=lambda c: (c.attrs or {}).get("Created", ""),
+                reverse=True,
+            )
+            winner = candidates[0]
+            losers = candidates[1:]
+            status = getattr(winner, "status", None)
+            ports_map = (
+                ((winner.attrs or {}).get("NetworkSettings") or {}).get("Ports")
+                or {}
+            )
+            binding = ports_map.get(f"{self._container_port}/tcp") or []
+            if status != "running" or not binding:
+                logger.info(
+                    "ContainerFanout(%s): newest candidate %s for key=%s "
+                    "is unusable (status=%r, has_binding=%s); removing all "
+                    "%d candidates",
+                    self._mcp_name, getattr(winner, "short_id", "?"),
+                    key, status, bool(binding), len(candidates),
+                )
+                for c in candidates:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(c.remove, force=True)
+                continue
+            try:
+                host_port = int(binding[0]["HostPort"])
+            except (KeyError, ValueError, TypeError) as exc:
+                logger.info(
+                    "ContainerFanout(%s): cannot parse port binding on %s "
+                    "for key=%s (%s); removing all %d candidates",
+                    self._mcp_name, getattr(winner, "short_id", "?"),
+                    key, exc, len(candidates),
+                )
+                for c in candidates:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(c.remove, force=True)
+                continue
+            handle = _ContainerHandle(
+                container=winner, port=host_port, host=self._container_host
+            )
+            self._handles[key] = handle
+            logger.info(
+                "ContainerFanout(%s): adopted existing container %s for "
+                "key=%s at %s (idle window starts now)",
+                self._mcp_name, getattr(winner, "short_id", "?"),
+                key, handle.url,
+            )
+            for loser in losers:
+                logger.info(
+                    "ContainerFanout(%s): removing duplicate container %s "
+                    "for key=%s (kept newer %s)",
+                    self._mcp_name, getattr(loser, "short_id", "?"),
+                    key, getattr(winner, "short_id", "?"),
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(loser.remove, force=True)
 
     async def _eviction_loop(self) -> None:
         try:

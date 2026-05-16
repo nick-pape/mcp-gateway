@@ -10,7 +10,6 @@ keyed on the container's host:port URL.
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -28,7 +27,6 @@ from mcp_hub.interfaces import (
     SecretRef,
     SecretResolutionError,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,16 +83,33 @@ class _StubSecretBackend:
 
 
 class _FakeContainer:
-    """Mimics docker.models.containers.Container's attribute surface."""
+    """Mimics docker.models.containers.Container's attribute surface.
 
-    def __init__(self, *, name: str, host_port: int) -> None:
+    Optional kwargs let adoption tests pre-construct containers with
+    custom labels / Created timestamps / status / port bindings — the
+    spawn path supplies only name + host_port via the normal defaults.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        host_port: int,
+        status: str = "running",
+        labels: dict[str, str] | None = None,
+        created: str = "2026-05-16T00:00:00.000000000Z",
+        include_port_binding: bool = True,
+    ) -> None:
         self.name = name
         self.short_id = name[:12]
-        self.status = "running"
-        self.attrs = {
-            "NetworkSettings": {
-                "Ports": {"8080/tcp": [{"HostPort": str(host_port)}]},
-            },
+        self.status = status
+        ports: dict[str, list[dict[str, str]]] = {}
+        if include_port_binding:
+            ports = {"8080/tcp": [{"HostPort": str(host_port)}]}
+        self.attrs: dict[str, Any] = {
+            "Created": created,
+            "Config": {"Labels": dict(labels or {})},
+            "NetworkSettings": {"Ports": ports},
         }
         self._host_port = host_port
         self.removed: bool = False
@@ -112,16 +127,27 @@ class _FakeContainer:
 class _FakeDockerClient:
     """Mimics docker.DockerClient minimal surface used by ContainerFanout."""
 
-    def __init__(self, *, image_present: bool = True, ping_ok: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        image_present: bool = True,
+        ping_ok: bool = True,
+        pre_existing: list[_FakeContainer] | None = None,
+        list_raises: Exception | None = None,
+    ) -> None:
         self._image_present = image_present
         self._ping_ok = ping_ok
+        self._pre_existing: list[_FakeContainer] = list(pre_existing or [])
+        self._list_raises = list_raises
         self.spawned: list[_FakeContainer] = []
         self.run_calls: list[dict[str, Any]] = []  # kwargs of each containers.run call
+        self.list_calls: list[dict[str, Any]] = []  # kwargs of each containers.list call
         self._port_seq = 12000
         self.images = MagicMock()
         self.images.get = self._images_get
         self.containers = MagicMock()
         self.containers.run = self._containers_run
+        self.containers.list = self._containers_list
 
     def ping(self) -> bool:
         if not self._ping_ok:
@@ -146,6 +172,23 @@ class _FakeDockerClient:
         c = _FakeContainer(name=name, host_port=self._port_seq)
         self.spawned.append(c)
         return c
+
+    def _containers_list(self, **kwargs: Any) -> list[_FakeContainer]:
+        # Adoption calls containers.list(all=True, filters={"label": [...]}).
+        # We honor `all` (include stopped) trivially since the test fakes
+        # don't model "list excludes stopped". For `filters.label`, every
+        # entry must be present in the container's labels (Docker semantics).
+        self.list_calls.append(dict(kwargs))
+        if self._list_raises is not None:
+            raise self._list_raises
+        wanted = kwargs.get("filters", {}).get("label", [])
+        wanted_pairs = [w.split("=", 1) for w in wanted if "=" in w]
+
+        def matches(c: _FakeContainer) -> bool:
+            labels = ((c.attrs or {}).get("Config") or {}).get("Labels") or {}
+            return all(labels.get(k) == v for k, v in wanted_pairs)
+
+        return [c for c in self._pre_existing if matches(c)]
 
 
 class _RoutedTransport:
@@ -429,7 +472,7 @@ async def test_eviction_skips_in_flight_handles() -> None:
     await fan.call(identity="alice", request={"id": 1}, request_context={})
     container = docker.spawned[0]
     # Hand-bump in_flight to simulate a long-running call
-    handle = fan._handles[fan._spawn_key("alice")]  # noqa: SLF001 — test inspects internals
+    handle = fan._handles[fan._spawn_key("alice")]
     handle.in_flight = 1
     await asyncio.sleep(0.15)
     assert container.removed is False, "in-flight handle must not be evicted"
@@ -605,4 +648,167 @@ async def test_auth_strategy_called_with_identity_and_request_context() -> None:
     # auth strategy is consulted afresh per request.
     for p in posts:
         assert p.headers["authorization"] == "Bearer xyz"
+    await fan.close()
+
+
+# ---------------------------------------------------------------------------
+# Adoption (containers from a previous hub lifetime)
+# ---------------------------------------------------------------------------
+
+
+def _adopt_labels(mcp: str, identity: str, scope: str = "shared") -> dict[str, str]:
+    """Mirror the label set _spawn_container writes."""
+    return {
+        "managed-by": "mcp-container-fanout",
+        "mcp": mcp,
+        "scope": scope,
+        "identity": identity,
+    }
+
+
+async def test_adopts_existing_shared_scope_container() -> None:
+    """Pre-existing container with matching labels is adopted; no respawn."""
+    routed = _RoutedTransport()
+    pre = _FakeContainer(
+        name="mcp-fakemcp-shared-1700000000",
+        host_port=12345,
+        labels=_adopt_labels("heb", "shared"),
+        created="2026-05-16T00:00:01Z",
+    )
+    docker = _FakeDockerClient(pre_existing=[pre])
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed,
+        scope="shared", identities=["alice", "bob"],
+    )
+    await fan.start_eager_or_die()
+    from mcp_fanout.container_fanout import SHARED_KEY
+
+    assert SHARED_KEY in fan._handles
+    assert fan._handles[SHARED_KEY].container is pre
+    assert fan._handles[SHARED_KEY].port == 12345
+    assert docker.run_calls == []  # no respawn happened
+    assert not pre.removed
+    await fan.close()
+
+
+async def test_adopts_newest_removes_duplicates_shared() -> None:
+    """Four pre-existing containers; only the newest survives, three removed."""
+    routed = _RoutedTransport()
+    oldest = _FakeContainer(
+        name="mcp-fakemcp-shared-1700000000", host_port=12000,
+        labels=_adopt_labels("heb", "shared"),
+        created="2026-05-15T20:00:00Z",
+    )
+    middle1 = _FakeContainer(
+        name="mcp-fakemcp-shared-1700001000", host_port=12001,
+        labels=_adopt_labels("heb", "shared"),
+        created="2026-05-15T22:00:00Z",
+    )
+    middle2 = _FakeContainer(
+        name="mcp-fakemcp-shared-1700002000", host_port=12002,
+        labels=_adopt_labels("heb", "shared"),
+        created="2026-05-15T23:30:00Z",
+    )
+    newest = _FakeContainer(
+        name="mcp-fakemcp-shared-1700003000", host_port=12003,
+        labels=_adopt_labels("heb", "shared"),
+        created="2026-05-16T00:00:00Z",
+    )
+    docker = _FakeDockerClient(pre_existing=[oldest, middle1, newest, middle2])
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed,
+        scope="shared", identities=["alice"],
+    )
+    await fan.start_eager_or_die()
+    from mcp_fanout.container_fanout import SHARED_KEY
+
+    assert fan._handles[SHARED_KEY].container is newest
+    assert not newest.removed
+    for loser in (oldest, middle1, middle2):
+        assert loser.removed, f"{loser.name} should have been removed"
+        assert loser.removed_force is True
+    await fan.close()
+
+
+async def test_adoption_drops_unknown_identity_per_identity_scope() -> None:
+    """Per-identity fanout removes containers labeled with identities it doesn't know."""
+    routed = _RoutedTransport()
+    bob_orphan = _FakeContainer(
+        name="mcp-fakemcp-bob-1700000000", host_port=12100,
+        labels=_adopt_labels("heb", "bob", scope="per-identity"),
+        created="2026-05-16T00:00:00Z",
+    )
+    docker = _FakeDockerClient(pre_existing=[bob_orphan])
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed,
+        scope="per-identity", identities=["alice"],
+    )
+    await fan.start_eager_or_die()
+    assert fan._handles == {}
+    assert bob_orphan.removed
+    assert bob_orphan.removed_force is True
+    await fan.close()
+
+
+async def test_adoption_drops_non_running_containers() -> None:
+    """Containers with status != 'running' are not adopted and get removed."""
+    routed = _RoutedTransport()
+    exited = _FakeContainer(
+        name="mcp-fakemcp-shared-1700000000", host_port=12200,
+        labels=_adopt_labels("heb", "shared"),
+        status="exited",
+        created="2026-05-16T00:00:00Z",
+    )
+    docker = _FakeDockerClient(pre_existing=[exited])
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed,
+        scope="shared", identities=["alice"],
+    )
+    await fan.start_eager_or_die()
+    assert fan._handles == {}
+    assert exited.removed
+    await fan.close()
+
+
+async def test_adoption_drops_containers_without_port_binding() -> None:
+    """Containers with no port binding can't be talked to; remove them."""
+    routed = _RoutedTransport()
+    no_port = _FakeContainer(
+        name="mcp-fakemcp-shared-1700000000", host_port=12300,
+        labels=_adopt_labels("heb", "shared"),
+        created="2026-05-16T00:00:00Z",
+        include_port_binding=False,
+    )
+    docker = _FakeDockerClient(pre_existing=[no_port])
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker, secret_backend=secrets, routed=routed,
+        scope="shared", identities=["alice"],
+    )
+    await fan.start_eager_or_die()
+    assert fan._handles == {}
+    assert no_port.removed
+    await fan.close()
+
+
+async def test_adoption_swallows_docker_list_failure() -> None:
+    """If docker list raises, startup still succeeds with empty handles."""
+    import docker.errors  # type: ignore[import-untyped]
+
+    routed = _RoutedTransport()
+    docker_client = _FakeDockerClient(
+        list_raises=docker.errors.APIError("simulated docker outage"),
+    )
+    secrets = _StubSecretBackend()
+    fan = _make_fanout(
+        docker_client=docker_client, secret_backend=secrets, routed=routed,
+        scope="shared", identities=["alice"],
+    )
+    await fan.start_eager_or_die()  # MUST NOT raise
+    assert fan._handles == {}
+    assert docker_client.list_calls, "containers.list should have been attempted"
     await fan.close()
