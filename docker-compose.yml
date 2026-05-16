@@ -251,6 +251,57 @@ services:
         max-size: "20m"
         max-file: "3"
 
+  # ============================================================
+  # email-mcp-proxy — tool-name normalization sidecar
+  # ============================================================
+  # Sits between mcp-hub and email-mcp. Rewrites upstream's 7 composite
+  # tools into 23 granular tools so the hub's HITL policy can glob-match
+  # read-vs-write at tool-name granularity (search auto-approve vs trash
+  # push-approve, etc.) instead of all-or-nothing per composite.
+  #
+  # Internal-only — no host port mapping, no Caddy block. Only mcp-hub
+  # reaches it via the compose default network (`http://email-mcp-proxy:8080/mcp`).
+  # The proxy forwards the inbound Authorization header verbatim; both
+  # hub→proxy and proxy→email-mcp use the same `hub_bearer` value (fetched
+  # by the hub from bao via bao_backed_bearer, sent in Bearer header).
+  #
+  # See mcp.service.pape.house/email-mcp-proxy/README.md for the
+  # tool-name rewrite design + drift-detection policy.
+  email-mcp-proxy:
+    image: registry.pape.house/local/email-mcp-proxy@sha256:131fb2a2259be0ffd7095216e396d7cb737ddf8aba982f0bdbe20a1a8d3c34f0
+    container_name: email-mcp-proxy
+    restart: unless-stopped
+
+    environment:
+      EMAIL_MCP_URL: http://email-mcp:8080
+      LISTEN_PORT: "8080"
+      LOG_LEVEL: INFO
+
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3); sys.exit(0 if r.status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    depends_on:
+      email-mcp:
+        condition: service_healthy
+
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+        reservations:
+          memory: 32M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 # ============================================================
 # Volumes
 # ============================================================
