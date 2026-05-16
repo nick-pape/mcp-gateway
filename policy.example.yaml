@@ -89,6 +89,22 @@ mcps:
     secret_env_name: PAPERLESS_TOKEN_FILE
     uid_offset: 20
 
+  # ── Drop-in HTTP MCP exemplar ──
+  # Simplest possible federation: an HTTP-transport upstream with no
+  # MCP-side auth, reached on the docker default network. No bao role
+  # required — `auth: type: none` short-circuits the secret backend. Use
+  # when the upstream MCP itself has no auth and docker network isolation
+  # is sufficient (e.g. a sidecar in the same compose stack that only the
+  # hub container can reach).
+  #
+  # Real instances: `ha` (Home Assistant MCP behind a path token at HA's
+  # end) and `searxng` (OvertliDS mcp-searxng-enhanced sidecar).
+  searxng:
+    transport: http
+    url: http://mcp-searxng-enhanced:8000/mcp
+    auth:
+      type: none
+
 identities:
   ironclaw:
     aud: mcp-ironclaw
