@@ -12,6 +12,7 @@ from mcp_hub.auth_strategies import (
     AuthStrategy,
     BaoBackedBearer,
     JwtPassthrough,
+    NoneStrategy,
 )
 from mcp_hub.interfaces import (
     ResolvedSecret,
@@ -283,3 +284,30 @@ async def test_jwt_passthrough_close_is_noop() -> None:
         request_context={CTX_KEY_BEARER_TOKEN: "tok"},
     )
     assert headers == {"Authorization": "Bearer tok"}
+
+
+# ---------------------------------------------------------------------------
+# NoneStrategy
+# ---------------------------------------------------------------------------
+
+
+def test_none_strategy_satisfies_protocol() -> None:
+    strategy = NoneStrategy()
+    assert isinstance(strategy, AuthStrategy)
+    assert strategy.name == "none"
+
+
+async def test_none_strategy_returns_empty_headers() -> None:
+    strategy = NoneStrategy()
+    headers = await strategy.auth_header(
+        identity="any", request_context={"anything": 1}
+    )
+    assert headers == {}
+
+
+async def test_none_strategy_close_is_noop() -> None:
+    strategy = NoneStrategy()
+    await strategy.close()
+    # Still usable afterward.
+    headers = await strategy.auth_header(identity="x", request_context={})
+    assert headers == {}

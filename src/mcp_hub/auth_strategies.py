@@ -236,6 +236,40 @@ class JwtPassthrough:
 
 
 # ---------------------------------------------------------------------------
+# NoneStrategy
+# ---------------------------------------------------------------------------
+
+
+class NoneStrategy:
+    """AuthStrategy that adds no auth header to upstream requests.
+
+    For upstreams that don't require auth — rare; usually only homelab-internal
+    services that are gated by network ACL or by a token embedded in the URL
+    path (e.g. Home Assistant's built-in MCP Server integration, which exposes
+    ``/<random-token>/<rest>`` and ignores ``Authorization`` entirely).
+
+    Returns an empty headers dict, which HttpFanout treats as "no headers to
+    inject" — the rest of the request still carries httpx's defaults (Host,
+    User-Agent, etc.). Use sparingly; prefer a real bearer scheme when the
+    upstream offers one.
+    """
+
+    name: str = "none"
+
+    async def auth_header(
+        self,
+        *,
+        identity: str,
+        request_context: dict[str, Any],
+    ) -> dict[str, str]:
+        del identity, request_context
+        return {}
+
+    async def close(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # FanoutJwt
 # ---------------------------------------------------------------------------
 

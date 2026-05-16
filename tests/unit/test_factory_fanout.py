@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from mcp_fanout import Fanout, HttpFanout
-from mcp_hub.auth_strategies import BaoBackedBearer, JwtPassthrough
+from mcp_hub.auth_strategies import BaoBackedBearer, JwtPassthrough, NoneStrategy
 from mcp_hub.factory import build_auth_strategy, build_fanout
 from mcp_hub.policy import AuthStrategyConfig, HubConfig, MCPConfig
 from mcp_hub.secrets.env import EnvSecretBackend
@@ -74,6 +74,24 @@ def test_build_auth_strategy_unknown_type() -> None:
     with pytest.raises(ValueError, match="unknown strategy"):
         build_auth_strategy(
             mcp_name="outline", config=cfg, secret_backend=backend
+        )
+
+
+def test_build_auth_strategy_none() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(type="none", config={})
+    strategy = build_auth_strategy(
+        mcp_name="ha", config=cfg, secret_backend=backend
+    )
+    assert isinstance(strategy, NoneStrategy)
+
+
+def test_build_auth_strategy_none_rejects_config() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(type="none", config={"x": 1})
+    with pytest.raises(ValueError, match="no config"):
+        build_auth_strategy(
+            mcp_name="ha", config=cfg, secret_backend=backend
         )
 
 

@@ -40,6 +40,7 @@ from .auth_strategies import (
     BaoBackedBearer,
     FanoutJwt,
     JwtPassthrough,
+    NoneStrategy,
 )
 from .bao_client import BaoClient
 from .interfaces import Approver, SecretBackend, SecretRef
@@ -210,6 +211,12 @@ def build_auth_strategy(
                 f"unexpected keys: {sorted(unexpected)}"
             )
         return FanoutJwt(path=path)
+    if config.type == "none":
+        if cfg:
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config: none takes no config"
+            )
+        return NoneStrategy()
     raise ValueError(
         f"mcps.{mcp_name}.auth.type: unknown strategy {config.type!r}"
     )

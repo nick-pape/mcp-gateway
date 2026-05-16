@@ -147,6 +147,10 @@ class AuthStrategyConfig(BaseModel):
       container MCPs whose wrapper accepts ``OIDC_BOOT_AUDIENCE``.
       Per-identity HITL/audit still happens hub-side via the inbound
       caller JWT — only the upstream-facing call uses the hub JWT.
+    - ``none`` — config: empty. Sends NO ``Authorization`` header to the
+      upstream. For homelab-internal MCPs that don't require auth (e.g.
+      HA's built-in MCP integration, which uses a URL-embedded token
+      instead of a header). Hub-side HITL/audit still apply.
     """
 
     model_config = ConfigDict(extra="forbid")
