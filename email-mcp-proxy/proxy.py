@@ -55,6 +55,10 @@ SCHEMA_FILE = os.environ.get("SCHEMA_FILE", "/app/tool-schemas.yaml")
 REQUEST_TIMEOUT_S = float(os.environ.get("REQUEST_TIMEOUT_S", "30"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
+# MCP protocol version we negotiate with upstream during the internal
+# handshake. Matches the hub's HttpFanout boot-time value.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -185,6 +189,16 @@ async def _startup() -> None:
     # One persistent client per process — connection pooling, HTTP/2 disabled
     # (email-mcp speaks HTTP/1.1 only via the docker network).
     app.state.http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S)
+    # Upstream session state. The hub's HttpFanout doesn't track
+    # Mcp-Session-Id (every request looks like a new session), but
+    # email-mcp via mcp-core's StreamableHTTPServerTransport enforces
+    # strict per-session init state. The proxy maintains one upstream
+    # session, multiplexing all hub callers over it (single-user
+    # deployment + the accounts-fallback fork means there's only one
+    # effective tenant anyway). Lock serializes session establishment;
+    # individual requests proceed concurrently once the session exists.
+    app.state.session_id: str | None = None
+    app.state.session_lock = asyncio.Lock()
     log.info("proxy ready: forwarding to %s, listening on :%d", EMAIL_MCP_URL, LISTEN_PORT)
 
 
@@ -241,22 +255,96 @@ def _forward_response_headers(headers) -> list[tuple[str, str]]:
     return out
 
 
+async def _ensure_upstream_session(
+    app_state, auth_headers: dict[str, str]
+) -> str:
+    """Acquire (or reuse) an upstream MCP session ID. Thread-safe.
+
+    The hub's HttpFanout doesn't track ``Mcp-Session-Id`` round-trip, so
+    every request from it looks like a new session to email-mcp. Email-mcp
+    via mcp-core's StreamableHTTPServerTransport enforces strict per-session
+    init state, returning ``Bad Request: Server not initialized`` on
+    tools/list etc. without a prior initialize+initialized handshake.
+
+    We bridge that here: maintain ONE upstream session and inject its ID
+    on every forwarded request. Lock prevents thundering-herd init when
+    multiple hub callers race the first request.
+    """
+    if app_state.session_id is not None:
+        return app_state.session_id
+    async with app_state.session_lock:
+        if app_state.session_id is not None:
+            return app_state.session_id  # raced — someone else just established it
+
+        log.info("establishing fresh upstream MCP session")
+        init_body = {
+            "jsonrpc": "2.0", "id": "_proxy-init",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "clientInfo": {"name": "email-mcp-proxy", "version": "0.1"},
+            },
+        }
+        handshake_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            **auth_headers,
+        }
+        init_resp = await app_state.http.post(
+            f"{EMAIL_MCP_URL}/mcp", json=init_body, headers=handshake_headers,
+        )
+        if init_resp.status_code != 200:
+            raise RuntimeError(
+                f"upstream initialize returned HTTP {init_resp.status_code}: "
+                f"{init_resp.text[:300]}"
+            )
+        session_id = init_resp.headers.get("mcp-session-id")
+        if not session_id:
+            raise RuntimeError("upstream initialize returned no Mcp-Session-Id header")
+
+        # notifications/initialized — fire-and-forget per MCP spec
+        await app_state.http.post(
+            f"{EMAIL_MCP_URL}/mcp",
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            headers={**handshake_headers, "Mcp-Session-Id": session_id},
+        )
+        app_state.session_id = session_id
+        log.info("upstream session established: %s", session_id[:8] + "...")
+        return session_id
+
+
 @app.post("/mcp")
 async def mcp(request: Request) -> Response:
     """Forward MCP requests to email-mcp, rewriting tool names both directions.
 
-    Streamable HTTP supports two response shapes from the same endpoint:
-    JSON (``application/json``) or SSE (``text/event-stream``). We have
-    to handle both. SSE is more complex because we need to rewrite
-    each ``data:`` line's JSON-RPC payload inline as it streams through.
+    Streamable HTTP supports two response shapes: ``application/json`` or
+    ``text/event-stream``. We handle both. SSE is more complex because we
+    need to rewrite each ``data:`` line's JSON-RPC payload inline as it
+    streams through.
+
+    Hub-side requests come stateless (no Mcp-Session-Id round-trip) but
+    upstream enforces session state — :func:`_ensure_upstream_session`
+    bridges that by holding one persistent upstream session.
     """
     raw_body = await request.body()
-    # Best-effort parse for rewriting; if body isn't JSON we just forward
-    # as-is (notifications/batched-requests/etc).
     payload: dict[str, Any] | None = None
     with contextlib.suppress(Exception):
         payload = json.loads(raw_body) if raw_body else None
 
+    # Intercept lifecycle messages from the hub: we own the upstream
+    # session ourselves, so the hub's init dance is a no-op for the
+    # upstream. Respond with a synthesized initialize result based on
+    # what our upstream session negotiated.
+    if isinstance(payload, dict):
+        method = payload.get("method")
+        if method == "initialize":
+            return await _handle_hub_initialize(request.app.state, payload, request.headers)
+        if method == "notifications/initialized":
+            # Hub's post-init notification — already done internally
+            return Response(status_code=202)
+
+    # Tool-call rewriting (granular → composite + action)
     if isinstance(payload, dict):
         payload = rewrite_tools_call(payload, request.app.state.name_to_composite)
         body_out = json.dumps(payload).encode()
@@ -264,17 +352,26 @@ async def mcp(request: Request) -> Response:
         body_out = raw_body
 
     headers = _forward_request_headers(request.headers)
-
-    # Streamable HTTP transport requires we ask for both content types.
     if "accept" not in {k.lower() for k in headers}:
         headers["Accept"] = "application/json, text/event-stream"
 
+    # Forward with our cached upstream session — establish if first call.
+    auth_in = {k: v for k, v in headers.items() if k.lower() == "authorization"}
+    try:
+        session_id = await _ensure_upstream_session(request.app.state, auth_in)
+    except Exception as exc:
+        log.error("upstream session establish failed: %s", exc)
+        return JSONResponse(
+            {"error": "upstream session establish failed", "detail": str(exc)},
+            status_code=502,
+        )
+    headers["Mcp-Session-Id"] = session_id
+
     upstream_url = f"{EMAIL_MCP_URL}/mcp"
-    log.debug("forward POST %s (body=%d bytes)", upstream_url, len(body_out))
+    log.debug("forward POST %s (body=%d bytes, session=%s)",
+              upstream_url, len(body_out), session_id[:8])
 
     try:
-        # Stream the response so SSE works; we manually buffer for JSON
-        # responses below.
         req = request.app.state.http.build_request(
             "POST", upstream_url, content=body_out, headers=headers,
         )
@@ -283,12 +380,35 @@ async def mcp(request: Request) -> Response:
         log.error("upstream forward failed: %s", exc)
         return JSONResponse({"error": "upstream unreachable", "detail": str(exc)}, status_code=502)
 
+    # If upstream rejected the session (4xx specifically about invalid/
+    # uninitialized session), invalidate + retry ONCE. Email-mcp restart
+    # is the realistic trigger.
+    if upstream.status_code == 400:
+        body_text = (await upstream.aread()).decode("utf-8", errors="replace")
+        await upstream.aclose()
+        if "not initialized" in body_text.lower() or "session" in body_text.lower():
+            log.warning("upstream session invalid (%s); reinitializing + retry", body_text[:200])
+            request.app.state.session_id = None
+            try:
+                session_id = await _ensure_upstream_session(request.app.state, auth_in)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": "upstream session re-establish failed", "detail": str(exc)},
+                    status_code=502,
+                )
+            headers["Mcp-Session-Id"] = session_id
+            req = request.app.state.http.build_request(
+                "POST", upstream_url, content=body_out, headers=headers,
+            )
+            upstream = await request.app.state.http.send(req, stream=True)
+        else:
+            # Some other 400 — return as-is
+            return Response(content=body_text.encode(), status_code=400, media_type=upstream.headers.get("content-type", "text/plain"))
+
     content_type = upstream.headers.get("content-type", "")
     response_headers = _forward_response_headers(upstream.headers)
 
     if "text/event-stream" in content_type:
-        # SSE: stream through, rewriting any data: lines whose JSON-RPC
-        # payload is a tools/list response.
         async def _sse_iter():
             try:
                 buf = b""
@@ -309,7 +429,6 @@ async def mcp(request: Request) -> Response:
             media_type=content_type,
         )
 
-    # Non-SSE: buffer + rewrite + return
     try:
         body = await upstream.aread()
     finally:
@@ -329,6 +448,44 @@ async def mcp(request: Request) -> Response:
         headers=dict(response_headers),
         media_type=content_type,
     )
+
+
+async def _handle_hub_initialize(
+    app_state, hub_payload: dict[str, Any], hub_headers,
+) -> Response:
+    """Synthesize a successful initialize response for the hub.
+
+    The hub does its own init handshake against this proxy as if it were
+    talking directly to a stateful MCP — but our upstream session is
+    proxy-managed (single shared session across all hub callers). We
+    don't want to forward the hub's init to upstream because that would
+    spawn additional upstream sessions per hub restart.
+
+    Establish our upstream session here (or reuse cached), then return a
+    synthesized init response. The Mcp-Session-Id we emit is OUR
+    upstream session ID — round-tripping a hub-side ID here would just
+    confuse things since the hub doesn't track it anyway.
+    """
+    auth_in = {k: v for k, v in hub_headers.items() if k.lower() == "authorization"}
+    try:
+        session_id = await _ensure_upstream_session(app_state, auth_in)
+    except Exception as exc:
+        log.error("synthesized initialize failed at upstream session establish: %s", exc)
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": hub_payload.get("id"),
+             "error": {"code": -32000, "message": f"proxy upstream init failed: {exc}"}},
+            status_code=502,
+        )
+    synth = {
+        "jsonrpc": "2.0",
+        "id": hub_payload.get("id"),
+        "result": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {}, "resources": {}},
+            "serverInfo": {"name": "email-mcp-proxy", "version": "0.1"},
+        },
+    }
+    return JSONResponse(synth, headers={"Mcp-Session-Id": session_id})
 
 
 def _maybe_rewrite_sse_line(line: bytes, app_obj) -> bytes:
