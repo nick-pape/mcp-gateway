@@ -146,7 +146,14 @@ services:
   # `dcr_server_secret`, materialized to `/etc/mcp-pape-house/email-mcp.env`
   # on the host (mode 0400, root-owned, never in the repo).
   email-mcp:
-    image: n24q02m/better-email-mcp:latest
+    # Pinned to nick-pape/better-email-mcp:1.29.0-pape.2 (pape-house fork).
+    # Two patches: (1) postinstall-sed extends JWT TTL 1h → 1y in compiled
+    # @n24q02m/mcp-core's jwt-issuer.js; (2) src/transports/http.ts
+    # accountsForThisRequest length-check fallback so disk-loaded accounts
+    # survive container restart when InMemoryCredStore for a sub is empty.
+    # Image is digest-pinned (Zot tag mutability isn't enforced).
+    # See nick-pape/better-email-mcp/PAPE_HOUSE_PATCHES.md for full rationale.
+    image: registry.pape.house/local/email-mcp@sha256:e8ae6a07be07ff691646a38dba28a2119c725461f5d939212d8ede98222e1a6c
     container_name: email-mcp
     restart: unless-stopped
 
@@ -205,11 +212,16 @@ services:
     ports:
       - "8081:8080"
 
-    # /data is the upstream's documented persistence path (per their own
-    # docker-compose.http.yml). Per-account OAuth refresh tokens (Outlook
-    # device-code) land here so we only do the device-code flow once.
+    # Persistence — upstream actually writes to /home/node/.config/mcp/,
+    # /home/node/.better-email-mcp/, and /home/node/.mcp-core/ (not /data
+    # despite the README hint). Volume mounted at /home/node covers all
+    # three. /etc/machine-id bind-mounted ro from CT 120 so the
+    # encryption key (PBKDF2 of "<machineId>:node") stays stable across
+    # container recreations — without this, every recreate generates a
+    # fresh in-container machineId and the encrypted config can't decrypt.
     volumes:
-      - email_mcp_state:/data
+      - email_mcp_state:/home/node
+      - /etc/machine-id:/etc/machine-id:ro
 
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/.well-known/oauth-authorization-server >/dev/null || exit 1"]
