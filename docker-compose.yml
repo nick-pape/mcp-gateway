@@ -177,6 +177,13 @@ services:
       PORT: "8080"
       HOST: 0.0.0.0
       PUBLIC_URL: https://email.mcp.pape.house
+      # The image's USER=node makes HOME=/home/node by default. Our
+      # user: "0:0" override flips it to root → HOME=/root, which would
+      # land all OAuth state (~/.config/mcp/, ~/.better-email-mcp/,
+      # ~/.mcp-core/) in the container's writeable layer instead of the
+      # email_mcp_state volume mounted at /home/node. Pin HOME explicitly
+      # so the state lands in the volume regardless of effective user.
+      HOME: /home/node
       # Bundled public Azure client (Thunderbird-pattern, baked in upstream)
       # — no user-side Azure registration needed.
 
