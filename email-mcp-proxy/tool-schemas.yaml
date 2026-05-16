@@ -1,0 +1,326 @@
+# Hand-authored granular tool schemas for the email-mcp proxy.
+#
+# Each entry below corresponds to one (composite_tool, action) pair from
+# the upstream better-email-mcp's tools/list. The proxy substitutes the
+# upstream's 7-tool composite list with these 23 entries; on tools/call
+# the proxy rewrites <base>_<action> → {name: <base>, arguments: {action,
+# ...}} before forwarding.
+#
+# Why hand-authored: upstream Jules-agent churn would silently break a
+# runtime derivation from composite schemas. CI test test_schema_drift
+# checks every (tool, action) the live upstream exposes is covered here.
+#
+# Layout per entry mirrors the upstream MCP `Tool` shape (name,
+# description, inputSchema). `_composite` and `_action` are proxy-only
+# metadata used by the rewriter; stripped before forwarding to the hub.
+#
+# Mapping cheatsheet: the FIRST underscore-separated token after the
+# `email-mcp_` hub prefix becomes the composite tool name. Reserved
+# composite names: messages, send, config, folders, attachments. Plus
+# two leaf tools (`config__open_relay`, `help`) that pass through.
+
+tools:
+  # ───────────────────── messages (composite, 9 actions) ─────────────────────
+
+  - name: messages_search
+    _composite: messages
+    _action: search
+    description: |
+      Search emails via IMAP search syntax.
+
+      Query examples: "UNREAD", "FROM user@example.com",
+      "SINCE 2026-01-01", "UNREAD FROM boss@company.com".
+      Dates MUST use YYYY-MM-DD. Plain text → subject search.
+    inputSchema:
+      type: object
+      properties:
+        account: {type: string, description: "Account email filter (optional, defaults to all)"}
+        query: {type: string, description: "IMAP search query", default: "UNSEEN"}
+        folder: {type: string, description: "Mailbox folder", default: "INBOX"}
+        limit: {type: number, description: "Max results", default: 20}
+
+  - name: messages_read
+    _composite: messages
+    _action: read
+    description: Fetch a single email by UID — full body + headers.
+    inputSchema:
+      type: object
+      required: [account, uid]
+      properties:
+        account: {type: string, description: "Account email (required)"}
+        uid: {type: number, description: "Email UID (required)"}
+        folder: {type: string, description: "Mailbox folder", default: "INBOX"}
+
+  - name: messages_mark_read
+    _composite: messages
+    _action: mark_read
+    description: Add the IMAP \\Seen flag (no destructive content change).
+    inputSchema:
+      type: object
+      required: [account]
+      properties:
+        account: {type: string}
+        uid: {type: number, description: "Single email UID"}
+        uids: {type: array, items: {type: number}, description: "Batch of UIDs"}
+        folder: {type: string, default: "INBOX"}
+
+  - name: messages_mark_unread
+    _composite: messages
+    _action: mark_unread
+    description: Remove the IMAP \\Seen flag.
+    inputSchema:
+      type: object
+      required: [account]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        uids: {type: array, items: {type: number}}
+        folder: {type: string, default: "INBOX"}
+
+  - name: messages_flag
+    _composite: messages
+    _action: flag
+    description: Add the IMAP \\Flagged flag (star/important).
+    inputSchema:
+      type: object
+      required: [account]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        uids: {type: array, items: {type: number}}
+        folder: {type: string, default: "INBOX"}
+
+  - name: messages_unflag
+    _composite: messages
+    _action: unflag
+    description: Remove the IMAP \\Flagged flag.
+    inputSchema:
+      type: object
+      required: [account]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        uids: {type: array, items: {type: number}}
+        folder: {type: string, default: "INBOX"}
+
+  - name: messages_move
+    _composite: messages
+    _action: move
+    description: |
+      IMAP MOVE to a destination folder. Destructive: removes the email
+      from its current folder.
+    inputSchema:
+      type: object
+      required: [account, destination]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        uids: {type: array, items: {type: number}}
+        destination: {type: string, description: "Target folder name (required)"}
+        folder: {type: string, default: "INBOX"}
+
+  - name: messages_archive
+    _composite: messages
+    _action: archive
+    description: |
+      MOVE to provider-detected archive folder. Destructive (removes
+      from current folder). Provider-folder name auto-detected + cached.
+    inputSchema:
+      type: object
+      required: [account]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        uids: {type: array, items: {type: number}}
+        folder: {type: string, default: "INBOX"}
+
+  - name: messages_trash
+    _composite: messages
+    _action: trash
+    description: |
+      MOVE to provider Trash folder. Destructive (provider may auto-purge
+      Trash on its own schedule).
+    inputSchema:
+      type: object
+      required: [account]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        uids: {type: array, items: {type: number}}
+        folder: {type: string, default: "INBOX"}
+
+  # ───────────────────── folders (composite, 1 action) ─────────────────────
+
+  - name: folders_list
+    _composite: folders
+    _action: list
+    description: |
+      List mailbox folders. Returns folder names, IMAP paths, and flags
+      (e.g. \\Inbox, \\Sent, \\Archive) for one or all accounts.
+    inputSchema:
+      type: object
+      properties:
+        account: {type: string, description: "Account email filter (optional)"}
+
+  # ───────────────────── attachments (composite, 2 actions) ─────────────────────
+
+  - name: attachments_list
+    _composite: attachments
+    _action: list
+    description: |
+      List attachments on an email: filename, content_type, size. Use
+      this first to get exact filenames (case-sensitive).
+    inputSchema:
+      type: object
+      required: [account, uid]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        folder: {type: string, default: "INBOX"}
+
+  - name: attachments_download
+    _composite: attachments
+    _action: download
+    description: |
+      Fetch attachment bytes as base64. Filenames must match
+      attachments_list exactly (case-sensitive). 25MB per-provider cap.
+      Caveat: enables exfiltration; HITL-gated.
+    inputSchema:
+      type: object
+      required: [account, uid, filename]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        filename: {type: string, description: "Exact filename from attachments_list"}
+        folder: {type: string, default: "INBOX"}
+
+  # ───────────────────── send (composite, 3 actions) ─────────────────────
+
+  - name: send_new
+    _composite: send
+    _action: new
+    description: |
+      Compose a new outbound email via SMTP. Body is plain text by
+      default; HTML supported (<b>, <a href>, <table>) — do not mix.
+      External side effect.
+    inputSchema:
+      type: object
+      required: [account, to, subject, body]
+      properties:
+        account: {type: string, description: "Sender account email"}
+        to: {type: string, description: "Recipient email address"}
+        subject: {type: string}
+        body: {type: string, description: "Plain text or HTML — do not mix"}
+        cc: {type: string, description: "Comma-separated"}
+        bcc: {type: string, description: "Comma-separated"}
+
+  - name: send_reply
+    _composite: send
+    _action: reply
+    description: |
+      Reply to an existing email. Threading headers (In-Reply-To /
+      References) added automatically. Recipient auto-derived from
+      original sender if `to` omitted; subject auto-prefixed "Re:".
+    inputSchema:
+      type: object
+      required: [account, uid, body]
+      properties:
+        account: {type: string}
+        uid: {type: number, description: "UID of original email being replied to"}
+        body: {type: string}
+        to: {type: string, description: "Override recipient (default = original sender)"}
+        folder: {type: string, default: "INBOX"}
+
+  - name: send_forward
+    _composite: send
+    _action: forward
+    description: |
+      Forward an existing email to a new recipient. Includes the
+      original message; subject auto-prefixed "Fwd:".
+    inputSchema:
+      type: object
+      required: [account, uid, to, body]
+      properties:
+        account: {type: string}
+        uid: {type: number}
+        to: {type: string}
+        body: {type: string, description: "Forwarded message body (optional comment)"}
+        folder: {type: string, default: "INBOX"}
+
+  # ───────────────────── config (composite, 6 actions) ─────────────────────
+
+  - name: config_status
+    _composite: config
+    _action: status
+    description: Dump credential state + configured accounts. Read-only.
+    inputSchema:
+      type: object
+
+  - name: config_setup_start
+    _composite: config
+    _action: setup_start
+    description: Trigger a relay setup session, return the setup URL.
+    inputSchema:
+      type: object
+      properties:
+        force: {type: boolean, description: "Restart relay even if already in progress"}
+
+  - name: config_setup_reset
+    _composite: config
+    _action: setup_reset
+    description: |
+      DELETE all stored credentials and reset to awaiting_setup state.
+      Catastrophic — invalidates the Outlook OAuth state stored on disk.
+    inputSchema:
+      type: object
+
+  - name: config_setup_complete
+    _composite: config
+    _action: setup_complete
+    description: Re-read state from disk after external config changes.
+    inputSchema:
+      type: object
+
+  - name: config_set
+    _composite: config
+    _action: set
+    description: |
+      Update runtime settings. Upstream's email tool exposes no runtime
+      settings; returns ok=false. Kept for forward-compat.
+    inputSchema:
+      type: object
+
+  - name: config_cache_clear
+    _composite: config
+    _action: cache_clear
+    description: |
+      Clear in-memory account + OAuth token caches. Forces fresh
+      Microsoft refresh on next call.
+    inputSchema:
+      type: object
+
+  # ───────────────────── leaf tools (single op, pass-through) ─────────────────────
+
+  - name: config__open_relay
+    _composite: config__open_relay
+    _action: null
+    description: |
+      Open the relay configuration form in the user's browser. Returns
+      relay URL, browser-launch status, current credential state.
+      Side-effectful — gated by HITL.
+    inputSchema:
+      type: object
+      properties: {}
+      additionalProperties: false
+
+  - name: help
+    _composite: help
+    _action: null
+    description: Get full documentation for a tool — read-only.
+    inputSchema:
+      type: object
+      required: [tool_name]
+      properties:
+        tool_name:
+          type: string
+          enum: [messages, folders, attachments, send, config, help]
