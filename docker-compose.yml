@@ -129,6 +129,61 @@ services:
         max-file: "3"
 
   # ============================================================
+  # mcp-searxng-enhanced — search + web fetch via SearXNG on CT 106
+  # ============================================================
+  # OvertliDS upstream (https://github.com/OvertliDS/mcp-searxng-enhanced).
+  # 3 read-only tools: search_web, get_website, get_current_datetime.
+  # FastMCP --http mode with stateless_http=True → the hub's stateless
+  # HttpFanout speaks to it directly with no session-bridge sidecar (the
+  # opposite of email-mcp, whose per-session init enforcement forced the
+  # proxy).
+  #
+  # No MCP-side auth (matches the `ha` MCP); docker network isolation is
+  # the boundary — only mcp-hub reaches it on the compose default network.
+  #
+  # SEARXNG_ENGINE_API_BASE_URL points at the JSON /search endpoint on
+  # CT 106 (search.service.pape.house:8888) — NOT the root URL.
+  #
+  # Image built from upstream commit 31291d9 (the published
+  # overtlids/mcp-searxng-enhanced:latest tag was a year stale and missing
+  # the --http mode entirely). Digest-pinned because Zot tag mutability
+  # isn't enforced.
+  mcp-searxng-enhanced:
+    image: registry.pape.house/local/mcp-searxng-enhanced@sha256:9272c3225deea1acd01d7bb01da66f572a9ede7c09a46fd2c1cb2550cb2151f2
+    container_name: mcp-searxng-enhanced
+    restart: unless-stopped
+    command: ["python", "mcp_server.py", "--http"]
+    environment:
+      SEARXNG_ENGINE_API_BASE_URL: http://search.service.pape.house:8888/search
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "8000"
+      DESIRED_TIMEZONE: America/Chicago
+      RATE_LIMIT_REQUESTS_PER_MINUTE: "30"
+      CACHE_TTL_MINUTES: "5"
+      LOG_LEVEL: INFO
+    healthcheck:
+      # FastMCP doesn't expose a dedicated /health; a TCP connect on :8000
+      # is the lightest liveness signal. The hub's own boot eager-or-die
+      # will catch any deeper MCP-protocol breakage.
+      test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(3); s.connect(('127.0.0.1',8000)); s.close()\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 32M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================
   # better-email-mcp — HTTP-mode OAuth 2.1 server
   # ============================================================
   # Upstream's official image. Runs in HTTP mode (sibling container to
