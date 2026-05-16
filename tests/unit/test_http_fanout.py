@@ -20,7 +20,10 @@ from mcp_fanout import (
     HttpUpstreamFailed,
     IdentityNotFound,
 )
-from mcp_fanout.http_fanout import DEFAULT_REQUEST_TIMEOUT_S
+from mcp_fanout.http_fanout import (
+    DEFAULT_REQUEST_TIMEOUT_S,
+    _parse_single_sse_message,
+)
 from mcp_hub.auth_strategies import CTX_KEY_BEARER_TOKEN, JwtPassthrough
 
 URL = "https://outline.example/mcp"
@@ -478,3 +481,69 @@ def test_jwt_passthrough_state_key_constant_matches_middleware() -> None:
     # middleware.py writes this key; auth_strategies.py reads it. Drift
     # would silently break JwtPassthrough at runtime; lock the value.
     assert CTX_KEY_BEARER_TOKEN == "bearer_token"
+
+
+# ---------------------------------------------------------------------------
+# _parse_single_sse_message
+# ---------------------------------------------------------------------------
+
+
+def test_sse_parses_single_event_single_data_line() -> None:
+    body = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n\n'
+    parsed = _parse_single_sse_message(body)
+    assert parsed == {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+
+
+def test_sse_parses_single_event_multi_data_line_pretty_json() -> None:
+    """One event, JSON split across multiple data: lines (SSE spec joins with \\n)."""
+    body = (
+        "event: message\n"
+        "data: {\n"
+        'data:   "jsonrpc": "2.0",\n'
+        'data:   "id": 1,\n'
+        'data:   "result": {"ok": true}\n'
+        "data: }\n\n"
+    )
+    parsed = _parse_single_sse_message(body)
+    assert parsed == {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+
+
+def test_sse_returns_final_reply_after_progress_notifications() -> None:
+    """Multi-event SSE: progress notifications followed by the real reply.
+
+    Regression for HA MCP's get_history (and similar large-result tools)
+    which emit notifications/progress events before the final response.
+    The previous parser joined ALL data lines and tried one json.loads,
+    which choked with "Extra data: line 2 column 1" — see 2026-05-16
+    incident with `ha_ha_get_history`.
+    """
+    progress1 = '{"jsonrpc":"2.0","method":"notifications/progress","params":{"pct":25}}'
+    progress2 = '{"jsonrpc":"2.0","method":"notifications/progress","params":{"pct":75}}'
+    final = '{"jsonrpc":"2.0","id":7,"result":{"history":[1,2,3]}}'
+    body = (
+        f"event: message\ndata: {progress1}\n\n"
+        f"event: message\ndata: {progress2}\n\n"
+        f"event: message\ndata: {final}\n\n"
+    )
+    parsed = _parse_single_sse_message(body)
+    assert parsed == {"jsonrpc": "2.0", "id": 7, "result": {"history": [1, 2, 3]}}
+
+
+def test_sse_strips_optional_single_space_after_data_colon() -> None:
+    """SSE spec: a single leading space after `data:` is part of the prefix."""
+    body = 'data: {"a":1}\ndata:{"b":2}\n\n'  # one event, two data lines
+    # First parses joined ('{"a":1}\n{"b":2}') which fails json.loads,
+    # then fallback returns the LAST valid object: {"b":2}.
+    parsed = _parse_single_sse_message(body)
+    assert parsed == {"b": 2}
+
+
+def test_sse_raises_when_no_data_lines() -> None:
+    with pytest.raises(ValueError, match="no data line in SSE body"):
+        _parse_single_sse_message("event: message\nid: 1\n\n")
+
+
+def test_sse_raises_when_no_data_line_parses() -> None:
+    body = "data: not json at all\ndata: also not json\n\n"
+    with pytest.raises(ValueError, match="none parsed to a JSON object"):
+        _parse_single_sse_message(body)

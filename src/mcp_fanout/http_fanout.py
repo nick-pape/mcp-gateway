@@ -414,30 +414,38 @@ class HttpFanout:
 
 
 def _parse_single_sse_message(body: str) -> dict[str, Any]:
-    """Parse a single-message SSE response body and return the JSON payload.
+    """Parse an SSE response body and return the FINAL JSON-RPC reply.
 
     The MCP Streamable-HTTP transport allows servers to reply with SSE for
-    request/response calls (Outline's native MCP always does). For our
-    federation pattern each request expects exactly one response, so we
-    handle the simplest case: one ``event: ...`` block, one or more
-    ``data:`` lines whose joined value is JSON.
+    request/response calls (Outline's native MCP always does; some others
+    do for large responses). For our federation pattern each request
+    expects exactly one logical reply, but the upstream may interleave
+    intermediate ``notifications/progress`` messages before the final
+    result — Home Assistant's MCP does this on ``get_history`` and other
+    big-result tools.
 
-    SSE spec: events are separated by blank lines; ``data:`` lines within
-    an event concatenate with newlines (we strip any leading single space
-    after the colon, per the spec).
+    Strategy:
+      1. Collect every ``data:`` line from the whole body (across event
+         boundaries, ignoring ``event: ...`` headers — they exist only to
+         help streaming clients dispatch). Per SSE spec, strip a single
+         leading space after ``data:``.
+      2. Fast path: join all data lines with newlines (matches the SSE
+         spec for multi-line pretty-printed JSON in a single event) and
+         try to parse as one JSON object. If the upstream emitted exactly
+         one event with a single JSON payload, this succeeds.
+      3. Fallback: parse each data line individually and return the LAST
+         one that's a JSON object. This handles upstreams that emit
+         multiple events (progress + final) — we throw away progress
+         notifications (which are JSON-RPC requests with no ``id``) and
+         return the final reply (which has an ``id`` matching ours).
 
     Raises :class:`ValueError` if the body has no parseable data line or
-    the joined payload isn't valid JSON.
+    nothing in it deserialises to a JSON object.
     """
     import json as _json
 
-    # Take everything up to the first blank line (single event).
-    head, _sep, _tail = body.partition("\n\n")
-    if not head:
-        head = body  # tolerate missing terminator
-
     data_lines: list[str] = []
-    for raw_line in head.splitlines():
+    for raw_line in body.splitlines():
         if not raw_line.startswith("data:"):
             continue
         # SSE spec: strip a single leading space after "data:" if present.
@@ -449,11 +457,33 @@ def _parse_single_sse_message(body: str) -> dict[str, Any]:
     if not data_lines:
         raise ValueError(f"no data line in SSE body (first 200 chars: {body[:200]!r})")
 
-    payload = "\n".join(data_lines)
+    # Fast path: single event with one (possibly multi-line) JSON payload.
+    joined = "\n".join(data_lines)
     try:
-        parsed = _json.loads(payload)
-    except _json.JSONDecodeError as exc:
-        raise ValueError(f"SSE data is not valid JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError(f"SSE data is JSON but not an object: {type(parsed).__name__}")
-    return parsed
+        parsed = _json.loads(joined)
+    except _json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        return parsed
+
+    # Fallback: multi-event responses (progress notifications followed by
+    # the final reply). Parse each data line, keep the last dict. Final
+    # JSON-RPC reply has an ``id``; intermediate progress notifications
+    # don't — so the order matters and we want the LAST valid dict.
+    last_dict: dict[str, Any] | None = None
+    for line in data_lines:
+        try:
+            obj = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            last_dict = obj
+
+    if last_dict is not None:
+        return last_dict
+
+    raise ValueError(
+        f"SSE body had {len(data_lines)} data line(s) but none parsed to a JSON object "
+        f"(first line preview: {data_lines[0][:200]!r})"
+    )
