@@ -88,8 +88,14 @@ async def search(
 
 
 if __name__ == "__main__":
+    # stateless_http=True so the hub's stateless HttpFanout (no
+    # Mcp-Session-Id round-trip) speaks to us cleanly. Same pattern as
+    # mcp-searxng-enhanced. Without this the hub's tools/list call hits a
+    # "Bad Request: Missing session ID" from FastMCP's default stateful
+    # StreamableHTTPServerTransport.
     mcp.run(
         transport="http",
         host=settings.LISTEN_HOST,
         port=settings.LISTEN_PORT,
+        stateless_http=True,
     )
