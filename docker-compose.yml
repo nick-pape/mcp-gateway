@@ -214,10 +214,12 @@ services:
         export MCP_RELAY_PASSWORD="$$(cat /run/secrets/email_mcp_relay_password)"
         exec node /usr/local/lib/node_modules/@n24q02m/better-email-mcp/bin/cli.mjs
 
-    # Host port 8081 exists for the one-time Caddy-fronted /authorize flow
-    # only. Hub talks internally on the compose network without going out.
-    ports:
-      - "8081:8080"
+    # No host port mapping — email-mcp is hub-internal now (Phase 3 wiring
+    # is done; the proxy + hub federation replace the direct .mcp.json
+    # path). If we ever need the relay /authorize form again (Outlook
+    # re-auth after Microsoft refresh-token expiry), `pct exec 120 --
+    # docker port email-mcp` + a temporary `docker run -p` lets us
+    # expose 8080 ad-hoc without committing it.
 
     # Persistence — upstream actually writes to /home/node/.config/mcp/,
     # /home/node/.better-email-mcp/, and /home/node/.mcp-core/ (not /data
