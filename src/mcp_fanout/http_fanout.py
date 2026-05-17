@@ -55,7 +55,7 @@ class HttpFanout:
 
         fanout = HttpFanout(
             mcp_name="outline",
-            url="https://outline.pape.house/mcp",
+            url="https://notes.pape.house/mcp",
             auth_strategy=BaoBackedBearer(...),
             identities=["claude-code-dev", "interactive"],
         )
