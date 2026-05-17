@@ -390,7 +390,7 @@ services:
       # prefix the way the cocoindex LiteLLMEmbedder does. Our direct
       # httpx /v1/embeddings call passes the model name as-is.
       EMBED_MODEL: qwen3-embed-0.6b-cpu
-      DEFAULT_COLLECTION: outline
+      DEFAULT_COLLECTION: homelab
       LISTEN_PORT: "8080"
 
     secrets:

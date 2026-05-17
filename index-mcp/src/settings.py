@@ -26,5 +26,6 @@ LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 
 # Default collection name (overridable per call via the search tool's
-# `collection` argument). For Phase A0 there's only `outline`.
-DEFAULT_COLLECTION = os.environ.get("DEFAULT_COLLECTION", "outline")
+# `collection` argument). One org-wide collection; per-source filtering
+# happens via payload `source` field, gated per-identity by the hub.
+DEFAULT_COLLECTION = os.environ.get("DEFAULT_COLLECTION", "homelab")
