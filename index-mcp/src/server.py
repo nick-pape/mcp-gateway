@@ -53,16 +53,22 @@ async def search(
 ) -> list[dict]:
     """Semantic search across the homelab index.
 
+    One org-wide collection (`homelab`). Each point's payload carries
+    `source` (e.g. "outline", future "email", "paperless") and `domain`
+    (source-specific sub-bucket, e.g. an Outline collection name) so
+    callers can see provenance per hit. Per-identity source/domain
+    filtering happens at the hub layer (see policy.yaml).
+
     Args:
         query: Free-text natural-language query.
-        top_k: Max number of hits to return (default 10).
-        collection: Qdrant collection name (default: `outline`). Other
-            collections will land as we add more sources (email, paperless,
-            code, etc.).
+        top_k: Max number of hits to return (default 10, capped at 50).
+        collection: Qdrant collection name (default: `homelab`). Override
+            only when querying experimental collections.
 
     Returns:
-        List of hit dicts with `title`, `doc_url`, `text`, `score`,
-        `chunk_start`, `chunk_end`, `doc_id`.
+        List of hit dicts with `score`, `source`, `domain`, `title`,
+        `doc_url`, `text`, `doc_id`, `chunk_start`, `chunk_end`,
+        `updated_at`, `tags`.
     """
     coll = collection or settings.DEFAULT_COLLECTION
     query_vec = await _embed(query)
@@ -76,6 +82,8 @@ async def search(
     return [
         {
             "score": float(h.score),
+            "source": h.payload.get("source"),
+            "domain": h.payload.get("domain"),
             "title": h.payload.get("title"),
             "doc_url": h.payload.get("doc_url"),
             "text": h.payload.get("text"),
@@ -83,6 +91,7 @@ async def search(
             "chunk_start": h.payload.get("chunk_start"),
             "chunk_end": h.payload.get("chunk_end"),
             "updated_at": h.payload.get("updated_at"),
+            "tags": h.payload.get("tags") or [],
         }
         for h in response.points
     ]
