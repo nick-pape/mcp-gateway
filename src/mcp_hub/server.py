@@ -312,6 +312,17 @@ class Hub:
             # schemas don't declare nullable=true (e.g. Outline's Zod).
             # Explicit None from the agent is preserved.
             arguments = {k: v for k, v in arguments.items() if v is not _UNSET}
+            # Per-identity forced args (clobbers agent values, including
+            # those the agent helpfully supplied to try to widen access).
+            # Used to gate index_search.sources per identity so alfred
+            # can't see recipe content, etc. See Policy.tool_arg_overrides.
+            forced_args = self._policy.tool_arg_overrides(identity, prefixed_name)
+            if forced_args:
+                arguments.update(forced_args)
+                logger.info(
+                    "policy: forced args on %s for %s: %s",
+                    prefixed_name, identity, list(forced_args),
+                )
             # Build request_context for HTTP-fanout auth strategies.
             # Only HttpFanout reads it; stdio Fanout ignores the kwarg.
             bearer_token = ctx.get_state(CTX_KEY_BEARER_TOKEN)

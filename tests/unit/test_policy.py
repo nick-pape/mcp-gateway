@@ -354,3 +354,76 @@ def test_is_tool_ever_push_approved_default_push_approve() -> None:
     raw["identities"]["ironclaw"]["hitl"] = {"defaults": "push-approve"}  # type: ignore[index]
     policy = Policy(HubConfig.model_validate(raw))
     assert policy.is_tool_ever_push_approved("technitium_dns_list") is True
+
+
+# ---------------------------------------------------------------------------
+# tool_arg_overrides
+# ---------------------------------------------------------------------------
+
+
+def _policy_with_arg_overrides(
+    overrides: dict[str, dict[str, object]],
+) -> Policy:
+    """Build a Policy whose ironclaw identity has the given overrides."""
+    import copy
+
+    raw = copy.deepcopy(MINIMAL)
+    raw["identities"]["ironclaw"]["tool_arg_overrides"] = overrides  # type: ignore[index]
+    return Policy(HubConfig.model_validate(raw))
+
+
+def test_tool_arg_overrides_absent_returns_none() -> None:
+    """No overrides on the identity → accessor returns None."""
+    policy = _policy()
+    assert policy.tool_arg_overrides("ironclaw", "technitium_dns_list") is None
+
+
+def test_tool_arg_overrides_exact_match_returns_dict() -> None:
+    policy = _policy_with_arg_overrides(
+        {"technitium_dns_list": {"limit": 5, "filter": ["A", "AAAA"]}}
+    )
+    got = policy.tool_arg_overrides("ironclaw", "technitium_dns_list")
+    assert got == {"limit": 5, "filter": ["A", "AAAA"]}
+
+
+def test_tool_arg_overrides_no_glob_match() -> None:
+    """Override keys are exact tool names — globbing is intentionally
+    not supported (security: ambiguity is a smell)."""
+    policy = _policy_with_arg_overrides(
+        {"technitium_dns_*": {"limit": 5}}  # this is meant to never fire
+    )
+    # Even though the key looks like a glob, lookup is exact: a tool
+    # whose name happens to LITERALLY be "technitium_dns_*" would hit;
+    # nothing else.
+    assert policy.tool_arg_overrides("ironclaw", "technitium_dns_list") is None
+    assert policy.tool_arg_overrides("ironclaw", "technitium_dns_*") == {"limit": 5}
+
+
+def test_tool_arg_overrides_returned_dict_is_a_copy() -> None:
+    """Caller may mutate the returned dict without affecting policy state."""
+    policy = _policy_with_arg_overrides(
+        {"technitium_dns_list": {"sources": ["a", "b"]}}
+    )
+    got = policy.tool_arg_overrides("ironclaw", "technitium_dns_list")
+    assert got is not None
+    got["sources"] = ["mutated"]
+    again = policy.tool_arg_overrides("ironclaw", "technitium_dns_list")
+    assert again == {"sources": ["a", "b"]}
+
+
+def test_tool_arg_overrides_rejects_tool_not_in_allowed_tools() -> None:
+    """An override for a tool the identity can't call would silently
+    never fire — fail at load."""
+    with pytest.raises(PolicyError, match="never fire"):
+        _policy_with_arg_overrides(
+            {"outline_get_doc": {"max_chars": 10000}}  # ironclaw only has technitium_*
+        )
+
+
+def test_tool_arg_overrides_accepts_glob_matching_tool() -> None:
+    """If `allowed_tools` is "technitium_*", an override on a specific
+    `technitium_dns_list` is valid — the override matches an allowed tool."""
+    policy = _policy_with_arg_overrides(
+        {"technitium_dns_list": {"limit": 5}}
+    )
+    assert policy.tool_arg_overrides("ironclaw", "technitium_dns_list") == {"limit": 5}

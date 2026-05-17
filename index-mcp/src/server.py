@@ -14,8 +14,50 @@ from __future__ import annotations
 import httpx
 from fastmcp import FastMCP
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
 
 import settings
+
+
+def _build_source_filter(
+    sources: list[str] | None,
+) -> qdrant_models.Filter | None:
+    """Translate a list of `source` / `source:domain` strings into a Qdrant
+    Filter that ANDs together (source in [...]) with per-source domain
+    restrictions when present.
+
+    Wire shape (forced by the hub per-identity):
+      ["outline"]                                 # any domain under outline
+      ["outline:Homelab", "outline:HomeAssistant"]  # specific Outline collections
+      ["outline", "kitchenowl:Default"]           # mixed: all outline + only Default kitchenowl
+
+    Output Qdrant filter is `should` (OR across entries): a hit matches
+    if its (source, domain) tuple is allowed by AT LEAST ONE entry.
+    """
+    if not sources:
+        return None
+    clauses: list[qdrant_models.Filter] = []
+    for entry in sources:
+        src, _, dom = entry.partition(":")
+        src = src.strip()
+        dom = dom.strip()
+        if not src:
+            continue
+        must: list[qdrant_models.FieldCondition] = [
+            qdrant_models.FieldCondition(
+                key="source", match=qdrant_models.MatchValue(value=src)
+            )
+        ]
+        if dom:
+            must.append(
+                qdrant_models.FieldCondition(
+                    key="domain", match=qdrant_models.MatchValue(value=dom)
+                )
+            )
+        clauses.append(qdrant_models.Filter(must=must))
+    if not clauses:
+        return None
+    return qdrant_models.Filter(should=clauses)
 
 
 mcp = FastMCP(name="index-mcp")
@@ -49,6 +91,7 @@ async def _embed(text: str) -> list[float]:
 async def search(
     query: str,
     top_k: int = 10,
+    sources: list[str] | None = None,
     collection: str | None = None,
 ) -> list[dict]:
     """Semantic search across the homelab index.
@@ -56,12 +99,20 @@ async def search(
     One org-wide collection (`homelab`). Each point's payload carries
     `source` (e.g. "outline", future "email", "paperless") and `domain`
     (source-specific sub-bucket, e.g. an Outline collection name) so
-    callers can see provenance per hit. Per-identity source/domain
-    filtering happens at the hub layer (see policy.yaml).
+    callers can see provenance per hit.
+
+    The `sources` arg is normally NOT passed by the agent — the hub
+    forces it per identity (see policy.yaml `tool_arg_overrides`). For
+    fully-trusted identities (claude-code-dev, interactive) the override
+    is absent and `sources=None` returns the whole index.
 
     Args:
         query: Free-text natural-language query.
         top_k: Max number of hits to return (default 10, capped at 50).
+        sources: List of allowed source filters. Each entry is either
+            a bare service name (`"outline"`) or a qualified
+            `"source:domain"` (`"outline:HomeAssistant"`). Hits matching
+            ANY entry are returned. None = no filter.
         collection: Qdrant collection name (default: `homelab`). Override
             only when querying experimental collections.
 
@@ -78,6 +129,7 @@ async def search(
         query=query_vec,
         limit=max(1, min(top_k, 50)),
         with_payload=True,
+        query_filter=_build_source_filter(sources),
     )
     return [
         {

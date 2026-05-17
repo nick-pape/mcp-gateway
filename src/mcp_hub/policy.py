@@ -362,6 +362,19 @@ class IdentityPolicy(BaseModel):
     allowed_tools: list[str] = Field(min_length=1)
     hitl: HITLPolicy = Field(default_factory=HITLPolicy)
     secrets: dict[str, SecretRefModel]
+    # Per-tool argument overrides. Hub stamps these into the call's
+    # arguments dict at dispatch time (clobbers agent-supplied values),
+    # so an identity can be constrained to a SUBSET of a tool's surface
+    # without trusting the agent to self-restrict.
+    #
+    # Map shape: {exact_tool_name: {arg_name: forced_value}}.
+    #
+    # Canonical use case: per-identity `sources` on `index_search` so
+    # alfred only sees Outline > HomeAssistant chunks, never recipes.
+    # Glob patterns on tool names are NOT supported (use exact names)
+    # — the override is a forcing function and ambiguity here is a
+    # security smell.
+    tool_arg_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class TokenRefresherPlugin(BaseModel):
@@ -510,6 +523,19 @@ class Policy:
                         f"{glob!r} doesn't start with any known MCP name "
                         f"(prefix {prefix!r}); known MCPs: {sorted(mcp_names)}"
                     )
+            # Every tool name referenced by tool_arg_overrides must be
+            # allowed by one of the identity's allowed_tools globs.
+            # An override on a tool the identity can't call is a typo —
+            # the override would silently never fire. Fail at load.
+            for tool_name in identity.tool_arg_overrides:
+                if not any(
+                    fnmatch.fnmatchcase(tool_name, g) for g in identity.allowed_tools
+                ):
+                    raise PolicyError(
+                        f"identity {identity_name!r}: tool_arg_overrides entry "
+                        f"{tool_name!r} is not matched by any allowed_tools glob "
+                        f"({identity.allowed_tools!r}) — the override would never fire."
+                    )
 
     # -----------------------------------------------------------------------
     # Accessors
@@ -565,6 +591,21 @@ class Policy:
     def mcp_name_for_tool(self, tool: str) -> str:
         """Return the MCP name that owns ``tool`` (its prefix before the first '_')."""
         return tool.split("_", 1)[0]
+
+    def tool_arg_overrides(
+        self, identity_name: str, tool: str
+    ) -> dict[str, Any] | None:
+        """Return the per-identity forced args for ``tool``, or None.
+
+        Exact tool-name match only (no glob). Callers should
+        ``arguments.update(overrides)`` to clobber agent-supplied
+        values — these are forced, not defaults.
+        """
+        identity = self.identity(identity_name)
+        forced = identity.tool_arg_overrides.get(tool)
+        if not forced:
+            return None
+        return dict(forced)
 
     def is_tool_ever_push_approved(self, tool: str) -> bool:
         """True if ANY identity's policy resolves ``tool`` to push-approve.
