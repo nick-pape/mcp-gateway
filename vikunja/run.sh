@@ -25,4 +25,7 @@ fi
 VIKUNJA_API_TOKEN="$(cat "$VIKUNJA_API_TOKEN_FILE")"
 export VIKUNJA_API_TOKEN
 
-exec node /app/mcps/vikunja/node_modules/@democratize-technology/vikunja-mcp/dist/index.js "$@"
+# proxy.js spawns the upstream vikunja-mcp as its own stdio child. See
+# mcp.service.pape.house/vikunja/proxy.js (tool-name normalization layer
+# that explodes composite subcommand tools into granular ones for HITL).
+exec node /app/mcps/vikunja/proxy.js "$@"
