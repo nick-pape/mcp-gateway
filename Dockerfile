@@ -40,7 +40,7 @@ RUN git clone --depth 1 --branch ${TECHNITIUM_REF} ${TECHNITIUM_REPO} /src \
 # our run.sh wrapper which slurps the secret file and exec's it.
 FROM node:22-alpine AS vikunja-install
 
-ARG VIKUNJA_MCP_VERSION=0.2.2
+ARG VIKUNJA_MCP_VERSION=0.2.0
 
 WORKDIR /pkg
 # Use `npm install --omit=dev` against a generated package.json so we

@@ -2,7 +2,9 @@
 
 Upstream: [`@democratize-technology/vikunja-mcp`](https://github.com/democratize-technology/vikunja-mcp)
 (npm-published, TypeScript). Pinned in the hub `Dockerfile`'s
-`vikunja-install` stage by exact version (`^0.2.2` at last bump).
+`vikunja-install` stage by exact version (`0.2.0` at last bump — latest
+npm-published, even though the upstream master has bumped package.json
+to 0.2.2 without publishing).
 
 ## What it does
 
