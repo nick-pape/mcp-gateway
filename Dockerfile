@@ -31,6 +31,26 @@ RUN git clone --depth 1 --branch ${TECHNITIUM_REF} ${TECHNITIUM_REPO} /src \
 
 
 # ============================================================================
+# Stage 1b — Vikunja MCP (npm-installed binary tree)
+# ============================================================================
+# @democratize-technology/vikunja-mcp is npm-published; we install the
+# exact version into a self-contained tree at /pkg, then COPY that tree
+# into the runtime stage at /app/mcps/vikunja/. The package's
+# `dist/index.js` is the stdio entrypoint; the per-identity child runs
+# our run.sh wrapper which slurps the secret file and exec's it.
+FROM node:22-alpine AS vikunja-install
+
+ARG VIKUNJA_MCP_VERSION=0.2.2
+
+WORKDIR /pkg
+# Use `npm install --omit=dev` against a generated package.json so we
+# get a deterministic node_modules tree, no devDependencies, and a real
+# tree at /pkg/node_modules/@democratize-technology/vikunja-mcp/.
+RUN echo '{"dependencies":{"@democratize-technology/vikunja-mcp":"'${VIKUNJA_MCP_VERSION}'"}}' > package.json \
+ && npm install --omit=dev --no-audit --no-fund
+
+
+# ============================================================================
 # Stage 2 — Hub Python package (uv-managed)
 # ============================================================================
 FROM python:3.13-slim AS hub-build
@@ -85,9 +105,17 @@ RUN set -eux; \
 COPY --from=hub-build /app/.venv /app/.venv
 
 # Technitium MCP build output. Future MCPs land at /app/mcps/<name>/...
-RUN mkdir -p /app/mcps/technitium
+RUN mkdir -p /app/mcps/technitium /app/mcps/vikunja
 COPY --from=technitium-build /src/dist /app/mcps/technitium/dist
 COPY --from=technitium-build /src/node_modules /app/mcps/technitium/node_modules
+
+# Vikunja MCP — npm-installed tree from stage 1b. run.sh wraps the
+# upstream binary to translate the hub's VIKUNJA_API_TOKEN_FILE
+# convention into the upstream's VIKUNJA_API_TOKEN env. See
+# mcp.service.pape.house/vikunja/README.md.
+COPY --from=vikunja-install /pkg/node_modules /app/mcps/vikunja/node_modules
+COPY vikunja/run.sh /app/mcps/vikunja/run.sh
+RUN chmod +x /app/mcps/vikunja/run.sh
 
 # Entrypoint
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
