@@ -18,7 +18,6 @@ from mcp_hub.refresher import (
     TokenWriteError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Test fakes
 # ---------------------------------------------------------------------------
@@ -291,7 +290,7 @@ def test_factory_builds_manager_with_dotted_path_plugins(tmp_path: Path) -> None
 # double-underscored so they don't collide with the simple stubs above.
 
 
-class __StubSourceForFactory:  # noqa: N801 (private-ish marker via dunder)
+class __StubSourceForFactory:
     name = "stub"
 
     async def mint(self) -> Token:
@@ -301,7 +300,7 @@ class __StubSourceForFactory:  # noqa: N801 (private-ish marker via dunder)
         return None
 
 
-class __StubSinkForFactory:  # noqa: N801
+class __StubSinkForFactory:
     name = "stub"
 
     def __init__(self, *, path: str) -> None:

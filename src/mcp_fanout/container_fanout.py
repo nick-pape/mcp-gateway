@@ -6,7 +6,7 @@ the ``FanoutLike`` union in ``server.py``.
 
 Internally:
 
-- Holds a per-(mcp × identity) registry of running wrapper containers.
+- Holds a per-(mcp x identity) registry of running wrapper containers.
 - On the first :meth:`call` for an identity, lazily spawns a container
   via the configured Docker remote API (typically ai.service.pape.house).
 - Per-spawn env injection — including bao-resolved secrets — happens
@@ -34,7 +34,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -45,8 +45,8 @@ try:  # pragma: no cover - import path validated at runtime
     import docker.errors
     from docker.models.containers import Container
 except ImportError as _import_exc:  # pragma: no cover
-    docker = None  # type: ignore[assignment]
-    Container = Any  # type: ignore[assignment, misc]
+    docker = None
+    Container = Any
     _DOCKER_IMPORT_ERROR: ImportError | None = _import_exc
 else:
     _DOCKER_IMPORT_ERROR = None
@@ -102,9 +102,9 @@ class _ContainerHandle:
     avoids racing eviction against an in-progress tool call.
     """
 
-    __slots__ = ("container", "port", "host", "started_at", "last_active", "in_flight")
+    __slots__ = ("container", "host", "in_flight", "last_active", "port", "started_at")
 
-    def __init__(self, *, container: "Container", port: int, host: str) -> None:
+    def __init__(self, *, container: Container, port: int, host: str) -> None:
         self.container = container
         self.port = port
         self.host = host

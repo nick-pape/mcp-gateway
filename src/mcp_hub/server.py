@@ -214,9 +214,9 @@ class Hub:
         from pathlib import Path as _P
         for candidate in ("/etc/mcp-pape-house/fanout_jwt",):
             p = _P(candidate)
-            if p.exists():
+            if p.exists():  # noqa: ASYNC240 — one-shot boot read; sync is fine
                 with contextlib.suppress(OSError):
-                    boot_bearer = p.read_text().strip() or None
+                    boot_bearer = p.read_text().strip() or None  # noqa: ASYNC240
                 if boot_bearer:
                     logger.info(
                         "registering tools with boot-time bearer from %s (len=%d)",

@@ -17,9 +17,7 @@ from mcp_hub.auth_strategies import BaoBackedBearer, JwtPassthrough, NoneStrateg
 from mcp_hub.factory import build_auth_strategy, build_fanout
 from mcp_hub.policy import AuthStrategyConfig, HubConfig, MCPConfig
 from mcp_hub.secrets.env import EnvSecretBackend
-
 from tests.unit.test_policy import MINIMAL
-
 
 # ---------------------------------------------------------------------------
 # build_auth_strategy
@@ -325,7 +323,7 @@ def test_build_fanout_container_requires_auth_config(tmp_path: Path) -> None:
 def test_build_fanout_container_requires_oidc_discovery_url(tmp_path: Path) -> None:
     """If no oidc_discovery_url is set on auth, container builds fail clearly."""
     raw = _container_minimal_raw()
-    raw["auth"].pop("oidc_discovery_url", None)  # type: ignore[index, attr-defined]
+    raw["auth"].pop("oidc_discovery_url", None)  # type: ignore[attr-defined]
     cfg = HubConfig.model_validate(raw)
     with pytest.raises(ValueError, match="oidc_discovery_url"):
         build_fanout(

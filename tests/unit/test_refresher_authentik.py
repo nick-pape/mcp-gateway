@@ -13,7 +13,6 @@ import pytest
 from mcp_hub.refresher import TokenMintError
 from mcp_hub.refresher.builtins.authentik import AuthentikClientCredentialsSource
 
-
 TOKEN_URL = "https://auth.example/application/o/token/"
 CLIENT_ID = "mcp-fanout-svc"
 

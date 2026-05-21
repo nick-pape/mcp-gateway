@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 
 import httpx
@@ -34,9 +33,6 @@ import pytest
 import yaml
 
 _PROXY_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_PROXY_DIR))
-
-import proxy as proxy_module  # noqa: E402
 
 SCHEMA_PATH = _PROXY_DIR / "tool-schemas.yaml"
 

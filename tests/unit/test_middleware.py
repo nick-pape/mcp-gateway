@@ -510,6 +510,17 @@ async def test_hitl_explicit_reject_raises(policy: Policy) -> None:
             self.called = True
             return ApprovalResult.APPROVED
 
+        async def publish_outcome(
+            self,
+            request: object,
+            outcome: object,
+            *,
+            result_snippet: object = None,
+            wait_ms: object = 0,
+            execution_ms: object = None,
+        ) -> None:
+            return None
+
         async def close(self) -> None:
             return None
 
