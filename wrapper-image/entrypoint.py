@@ -39,7 +39,6 @@ from authlib.jose.errors import JoseError
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response
 
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -244,7 +243,7 @@ class StdioChild:
             self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._proc.kill()
                 await self._proc.wait()
         logger.info("stdio child exited rc=%s", self._proc.returncode)
@@ -304,7 +303,7 @@ async def mcp(request: Request, _claims: dict[str, Any] = Depends(jwt_dep)):
         response = await asyncio.wait_for(
             app.state.child.call(body), timeout=MCP_REQUEST_TIMEOUT_S
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT,
             f"stdio child did not respond within {MCP_REQUEST_TIMEOUT_S:.0f}s",

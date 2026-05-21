@@ -37,7 +37,6 @@ from typing import Any
 import httpx
 import yaml
 
-
 HITL_POLICY_NAME = "mcp-hitl"
 HITL_ROLE_NAME = "mcp-hitl"
 FANOUT_SUBJECT = "mcp-fanout-svc"
@@ -196,9 +195,9 @@ def bootstrap(policy_path: Path, addr: str, token: str) -> int:
 
     print()
     print("bootstrap complete. Verify with:")
-    print(f"  bao read auth/jwt/config")
-    print(f"  bao list sys/policies/acl")
-    print(f"  bao list auth/jwt/role")
+    print("  bao read auth/jwt/config")
+    print("  bao list sys/policies/acl")
+    print("  bao list auth/jwt/role")
     return 0
 
 

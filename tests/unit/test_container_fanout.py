@@ -151,14 +151,14 @@ class _FakeDockerClient:
 
     def ping(self) -> bool:
         if not self._ping_ok:
-            import docker.errors  # type: ignore[import-untyped]
+            import docker.errors
 
             raise docker.errors.APIError("ping failed (forced)")
         return True
 
     def _images_get(self, image: str) -> Any:
         if not self._image_present:
-            import docker.errors  # type: ignore[import-untyped]
+            import docker.errors
 
             raise docker.errors.ImageNotFound(f"image not found: {image}")
         return MagicMock(id=f"sha256:{image}")
@@ -797,7 +797,7 @@ async def test_adoption_drops_containers_without_port_binding() -> None:
 
 async def test_adoption_swallows_docker_list_failure() -> None:
     """If docker list raises, startup still succeeds with empty handles."""
-    import docker.errors  # type: ignore[import-untyped]
+    import docker.errors
 
     routed = _RoutedTransport()
     docker_client = _FakeDockerClient(

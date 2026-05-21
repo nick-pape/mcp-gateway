@@ -338,7 +338,10 @@ class HITLMiddleware(Middleware):
         the approver's publish_outcome are swallowed inside the task.
         """
         try:
-            asyncio.create_task(
+            # Intentional fire-and-forget: the receipt publish runs concurrently
+            # and its errors are swallowed inside publish_outcome. The task is
+            # short-lived; we don't retain a reference.
+            asyncio.create_task(  # noqa: RUF006
                 self._approver.publish_outcome(
                     req, outcome,
                     result_snippet=result_snippet,

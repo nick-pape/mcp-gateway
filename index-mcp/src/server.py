@@ -12,11 +12,10 @@ on the compose default network).
 from __future__ import annotations
 
 import httpx
+import settings
 from fastmcp import FastMCP
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
-
-import settings
 
 
 def _build_source_filter(

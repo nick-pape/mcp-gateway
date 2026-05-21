@@ -41,14 +41,14 @@ def resolve_source(type_str: str) -> type[TokenSource]:
     """Look up a :class:`TokenSource` implementation by name."""
     cls = _resolve(type_str, SOURCE_ENTRY_POINT_GROUP)
     _validate_protocol(cls, type_str, kind="source")
-    return cls  # type: ignore[return-value]
+    return cls
 
 
 def resolve_sink(type_str: str) -> type[TokenSink]:
     """Look up a :class:`TokenSink` implementation by name."""
     cls = _resolve(type_str, SINK_ENTRY_POINT_GROUP)
     _validate_protocol(cls, type_str, kind="sink")
-    return cls  # type: ignore[return-value]
+    return cls
 
 
 def _resolve(type_str: str, group: str) -> type:

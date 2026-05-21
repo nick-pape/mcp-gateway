@@ -12,7 +12,7 @@ shape:
   etc.), injecting per-identity auth headers via a pluggable
   :class:`mcp_hub.auth_strategies.AuthStrategy`.
 - :class:`ContainerFanout` (container) — spawns wrapper containers
-  on-demand per (mcp × identity) via the Docker remote API. Each
+  on-demand per (mcp x identity) via the Docker remote API. Each
   container packages a stdio MCP behind an Authentik-fronted HTTPS
   shim; the hub federates with JwtPassthrough.
 

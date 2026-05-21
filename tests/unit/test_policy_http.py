@@ -12,7 +12,6 @@ import copy
 import pytest
 
 from mcp_hub.policy import HubConfig, MCPConfig
-
 from tests.unit.test_policy import MINIMAL
 
 

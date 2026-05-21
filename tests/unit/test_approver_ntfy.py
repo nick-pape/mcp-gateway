@@ -166,7 +166,7 @@ async def test_topic_template_substitutes_identity(
     """A {identity} placeholder in topic_template resolves per-call."""
     # Hot-swap to a templated topic — unit test scope, private attr is
     # fine. Production paths set this at construction via factory.py.
-    approver._topic_template = "mcp-hitl-{identity}"  # noqa: SLF001
+    approver._topic_template = "mcp-hitl-{identity}"
 
     async def tap() -> None:
         await asyncio.sleep(0.05)
@@ -416,7 +416,10 @@ async def test_publish_payload_includes_required_fields(
     publish = fake_ntfy.publishes[0]
     assert publish["topic"] == "mcp-hitl-approvals"
     assert "ironclaw" in publish["title"]
-    assert "technitium_dns_delete_record" in publish["title"]
+    # ntfy.py strips the mcp-name prefix, so the title reads
+    # "<id> wants to run technitium dns_delete_record" — assert both parts.
+    assert "technitium" in publish["title"]
+    assert "dns_delete_record" in publish["title"]
     labels = {a["label"] for a in publish["actions"]}
     assert labels == {"Approve", "Reject"}
     # Both actions POST to the configured webhook.
