@@ -44,12 +44,17 @@ class FileSink:
     ) -> None:
         self._path = Path(path)
         # YAML 1.1 doesn't parse `0o400` as octal — users get a string.
-        # Accept str via int(s, 0) which auto-detects 0o / 0x / 0b /
-        # decimal. Required so policy.yaml writers can use the
-        # natural-looking ``mode: 0o400`` quoted form.
+        # Accept `0o`/`0x`/`0b` prefixes + decimal via int(s, 0), plus the
+        # classic leading-zero octal form (`0400`, `0600`) that policy.yaml
+        # writers expect. int(s, 0) rejects leading-zero literals, so treat a
+        # leading `0` (without an 0o/0x/0b prefix) as octal explicitly.
         if isinstance(mode, str):
+            s = mode.strip()
             try:
-                mode = int(mode, 0)
+                if len(s) > 1 and s[0] == "0" and s[1] not in "oObBxX":
+                    mode = int(s, 8)
+                else:
+                    mode = int(s, 0)
             except ValueError as exc:
                 raise ValueError(
                     f"FileSink mode must be int or numeric string "
