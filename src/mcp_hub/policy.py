@@ -136,9 +136,10 @@ class AuthStrategyConfig(BaseModel):
 
     Built-in types:
 
-    - ``bao_backed_bearer`` — config: ``path_template`` (str, required;
-      e.g. ``"services/outline/{identity}"``), ``field`` (str, default
-      ``"api_token"``), ``cache_ttl_s`` (float, default 30).
+    - ``secret_bearer`` (alias: ``bao_backed_bearer``) — config:
+      ``path_template`` (str, required; e.g. ``"services/outline/{identity}"``),
+      ``field`` (str, default ``"api_token"``), ``cache_ttl_s`` (float, default 30).
+      Resolves a per-identity secret from the configured ``secret_backend``.
     - ``jwt_passthrough`` — config: empty.
     - ``fanout_jwt`` — config: ``path`` (str, optional; default
       ``/etc/mcp-pape-house/fanout_jwt``). Forwards the hub's own

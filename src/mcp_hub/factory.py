@@ -37,10 +37,10 @@ from .auth_strategies import (
     DEFAULT_BAO_CACHE_TTL_S,
     DEFAULT_FANOUT_JWT_PATH,
     AuthStrategy,
-    BaoBackedBearer,
     FanoutJwt,
     JwtPassthrough,
     NoneStrategy,
+    SecretBearer,
 )
 from .bao_client import BaoClient
 from .interfaces import Approver, SecretBackend, SecretRef
@@ -81,16 +81,47 @@ def build_secret_backend(
         )
     if cls is BaoSecretBackend:
         addr = _required_str(cfg, "addr", "secret_backend.config.addr")
-        jwt_path = _required_str(cfg, "role_jwt_path", "secret_backend.config.role_jwt_path")
         kv_mount = cfg.get("kv_mount", "secret")
-        role_template = cfg.get("role_template", "mcp-{mcp}-{identity}")
-        bao = BaoClient(
-            addr=addr,
-            jwt_path=jwt_path,
-            kv_mount=kv_mount,
-            http_client=http_client,
+        auth = cfg.get("auth") or {}
+        method = auth.get("method", "jwt")
+        if method == "jwt":
+            # JWT auth (default): the refresher writes a JWT the hub exchanges
+            # for a per-(mcp,identity) Vault token. `role_jwt_path` stays
+            # top-level for back-compat with existing policy.yaml.
+            jwt_path = _required_str(
+                cfg, "role_jwt_path", "secret_backend.config.role_jwt_path"
+            )
+            role_template = cfg.get("role_template", "mcp-{mcp}-{identity}")
+            bao = BaoClient(
+                addr=addr, jwt_path=jwt_path, kv_mount=kv_mount, http_client=http_client
+            )
+            return BaoSecretBackend(
+                bao_client=bao, role_template=role_template, auth_method="jwt"
+            )
+        if method == "token":
+            # Static-token auth: run Vault/OpenBao with no Authentik/JWT dance.
+            # The token is read from a file — never inlined in policy.yaml.
+            token_path = _required_str(
+                auth, "token_path", "secret_backend.config.auth.token_path"
+            )
+            try:
+                token = Path(token_path).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ValueError(
+                    f"secret_backend.config.auth.token_path: cannot read "
+                    f"{token_path}: {exc}"
+                ) from exc
+            if not token:
+                raise ValueError(
+                    f"secret_backend.config.auth.token_path {token_path} is empty"
+                )
+            bao = BaoClient(addr=addr, kv_mount=kv_mount, http_client=http_client)
+            return BaoSecretBackend(
+                bao_client=bao, auth_method="token", static_token=token
+            )
+        raise ValueError(
+            f"secret_backend.config.auth.method must be 'jwt' or 'token', got {method!r}"
         )
-        return BaoSecretBackend(bao_client=bao, role_template=role_template)
 
     # Third-party adapter (entry point or dotted-path): construct from config.
     return cls(**cfg)
@@ -180,7 +211,7 @@ def build_auth_strategy(
     function and document the new ``type`` in ``policy.example.yaml``.
     """
     cfg = config.config
-    if config.type == "bao_backed_bearer":
+    if config.type in ("secret_bearer", "bao_backed_bearer"):
         path_template = _required_str(
             cfg, "path_template", f"mcps.{mcp_name}.auth.config.path_template"
         )
@@ -198,7 +229,7 @@ def build_auth_strategy(
             raise ValueError(
                 f"mcps.{mcp_name}.auth.config.cache_ttl_s must be a number"
             ) from exc
-        return BaoBackedBearer(
+        return SecretBearer(
             secret_backend=secret_backend,
             mcp_name=mcp_name,
             path_template=path_template,

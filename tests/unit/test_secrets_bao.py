@@ -55,6 +55,32 @@ def test_bao_backend_satisfies_secret_backend_protocol(
     assert backend.name == "bao"
 
 
+async def test_token_auth_uses_static_token_no_login() -> None:
+    """auth_method='token' resolves with a static Vault token (no jwt_login)."""
+    fake = FakeBao(role_to_token={"unused": "static-tok"})
+    fake.seed("services/x/y", {"api_token": "secret-value"})
+    bao = BaoClient(
+        addr=BAO_ADDR, http_client=httpx.AsyncClient(transport=fake.transport)
+    )
+    backend = BaoSecretBackend(
+        bao_client=bao, auth_method="token", static_token="static-tok"
+    )
+    got = await backend.resolve(
+        mcp="x", identity="y", ref=SecretRef(path="services/x/y", field="api_token")
+    )
+    assert got.value == "secret-value"
+    assert fake.login_count == 0  # token mode does not jwt-login
+    await backend.close()
+
+
+def test_token_auth_requires_static_token() -> None:
+    bao = BaoClient(
+        addr=BAO_ADDR, http_client=httpx.AsyncClient(transport=FakeBao().transport)
+    )
+    with pytest.raises(ValueError, match="static_token"):
+        BaoSecretBackend(bao_client=bao, auth_method="token")
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------

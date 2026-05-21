@@ -47,9 +47,19 @@ class BaoSecretBackend:
         *,
         bao_client: BaoClient,
         role_template: str = _DEFAULT_ROLE_TEMPLATE,
+        auth_method: str = "jwt",
+        static_token: str | None = None,
     ) -> None:
+        if auth_method not in ("jwt", "token"):
+            raise ValueError(
+                f"bao auth_method must be 'jwt' or 'token', got {auth_method!r}"
+            )
+        if auth_method == "token" and not static_token:
+            raise ValueError("bao auth_method='token' requires a static_token")
         self._bao = bao_client
         self._role_template = role_template
+        self._auth_method = auth_method
+        self._static_token = static_token
 
     async def resolve(
         self,
@@ -60,7 +70,11 @@ class BaoSecretBackend:
     ) -> ResolvedSecret:
         role = self._role_template.format(mcp=mcp, identity=identity)
         try:
-            token = await self._bao.jwt_login(role=role)
+            if self._auth_method == "token":
+                assert self._static_token is not None  # guaranteed by __init__
+                token = self._static_token
+            else:
+                token = await self._bao.jwt_login(role=role)
             data = await self._bao.kv_read(token=token, path=ref.path)
         except BaoError as exc:
             raise SecretResolutionError(

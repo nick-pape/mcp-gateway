@@ -104,7 +104,7 @@ class AuthStrategy(Protocol):
 # ---------------------------------------------------------------------------
 
 
-class BaoBackedBearer:
+class SecretBearer:
     """AuthStrategy that resolves the upstream Bearer token from a SecretBackend.
 
     Reads ``ref = SecretRef(path=path_template.format(identity=identity), field=field)``
@@ -117,7 +117,7 @@ class BaoBackedBearer:
     don't want stale caches surviving across rotations.
     """
 
-    name: str = "bao_backed_bearer"
+    name: str = "secret_bearer"
 
     def __init__(
         self,
@@ -193,6 +193,12 @@ class BaoBackedBearer:
         # not by this strategy. Closing it here would tear down
         # whatever else is using it. No-op.
         return None
+
+
+# Back-compat alias: this strategy was named for the bao backend, but it only
+# depends on the SecretBackend Protocol. `secret_bearer` is the canonical name;
+# `bao_backed_bearer` keeps existing policy.yaml working.
+BaoBackedBearer = SecretBearer
 
 
 # ---------------------------------------------------------------------------

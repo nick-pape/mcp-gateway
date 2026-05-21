@@ -39,6 +39,20 @@ def test_build_auth_strategy_bao_backed_bearer() -> None:
     assert isinstance(strategy, BaoBackedBearer)
 
 
+def test_build_auth_strategy_secret_bearer() -> None:
+    # `secret_bearer` is the canonical name; `bao_backed_bearer` is the alias.
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(
+        type="secret_bearer",
+        config={"path_template": "services/outline/{identity}"},
+    )
+    strategy = build_auth_strategy(
+        mcp_name="outline", config=cfg, secret_backend=backend
+    )
+    assert isinstance(strategy, BaoBackedBearer)  # alias for SecretBearer
+    assert strategy.name == "secret_bearer"
+
+
 def test_build_auth_strategy_bao_backed_bearer_requires_path_template() -> None:
     backend = EnvSecretBackend()
     cfg = AuthStrategyConfig(type="bao_backed_bearer", config={})

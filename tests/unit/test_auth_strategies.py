@@ -68,7 +68,7 @@ def test_bao_backed_bearer_satisfies_protocol() -> None:
         field="api_token",
     )
     assert isinstance(strategy, AuthStrategy)
-    assert strategy.name == "bao_backed_bearer"
+    assert strategy.name == "secret_bearer"
 
 
 def test_jwt_passthrough_satisfies_protocol() -> None:

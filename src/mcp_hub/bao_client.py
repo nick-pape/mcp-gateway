@@ -69,7 +69,7 @@ class BaoClient:
         self,
         *,
         addr: str,
-        jwt_path: str | Path,
+        jwt_path: str | Path | None = None,
         kv_mount: str = "secret",
         http_client: httpx.AsyncClient | None = None,
         retries: int = _DEFAULT_RETRIES,
@@ -80,7 +80,7 @@ class BaoClient:
             raise ValueError(f"addr must be http(s)://, got {addr!r}")
         # Normalize trailing slash so URL joins are consistent.
         self._addr = addr.rstrip("/")
-        self._jwt_path = Path(jwt_path)
+        self._jwt_path = Path(jwt_path) if jwt_path is not None else None
         self._kv_mount = kv_mount.strip("/")
         self._http = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_S)
         self._owns_client = http_client is None
@@ -103,6 +103,8 @@ class BaoClient:
         the file may rotate; the cost (one read of a tiny file) is
         negligible compared to the HTTPS round-trip that follows.
         """
+        if self._jwt_path is None:
+            raise BaoError("jwt_login requires a configured jwt_path")
         try:
             jwt = self._jwt_path.read_text(encoding="utf-8").strip()
         except OSError as exc:
