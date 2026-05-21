@@ -40,6 +40,6 @@ def test_dotted_path_to_non_class_raises() -> None:
 
 
 def test_class_without_protocol_methods_raises() -> None:
-    # pathlib.Path is a class but has no resolve()/close().
+    # pathlib.Path is a class but lacks close(), so it fails the Protocol check.
     with pytest.raises(SecretBackendNotFound):
         resolve_secret_backend("pathlib.Path")

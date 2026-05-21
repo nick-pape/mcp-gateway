@@ -75,6 +75,12 @@ def test_non_mapping_top_level_raises(tmp_path: Path) -> None:
         FileSecretBackend(path=p)
 
 
+def test_malformed_yaml_raises(tmp_path: Path) -> None:
+    p = _write(tmp_path, "key: [unclosed\n")
+    with pytest.raises(SecretResolutionError):
+        FileSecretBackend(path=p)
+
+
 async def test_satisfies_protocol(tmp_path: Path) -> None:
     p = _write(tmp_path, "{}\n")
     backend = FileSecretBackend(path=p)

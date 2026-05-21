@@ -50,7 +50,12 @@ class FileSecretBackend:
             raise SecretResolutionError(
                 f"file backend: cannot read secrets file {self._path}: {exc}"
             ) from exc
-        data: Any = yaml.safe_load(raw)
+        try:
+            data: Any = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            raise SecretResolutionError(
+                f"file backend: {self._path} is not valid YAML/JSON: {exc}"
+            ) from exc
         if data is None:
             data = {}
         if not isinstance(data, dict):
