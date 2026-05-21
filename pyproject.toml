@@ -52,6 +52,14 @@ authentik_client_credentials = "mcp_hub.refresher.builtins.authentik:AuthentikCl
 [project.entry-points."mcp_hub.token_sinks"]
 file = "mcp_hub.refresher.builtins.file_sink:FileSink"
 
+# Secret-backend adapters. Built-ins below; third-party adapters declare the
+# same group in their own pyproject.toml and are picked up once installed.
+# See src/mcp_hub/secrets/registry.py.
+[project.entry-points."mcp_hub.secret_backends"]
+env = "mcp_hub.secrets.env:EnvSecretBackend"
+file = "mcp_hub.secrets.file:FileSecretBackend"
+bao = "mcp_hub.secrets.bao:BaoSecretBackend"
+
 [dependency-groups]
 dev = [
     "pytest>=8,<9",

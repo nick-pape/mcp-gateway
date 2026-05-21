@@ -53,6 +53,8 @@ from .refresher import (
 )
 from .secrets.bao import BaoSecretBackend
 from .secrets.env import EnvSecretBackend
+from .secrets.file import FileSecretBackend
+from .secrets.registry import resolve_secret_backend
 
 
 def build_secret_backend(
@@ -60,13 +62,24 @@ def build_secret_backend(
     *,
     http_client: httpx.AsyncClient | None = None,
 ) -> SecretBackend:
-    """Instantiate the secret backend selected in ``policy.yaml``."""
+    """Instantiate the secret backend selected in ``policy.yaml``.
+
+    The backend *class* is resolved through the ``mcp_hub.secret_backends``
+    plugin registry (entry points + dotted-path), so a third-party adapter
+    works via ``secret_backend.name: my_pkg.MyBackend`` with no hub change.
+    The built-ins (``env``/``file``/``bao``) keep their bespoke construction.
+    """
     backend = config.secret_backend
-    name = backend.name
-    if name == "env":
+    cls = resolve_secret_backend(backend.name)
+    cfg = backend.config or {}
+
+    if cls is EnvSecretBackend:
         return EnvSecretBackend()
-    if name == "bao":
-        cfg = backend.config
+    if cls is FileSecretBackend:
+        return FileSecretBackend(
+            path=_required_str(cfg, "path", "secret_backend.config.path")
+        )
+    if cls is BaoSecretBackend:
         addr = _required_str(cfg, "addr", "secret_backend.config.addr")
         jwt_path = _required_str(cfg, "role_jwt_path", "secret_backend.config.role_jwt_path")
         kv_mount = cfg.get("kv_mount", "secret")
@@ -78,7 +91,9 @@ def build_secret_backend(
             http_client=http_client,
         )
         return BaoSecretBackend(bao_client=bao, role_template=role_template)
-    raise ValueError(f"unknown secret_backend.name: {name!r}")
+
+    # Third-party adapter (entry point or dotted-path): construct from config.
+    return cls(**cfg)
 
 
 def build_approver(
