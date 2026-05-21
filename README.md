@@ -67,7 +67,7 @@ On a freshly-created Docker LXC (`mcp.service.pape.house`):
    needed; the hub validates JWTs itself).
 
 5. **Deploy via Portainer** — Repository (Git) stack pointing at
-   `mcp.service.pape.house/docker-compose.yml` on `main`.
+   `docker-compose.yml` on `main`.
 
 6. **Smoke test the 10 verification steps** in
    [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) § Verification.

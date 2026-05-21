@@ -37,7 +37,7 @@
 #   - Node + jose is already inside the email-mcp container; no extra deps.
 #
 # Usage:
-#   bash mcp.service.pape.house/scripts/bootstrap_email_mcp_hub_bearer.sh
+#   bash scripts/bootstrap_email_mcp_hub_bearer.sh
 
 set -euo pipefail
 

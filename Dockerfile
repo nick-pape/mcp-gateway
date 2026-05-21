@@ -114,7 +114,7 @@ COPY --from=technitium-build /src/node_modules /app/mcps/technitium/node_modules
 # convention into the upstream's VIKUNJA_API_TOKEN env. proxy.js sits
 # between run.sh and the upstream stdio child, exploding composite
 # subcommand tools into granular per-subcommand tools so the hub HITL
-# policy can glob read-vs-write. See mcp.service.pape.house/vikunja/README.md.
+# policy can glob read-vs-write. See vikunja/README.md.
 COPY --from=vikunja-install /pkg/node_modules /app/mcps/vikunja/node_modules
 COPY vikunja/run.sh vikunja/proxy.js /app/mcps/vikunja/
 RUN chmod +x /app/mcps/vikunja/run.sh

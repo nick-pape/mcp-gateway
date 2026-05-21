@@ -3,12 +3,12 @@
 # email-mcp-proxy — the tool-name normalization layer between the hub
 # and better-email-mcp. ~200 LoC fastapi + httpx forward proxy.
 #
-# Build context: this directory (mcp.service.pape.house/email-mcp-proxy/)
+# Build context: this directory (email-mcp-proxy/)
 # Build:
 #   docker build -t registry.pape.house/local/email-mcp-proxy:0.1 .
 #   docker push registry.pape.house/local/email-mcp-proxy:0.1
 #
-# Runtime env (set in mcp.service.pape.house/docker-compose.yml):
+# Runtime env (set in docker-compose.yml):
 #   EMAIL_MCP_URL          http://email-mcp:8080 (sibling container in same compose net)
 #   LISTEN_PORT            8080 (internal; not exposed to host or Caddy)
 #   SCHEMA_FILE            /app/tool-schemas.yaml (baked in by COPY below)

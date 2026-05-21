@@ -5,7 +5,7 @@ Embeds the query via the same llama-swap endpoint the indexer uses
 search, and returns each hit with title + doc_url + text + score.
 
 Federated through mcp.pape.house via the `index` MCP block in
-mcp.service.pape.house/policy.yaml. Auth: none (hub→index internal-only
+policy.yaml. Auth: none (hub→index internal-only
 on the compose default network).
 """
 

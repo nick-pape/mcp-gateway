@@ -11,7 +11,7 @@
 #   EMAIL_CREDENTIALS=user@example.com:app-password
 #   EMAIL_CREDENTIALS=u1@host:pw1,u2@host:pw2:imap.custom.host    # multi-account
 #
-# Build (from mcp.service.pape.house/wrapper-image/):
+# Build (from wrapper-image/):
 #   docker build -t registry.pape.house/local/email-mcp-wrapper:0.1 \
 #                -f examples/email/Dockerfile .
 #

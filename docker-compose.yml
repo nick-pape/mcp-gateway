@@ -322,7 +322,7 @@ services:
   # hub→proxy and proxy→email-mcp use the same `hub_bearer` value (fetched
   # by the hub from bao via bao_backed_bearer, sent in Bearer header).
   #
-  # See mcp.service.pape.house/email-mcp-proxy/README.md for the
+  # See email-mcp-proxy/README.md for the
   # tool-name rewrite design + drift-detection policy.
   email-mcp-proxy:
     # v0.2 — adds upstream session management to bridge the gap between

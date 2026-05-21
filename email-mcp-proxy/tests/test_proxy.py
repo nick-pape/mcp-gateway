@@ -1,6 +1,6 @@
 """Unit tests for the email-mcp-proxy rewrite logic.
 
-Pattern mirrors mcp.service.pape.house/tests/unit/test_http_fanout.py —
+Pattern mirrors tests/unit/test_http_fanout.py —
 no real network, no real email-mcp container; httpx.MockTransport stubs
 the upstream and asserts on what the proxy emits.
 """

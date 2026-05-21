@@ -19,7 +19,7 @@
 // surface here automatically on the next hub restart — no schema drift
 // to chase.
 //
-// See mcp.service.pape.house/vikunja/README.md for the rationale.
+// See vikunja/README.md for the rationale.
 
 const { spawn } = require('child_process');
 const readline = require('readline');

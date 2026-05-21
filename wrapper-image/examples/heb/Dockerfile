@@ -13,7 +13,7 @@
 # persist orchestrator-injected HEB_EMAIL / HEB_PASSWORD into the MCP's
 # credential store, then execs into the wrapper entrypoint.
 #
-# Build (from mcp.service.pape.house/wrapper-image/):
+# Build (from wrapper-image/):
 #   docker build -t mcp-pape-house/heb-mcp-wrapper:0.1 \
 #                -f examples/heb/Dockerfile .
 #
@@ -50,7 +50,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Wrapper deps (matches mcp.service.pape.house/wrapper-image/requirements.txt)
+# Wrapper deps (matches wrapper-image/requirements.txt)
 RUN pip install --no-cache-dir \
         "fastapi>=0.115,<1.0" \
         "uvicorn[standard]>=0.32,<1.0" \
