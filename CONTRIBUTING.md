@@ -40,7 +40,7 @@ Current and planned groups:
 |---|---|---|
 | `mcp_hub.token_sources` | `TokenSource` (mint/rotate tokens) | available |
 | `mcp_hub.token_sinks` | `TokenSink` (write rotated tokens) | available |
-| `mcp_hub.secret_backends` | `SecretBackend` | planned (see #8) |
+| `mcp_hub.secret_backends` | `SecretBackend` | available (built-ins: `env`, `file`, `bao`) |
 | `mcp_hub.approvers` | `Approver` | planned (see #11) |
 
 Implement the Protocol from `src/mcp_hub/interfaces.py` (or
