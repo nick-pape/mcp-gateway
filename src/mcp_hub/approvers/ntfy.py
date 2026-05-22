@@ -51,7 +51,12 @@ from typing import Any
 import httpx
 
 from mcp_hub.bao_client import BaoClient, BaoError, compare_digest
-from mcp_hub.interfaces import ApprovalRequest, ApprovalResult, CallOutcome
+from mcp_hub.interfaces import (
+    ApprovalRequest,
+    ApprovalResult,
+    CallOutcome,
+    WebhookRoute,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +127,7 @@ class NtfyApprover:
         self._ntfy_server = ntfy_server.rstrip("/")
         self._topic_template = topic_template
         self._publish_token_path = Path(publish_token_path)
+        self._webhook_path = webhook_path
         self._webhook_url = f"{webhook_base_url.rstrip('/')}{webhook_path}"
         self._timeout_default_s = timeout_default_s
         self._ack_ttl_s = ack_ttl_s
@@ -379,6 +385,19 @@ class NtfyApprover:
     # -----------------------------------------------------------------------
     # Webhook handler (called by the hub server for POST /hitl/ack)
     # -----------------------------------------------------------------------
+
+    def webhook_routes(self) -> list[WebhookRoute]:
+        """Self-register the /hitl/ack callback (WebhookApprover capability)."""
+
+        async def _handle(
+            query: Mapping[str, str], body: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            status = await self.handle_webhook(nonce=query.get("nonce", ""), body=body)
+            return status, {"ok": True}
+
+        return [
+            WebhookRoute(path=self._webhook_path, methods=("POST",), handler=_handle)
+        ]
 
     async def handle_webhook(
         self,

@@ -18,9 +18,10 @@ Both are :func:`typing.runtime_checkable` Protocols so tests can
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 # ---------------------------------------------------------------------------
 # Secret backend
@@ -196,3 +197,36 @@ class Approver(Protocol):
     async def close(self) -> None:
         """Release resources (HTTP clients, sockets, etc.)."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# Webhook callback routes (optional approver capability)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookRoute:
+    """An inbound callback route a push-approver wants the hub to mount.
+
+    ``handler`` is framework-agnostic: it takes the request's query params and
+    parsed JSON body and returns ``(status_code, json_body)``. The hub adapts
+    it to its HTTP framework, so approvers don't import Starlette.
+    """
+
+    path: str
+    methods: tuple[str, ...]
+    handler: Callable[
+        [Mapping[str, str], dict[str, Any]], Awaitable[tuple[int, dict[str, Any]]]
+    ]
+
+
+@runtime_checkable
+class WebhookApprover(Protocol):
+    """Optional capability: an :class:`Approver` that needs callback routes.
+
+    Push-based approvers (ntfy, Slack, ...) implement this to self-register
+    their inbound webhook(s); the hub mounts whatever they return. Approvers
+    without callbacks (auto, reject) simply don't implement it.
+    """
+
+    def webhook_routes(self) -> list[WebhookRoute]: ...

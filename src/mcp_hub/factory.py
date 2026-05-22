@@ -32,6 +32,7 @@ from mcp_fanout import (
 
 from .approvers.auto import AutoApprover
 from .approvers.ntfy import NtfyApprover
+from .approvers.registry import resolve_approver
 from .approvers.reject import RejectApprover
 from .auth_strategies import (
     DEFAULT_BAO_CACHE_TTL_S,
@@ -138,12 +139,12 @@ def build_approver(
     (the homelab has one bao instance) but uses its own role + JWT path.
     """
     approver = config.approver
-    name = approver.name
-    if name == "auto":
+    cls = resolve_approver(approver.name)
+    if cls is AutoApprover:
         return AutoApprover()
-    if name == "reject":
+    if cls is RejectApprover:
         return RejectApprover()
-    if name == "ntfy":
+    if cls is NtfyApprover:
         cfg = approver.config
         # Reuse bao address from secret_backend; per-approver bao_addr override
         # is accepted but uncommon (one bao instance in the homelab).
@@ -184,7 +185,8 @@ def build_approver(
             rate_limit_per_identity=cfg.get("rate_limit_per_identity", 5),
             http_client=http_client,
         )
-    raise ValueError(f"unknown approver.name: {name!r}")
+    # Third-party approver (entry point or dotted-path): construct from config.
+    return cls(**(approver.config or {}))
 
 
 def _required_str(d: dict[str, object], key: str, label: str) -> str:
