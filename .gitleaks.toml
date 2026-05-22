@@ -1,0 +1,33 @@
+# gitleaks configuration for mcp-gateway.
+#
+# Extends the upstream default ruleset (AWS/GCP/GitHub/Slack/JWT/... keys)
+# and adds one project-specific rule: opaque high-entropy tokens carried
+# behind a secret-ish prefix. That class is how a Home Assistant MCP token
+# (`private_<random>`) once slipped past a naive scan as a URL *path*
+# segment — see issue #5.
+#
+# Used by CI (.github/workflows/secrets.yml), the pre-commit hook
+# (.pre-commit-config.yaml), and ad-hoc local runs (`gitleaks detect`).
+
+title = "mcp-gateway gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "opaque-prefixed-token"
+description = "High-entropy token behind a secret-ish prefix (catches URL path tokens like private_<random>)"
+# A secret-ish prefix, a separator, then a long opaque run. The entropy
+# gate on the captured run keeps ordinary identifiers (secret_backend,
+# token_refresh, access_token_validity, ...) from matching.
+regex = '''(?i)\b(?:private|secret|token|apikey|api[_-]?key|access[_-]?token|auth[_-]?token)[_-]([A-Za-z0-9]{16,})\b'''
+secretGroup = 1
+entropy = 3.5
+keywords = ["private", "secret", "token", "apikey", "access", "auth"]
+
+[allowlist]
+description = "Repo-wide false-positive suppressions"
+# uv.lock holds package hashes that look high-entropy but are not secrets.
+paths = [
+  '''(^|/)uv\.lock$''',
+]
