@@ -19,7 +19,7 @@ classifiers = [
 dependencies = [
     # FastMCP — Streamable HTTP server. Pin exactly; bump deliberately.
     # (Streamable HTTP transport stability has wobbled in 2.x; do not float.)
-    "fastmcp>=2.10,<3",
+    "fastmcp>=3.2.0,<4",
 
     # JWT validation. >=2.10.1 for CVE-2024-53861 (issuer claim type confusion).
     # python-jose explicitly rejected (CVE history + thin maintenance).
