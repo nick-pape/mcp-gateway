@@ -284,6 +284,10 @@ class MCPConfig(BaseModel):
     spawn_timeout_s: float = 60.0
     eviction_interval_s: float = 60.0
     audience_template: str = "mcp-{identity}"
+    # Host the hub uses to reach a spawned wrapper's published port. None ⇒
+    # host.docker.internal (Docker Desktop / Linux Docker with host-gateway);
+    # set for rootless / Podman / k8s. Container-transport only.
+    container_host: str | None = None
     # env: pass-through env vars set on every spawned container of this MCP.
     # Static — not bao-resolved. For sensitive runtime values use secrets_to_env.
     env: dict[str, str] = Field(default_factory=dict)
@@ -337,6 +341,10 @@ class MCPConfig(BaseModel):
                 raise ValueError(
                     "transport=stdio: use 'extra_env' instead of 'env'"
                 )
+            if self.container_host is not None:
+                raise ValueError(
+                    "transport=stdio: field 'container_host' is container-only"
+                )
         elif self.transport == "http":
             missing_http: list[str] = []
             if self.url is None or not self.url:
@@ -361,6 +369,10 @@ class MCPConfig(BaseModel):
             if self.secrets_to_env:
                 raise ValueError(
                     "transport=http: field 'secrets_to_env' is container-only"
+                )
+            if self.container_host is not None:
+                raise ValueError(
+                    "transport=http: field 'container_host' is container-only"
                 )
             assert self.url is not None
             if not self.url.startswith(("http://", "https://")):

@@ -41,6 +41,10 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   uniformly across secret paths, `path_template`, `secrets_to_env`,
   `audience_template`, and `role_template` (stdio `secrets.path` gains
   templating too).
+- Container transport: `container_host` is now configurable per MCP in
+  `policy.yaml` (was hardcoded `host.docker.internal`) for rootless / Podman /
+  k8s; documented the Docker requirements and that stdio/http need no Docker.
+  (The per-identity UID range was already a build ARG: `UID_BASE`/`UID_COUNT`.)
 - GitHub Actions CI (ruff + mypy --strict + pytest) and a generic image build
   published to `ghcr.io/nick-pape/mcp-gateway`.
 - gitleaks secret-scanning CI gate + pre-commit hook, with a custom rule for

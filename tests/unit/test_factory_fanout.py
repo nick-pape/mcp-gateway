@@ -407,6 +407,44 @@ def test_build_fanout_container_returns_container_fanout(tmp_path: Path) -> None
     assert "ironclaw" in fanout.identities
 
 
+def test_build_fanout_container_threads_container_host(tmp_path: Path) -> None:
+    """A configured `container_host` reaches the ContainerFanout (#16)."""
+    from mcp_fanout import ContainerFanout
+
+    raw = _container_minimal_raw()
+    raw["mcps"]["heb"]["container_host"] = "172.17.0.1"  # type: ignore[index]
+    cfg = HubConfig.model_validate(raw)
+    fanout = build_fanout(
+        "heb",
+        cfg.mcps["heb"],
+        identities=cfg.identities,
+        secret_backend=EnvSecretBackend(),
+        runtime_dir=tmp_path,
+        auth_config=cfg.auth,
+        docker_client=object(),
+    )
+    assert isinstance(fanout, ContainerFanout)
+    assert fanout._container_host == "172.17.0.1"
+
+
+def test_build_fanout_container_default_host(tmp_path: Path) -> None:
+    """Unset `container_host` falls back to host.docker.internal (#16)."""
+    from mcp_fanout import ContainerFanout
+
+    cfg = HubConfig.model_validate(_container_minimal_raw())
+    fanout = build_fanout(
+        "heb",
+        cfg.mcps["heb"],
+        identities=cfg.identities,
+        secret_backend=EnvSecretBackend(),
+        runtime_dir=tmp_path,
+        auth_config=cfg.auth,
+        docker_client=object(),
+    )
+    assert isinstance(fanout, ContainerFanout)
+    assert fanout._container_host == "host.docker.internal"
+
+
 def test_build_fanout_container_requires_docker_client(tmp_path: Path) -> None:
     """Container transport without a docker_client kwarg raises clearly."""
     cfg = HubConfig.model_validate(_container_minimal_raw())

@@ -22,6 +22,11 @@ Slack, …) or with zero external infrastructure.
     distinct UID (via `gosu`), with its secret injected as a `0400` file.
   - **http** — forwards to an HTTP MCP with a per-identity auth header.
   - **container** — spawns a wrapper container per identity on the Docker socket.
+    Opt-in, and the only transport that needs Docker: it requires the Docker API
+    (mount the socket / set `DOCKER_HOST`) and a reachable `container_host`
+    (`host.docker.internal` by default; set it for rootless/Podman/k8s). The
+    per-identity UID range is a build ARG (`UID_BASE`/`UID_COUNT`) for rootless
+    subuid maps. **stdio and http need no Docker** — prefer them when you can.
 - **Middleware chain** — identity (JWT) → tool curation (per-identity allowlist)
   → HITL gate → audit.
 

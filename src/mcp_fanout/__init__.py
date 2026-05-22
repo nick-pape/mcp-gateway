@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from .container_fanout import (
     DEFAULT_AUDIENCE_TEMPLATE,
+    DEFAULT_CONTAINER_HOST,
     DEFAULT_CONTAINER_PORT,
     DEFAULT_EVICTION_INTERVAL_S,
     DEFAULT_IDLE_TIMEOUT_S,
@@ -60,6 +61,7 @@ from .http_fanout import (
 
 __all__ = [
     "DEFAULT_AUDIENCE_TEMPLATE",
+    "DEFAULT_CONTAINER_HOST",
     "DEFAULT_CONTAINER_PORT",
     "DEFAULT_EVICTION_INTERVAL_S",
     "DEFAULT_IDLE_TIMEOUT_S",
