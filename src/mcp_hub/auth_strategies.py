@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from .interfaces import SecretBackend, SecretRef, SecretResolutionError
+from .templating import expand_template
 
 # Default cache TTL for BaoBackedBearer: 30s. Rationale: bao tokens are
 # short-lived but we don't want to log in to bao on every single request.
@@ -222,7 +223,9 @@ class SecretBearer:
                 return cached[0]
 
             ref = SecretRef(
-                path=self._path_template.format(identity=identity),
+                path=expand_template(
+                    self._path_template, identity=identity, mcp=self._mcp_name
+                ),
                 field=self._field,
             )
             try:

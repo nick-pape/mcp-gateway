@@ -14,6 +14,7 @@ import yaml
 from mcp_hub.policy import (
     HITLAction,
     HubConfig,
+    IdentityPolicy,
     Policy,
     PolicyError,
 )
@@ -57,6 +58,12 @@ MINIMAL: dict[str, object] = {
         },
     },
 }
+
+
+def test_identity_policy_secrets_optional() -> None:
+    """#18: an identity that needs no per-MCP secret entry may omit `secrets`."""
+    p = IdentityPolicy(aud="mcp-x", uid_base=1001, allowed_tools=["outline_*"])
+    assert p.secrets == {}
 
 
 def _policy(overrides: dict[str, object] | None = None) -> Policy:

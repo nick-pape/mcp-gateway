@@ -53,6 +53,7 @@ else:
 
 from mcp_hub.auth_strategies import AuthStrategy
 from mcp_hub.interfaces import SecretBackend, SecretRef, SecretResolutionError
+from mcp_hub.templating import expand_template
 
 from .exceptions import HttpUpstreamFailed, IdentityNotFound
 
@@ -384,7 +385,9 @@ class ContainerFanout:
         format_key = identity if self._scope == "per-identity" else "shared"
         volumes: dict[str, dict[str, str]] = {}
         for vm in self._volumes_per_identity:
-            name = vm.volume_name_template.format(identity=format_key)
+            name = expand_template(
+                vm.volume_name_template, identity=format_key, mcp=self._mcp_name
+            )
             volumes[name] = {"bind": vm.container_path, "mode": "rw"}
         return volumes
 
@@ -522,7 +525,9 @@ class ContainerFanout:
         env: dict[str, str] = {
             "OIDC_ISSUER": self._oidc_issuer,
             "OIDC_DISCOVERY_URL": self._oidc_discovery_url,
-            "OIDC_AUDIENCE": self._audience_template.format(identity=identity),
+            "OIDC_AUDIENCE": expand_template(
+                self._audience_template, identity=identity, mcp=self._mcp_name
+            ),
             **self._env,
         }
         for env_var, ref in self._secrets_to_env.items():
@@ -531,7 +536,9 @@ class ContainerFanout:
                     mcp=self._mcp_name,
                     identity=identity,
                     ref=SecretRef(
-                        path=ref.path.format(identity=identity),
+                        path=expand_template(
+                            ref.path, identity=identity, mcp=self._mcp_name
+                        ),
                         field=ref.field,
                     ),
                 )

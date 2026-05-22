@@ -134,6 +134,26 @@ async def test_bao_backed_bearer_uses_per_identity_path_template() -> None:
     assert paper["Authorization"] == "Bearer paper-tok"
 
 
+async def test_bao_backed_bearer_expands_mcp_placeholder() -> None:
+    """{mcp} in path_template is expanded alongside {identity} (#18)."""
+    backend = _FakeBackend()
+    backend.seed(
+        mcp="outline",
+        identity="alfred",
+        path="services/outline/alfred",  # {mcp}/{identity} expanded
+        value="tok",
+    )
+    strategy = BaoBackedBearer(
+        secret_backend=backend,
+        mcp_name="outline",
+        path_template="services/{mcp}/{identity}",
+        field="api_token",
+    )
+    headers = await strategy.auth_header(identity="alfred", request_context={})
+    assert headers == {"Authorization": "Bearer tok"}
+    assert backend.calls == [("outline", "alfred", "services/outline/alfred")]
+
+
 async def test_bao_backed_bearer_caches_results_within_ttl() -> None:
     backend = _FakeBackend()
     backend.seed(
