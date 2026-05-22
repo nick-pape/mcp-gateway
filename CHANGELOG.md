@@ -33,6 +33,10 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   configurable `identity_claim` (`sub`/`azp`/`client_id`/custom) alongside the
   audience-prefix model, and an optional exact `audience` check — validates
   against Keycloak / Auth0 / Zitadel / Authentik by config alone.
+- Generic `oidc_client_credentials` token-refresh source (RFC 6749) — works with
+  any OIDC IdP; `authentik_client_credentials` kept as a back-compat alias. Plus
+  a CONTRIBUTING plugin-author guide (worked example) covering all four
+  entry-point groups.
 - GitHub Actions CI (ruff + mypy --strict + pytest) and a generic image build
   published to `ghcr.io/nick-pape/mcp-gateway`.
 - gitleaks secret-scanning CI gate + pre-commit hook, with a custom rule for

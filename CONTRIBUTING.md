@@ -63,23 +63,70 @@ protection, which we also enable once the repository is public.
 
 ## Writing a plugin (no fork required)
 
-The hub discovers plugins via Python entry points — declare them in your own
-package's `pyproject.toml` under the matching group and install side-by-side.
-Resolution is entry-point first, then a dotted-path fallback
-(`my_pkg.module:MyClass`); see `src/mcp_hub/refresher/registry.py`.
+Four of the hub's seams are pluggable via Python **entry points** — install a
+package that declares one and the hub picks it up; no fork, no central registry.
+Resolution is entry-point first, then a **dotted-path fallback**
+(`my_pkg.module:MyClass`, handy for prototyping) — see
+`src/mcp_hub/refresher/registry.py` and `src/mcp_hub/secrets/registry.py`.
 
-Current and planned groups:
-
-| Group | Interface | Status |
+| Entry-point group | Protocol (where) | Built-ins |
 |---|---|---|
-| `mcp_hub.token_sources` | `TokenSource` (mint/rotate tokens) | available |
-| `mcp_hub.token_sinks` | `TokenSink` (write rotated tokens) | available |
-| `mcp_hub.secret_backends` | `SecretBackend` | available (built-ins: `env`, `file`, `bao`) |
-| `mcp_hub.approvers` | `Approver` | available (built-ins: `auto`, `reject`, `ntfy`) |
+| `mcp_hub.secret_backends` | `SecretBackend` (`interfaces.py`) | `env`, `file`, `bao` |
+| `mcp_hub.approvers` | `Approver` (`interfaces.py`) | `auto`, `reject`, `ntfy` |
+| `mcp_hub.token_sources` | `TokenSource` (`refresher/protocols.py`) | `oidc_client_credentials` |
+| `mcp_hub.token_sinks` | `TokenSink` (`refresher/protocols.py`) | `file` |
 
-Implement the Protocol from `src/mcp_hub/interfaces.py` (or
-`refresher/protocols.py`), declare the entry point, and select it by name in
-`policy.yaml`. Add unit tests using the fakes in `tests/fakes/`.
+The loop is the same for all four: **implement the Protocol → declare the entry
+point → `pip install` next to the hub → select it by name in `policy.yaml`**
+(the `config:` block is passed to your `__init__` as kwargs). Add unit tests
+with the fakes in `tests/fakes/`.
+
+### Worked example — a token source
+
+```python
+# my_plugin/source.py
+from datetime import UTC, datetime, timedelta
+from mcp_hub.refresher.protocols import Token, TokenMintError
+
+class MyTokenSource:
+    name = "my_token_source"
+
+    def __init__(self, *, endpoint: str) -> None:        # kwargs come from policy config
+        self._endpoint = endpoint
+
+    async def mint(self) -> Token:
+        try:
+            value = await fetch_token(self._endpoint)     # your logic
+        except Exception as exc:
+            raise TokenMintError(str(exc)) from exc        # transient=True by default; retried
+        return Token(value=value, expires_at=datetime.now(UTC) + timedelta(minutes=15))
+
+    async def close(self) -> None: ...
+```
+
+```toml
+# my_plugin/pyproject.toml
+[project.entry-points."mcp_hub.token_sources"]
+my_token_source = "my_plugin.source:MyTokenSource"
+```
+
+```yaml
+# policy.yaml — `config` keys are passed to __init__ as kwargs
+token_refresh:
+  fanout_jwt:
+    source: { type: my_token_source, config: { endpoint: "https://..." } }
+    sink:   { type: file, config: { path: /etc/mcp-gateway/fanout_jwt } }
+    rotate_every: minutes=10
+```
+
+`pip install -e ./my_plugin` next to the hub and `type: my_token_source`
+resolves. While prototyping, skip the entry point and use a dotted path:
+`type: my_plugin.source:MyTokenSource`.
+
+Secret backends (`SecretBackend.resolve/close`) and approvers
+(`Approver.request_approval/publish_outcome/close`, plus the optional
+`WebhookApprover.webhook_routes` for push callbacks) follow the same loop —
+implement the Protocol from `interfaces.py`, declare the group's entry point.
 
 ## Reporting security issues
 

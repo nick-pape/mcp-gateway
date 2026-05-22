@@ -61,7 +61,9 @@ mcp-hub = "mcp_hub.__main__:main"
 # order (entry points first, then dotted-path fallback).
 
 [project.entry-points."mcp_hub.token_sources"]
-authentik_client_credentials = "mcp_hub.refresher.builtins.authentik:AuthentikClientCredentialsSource"
+oidc_client_credentials = "mcp_hub.refresher.builtins.oidc:OidcClientCredentialsSource"
+# Back-compat alias for the pre-#13 name; same class.
+authentik_client_credentials = "mcp_hub.refresher.builtins.oidc:OidcClientCredentialsSource"
 
 [project.entry-points."mcp_hub.token_sinks"]
 file = "mcp_hub.refresher.builtins.file_sink:FileSink"

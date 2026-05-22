@@ -16,12 +16,19 @@ from mcp_hub.refresher import (
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_authentik_source_via_entry_point() -> None:
-    """Built-in entry point resolves to the source class."""
-    cls = resolve_source("authentik_client_credentials")
-    assert cls.__name__ == "AuthentikClientCredentialsSource"
+def test_resolve_oidc_source_via_entry_point() -> None:
+    """Canonical entry point resolves to the OIDC source class."""
+    cls = resolve_source("oidc_client_credentials")
+    assert cls.__name__ == "OidcClientCredentialsSource"
     assert callable(cls.mint)
     assert callable(cls.close)
+
+
+def test_authentik_source_alias_resolves_to_same_class() -> None:
+    """The pre-#13 name stays a back-compat alias for the same class."""
+    assert resolve_source("authentik_client_credentials") is resolve_source(
+        "oidc_client_credentials"
+    )
 
 
 def test_resolve_file_sink_via_entry_point() -> None:
