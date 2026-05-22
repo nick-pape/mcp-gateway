@@ -1,5 +1,5 @@
 #!/bin/sh
-# Container entrypoint for mcp.pape.house.
+# Container entrypoint for mcp-gateway.
 #
 # Pre-flight: bail loudly if required bind-mounts / secrets are missing.
 # Then exec the CMD (default: python -m mcp_hub) so PID 1 stays sane

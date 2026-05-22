@@ -1,0 +1,38 @@
+# Example deployment of the generic mcp-gateway image.
+#
+# Put a policy.yaml (start from policy.example.minimal.yaml) in ./config, then
+# `docker compose up -d`. Backends that bake in specific MCP servers should
+# instead build a thin overlay `FROM ghcr.io/nick-pape/mcp-gateway` and add them.
+name: mcp-gateway
+
+services:
+  mcp-gateway:
+    image: ghcr.io/nick-pape/mcp-gateway:latest
+    container_name: mcp-gateway
+    restart: unless-stopped
+
+    # Caddy/your reverse proxy should front 8443 (TLS + routing).
+    ports:
+      - "8443:8443"
+
+    # Capability minimization: drop all, re-add only what's needed to spawn
+    # per-identity stdio children at distinct UIDs and chown their token files.
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN]
+
+    # Per-identity secret files live on a tmpfs (RAM-only, gone on stop).
+    tmpfs:
+      - /run/mcp-tokens:size=16m,mode=0711
+
+    # Config dir: policy.yaml (+ secrets.yaml for the `file` backend, + the
+    # rotated fanout_jwt if you use the bao backend's refresher). Mount the
+    # DIRECTORY (not single files) so atomic refresher writes work.
+    volumes:
+      - ./config:/etc/mcp-gateway
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8443/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

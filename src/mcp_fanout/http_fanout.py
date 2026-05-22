@@ -55,8 +55,8 @@ class HttpFanout:
 
         fanout = HttpFanout(
             mcp_name="outline",
-            url="https://notes.pape.house/mcp",
-            auth_strategy=BaoBackedBearer(...),
+            url="https://notes.example.com/mcp",
+            auth_strategy=SecretBearer(...),
             identities=["claude-code-dev", "interactive"],
         )
         await fanout.start_eager_or_die()

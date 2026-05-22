@@ -1,92 +1,92 @@
-# mcp.pape.house
+# mcp-gateway
 
-Homelab MCP (Model Context Protocol) gateway. Single docker container,
-in-process Fanout module, Authentik OIDC auth, ntfy HITL push approvals,
-bao-injected per-identity secrets.
+A multi-tenant **MCP (Model Context Protocol) gateway**: one process that sits in
+front of many MCP servers and adds, per calling identity, the things individual
+MCP servers don't: **authentication**, **per-tool authorization**,
+**human-in-the-loop (HITL) approvals**, **audit logging**, and **per-identity
+secret injection + process isolation**.
 
-See:
+It's deliberately infrastructure-agnostic — secrets, inbound auth, HITL
+approvals, and token refresh are all **pluggable** behind small interfaces, so
+you can run it against your stack (Vault/OpenBao, Keycloak/Authentik/Auth0, ntfy/
+Slack, …) or with zero external infrastructure.
 
-- [`architecture.md`](./architecture.md) — design contract
-- [`landscape.md`](./landscape.md) — why we're building rather than adopting
-- [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) — phased build plan
+> Status: pre-1.0. The core (`src/mcp_hub`, `src/mcp_fanout`) is stable; the
+> public-readiness work is tracked in the [issues](https://github.com/nick-pape/mcp-gateway/issues).
 
-## Status
+## How it works
 
-Phase 9 complete (Dockerfile + compose). End-to-end deploy in Phase 11.
+- **Fanout** — the hub registers every backend MCP's tools under a `<mcp>_`
+  prefix and routes each call to a per-identity worker:
+  - **stdio** — spawns the MCP as a child process, one per identity, each as a
+    distinct UID (via `gosu`), with its secret injected as a `0400` file.
+  - **http** — forwards to an HTTP MCP with a per-identity auth header.
+  - **container** — spawns a wrapper container per identity on the Docker socket.
+- **Middleware chain** — identity (JWT) → tool curation (per-identity allowlist)
+  → HITL gate → audit.
 
-## Quickstart (dev — Windows or Linux)
+See [`architecture.md`](./architecture.md) for the full design.
+
+## Pluggable adapters
+
+Each axis resolves an implementation by name from `policy.yaml`; third-party
+adapters install side-by-side and are selected with a dotted path
+(`name: my_pkg.MyClass`) — no fork required. See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
+| Axis | Built-ins | Entry-point group |
+|---|---|---|
+| Secrets | `env`, `file` (SOPS/age-friendly), `bao` (Vault/OpenBao) | `mcp_hub.secret_backends` |
+| Approvals (HITL) | `auto`, `reject`, `ntfy` | `mcp_hub.approvers` |
+| Token refresh | `authentik_client_credentials`, `file` sink | `mcp_hub.token_sources` / `token_sinks` |
+| Inbound auth | generic OIDC (JWKS + issuer + audience) | _(static-token / non-OIDC mode planned — #7)_ |
+
+**Zero-infra mode:** `secret_backend: {name: file}` (or `env`) + `approver:
+{name: auto}` needs no Vault/ntfy — see [`policy.example.minimal.yaml`](./policy.example.minimal.yaml).
+(Inbound auth currently still requires an OIDC issuer; a static-token mode is on
+the roadmap.)
+
+## Run it
+
+The hub is published as a generic image: `ghcr.io/nick-pape/mcp-gateway`.
+
+```bash
+# 1. Put a policy.yaml in ./config (start from policy.example.minimal.yaml)
+mkdir -p config && cp policy.example.minimal.yaml config/policy.yaml
+
+# 2. Bring it up (see docker-compose.yml for the example service)
+docker compose up -d
+curl -fsS http://localhost:8443/health   # -> {"status":"ok"}
+```
+
+Config lives at `/etc/mcp-gateway/policy.yaml` by default (override with the
+`MCP_HUB_CONFIG` env var). Backends that bake in specific MCP servers layer them
+onto this base image with a thin `FROM ghcr.io/nick-pape/mcp-gateway` overlay.
+
+## Configuration
+
+- [`policy.example.minimal.yaml`](./policy.example.minimal.yaml) — smallest
+  working config (no external infra).
+- [`policy.example.yaml`](./policy.example.yaml) — full feature reference
+  (OIDC auth, bao secrets, ntfy HITL, token refresh, per-identity allowlists).
+
+## Development
+
+Uses [uv](https://docs.astral.sh/uv/), Python 3.13.
 
 ```bash
 uv sync
-uv run pytest -q
-uv run ruff check src/
-uv run mypy --strict src/
+uv run pytest -m "not linux_only"   # full unit suite (linux_only needs gosu+root)
+uv run ruff check .
+uv run mypy
 ```
 
-## Container build (local syntax check)
+CI runs ruff + mypy `--strict` + pytest and builds/publishes the image.
 
-```bash
-docker compose config           # validate compose schema
-docker compose build            # full multi-stage build (~5 min cold)
-```
+## Security
 
-The build pulls the Technitium MCP fork from
-`https://github.com/nick-pape/technitium-mcp-secure` `main` by default;
-override with `--build-arg TECHNITIUM_REF=<branch>`.
+This is an authenticating gateway for privileged tool calls — please report
+vulnerabilities privately (see [`SECURITY.md`](./SECURITY.md)).
 
-## First-time LXC deploy (Phase 11)
+## License
 
-On a freshly-created Docker LXC (`mcp.service.pape.house`):
-
-1. **Bind-mount config dir:**
-   ```bash
-   sudo mkdir -p /etc/mcp-pape-house
-   sudo cp policy.example.yaml /etc/mcp-pape-house/policy.yaml
-   sudo chown root:root /etc/mcp-pape-house/policy.yaml
-   sudo chmod 0644 /etc/mcp-pape-house/policy.yaml
-   ```
-   Edit `/etc/mcp-pape-house/policy.yaml` to fill in the real
-   Authentik issuer URL, audiences, and secret paths.
-
-2. **Place secrets** (mode 0400 each):
-   ```bash
-   sudo install -m 0400 -o root -g root /dev/stdin /etc/mcp-pape-house/fanout_jwt < your-jwt
-   sudo install -m 0400 -o root -g root /dev/stdin /etc/mcp-pape-house/ntfy_publish_token < your-token
-   ```
-   `fanout_jwt` is the Authentik machine token for the
-   `mcp-fanout-svc` OAuth client (used by the hub to log in to bao).
-   `ntfy_publish_token` is the ntfy bearer token for publishing to the
-   `mcp-hitl-approvals` topic.
-
-3. **bao bootstrap** — see `scripts/bootstrap-bao.sh` (Phase 10) which
-   enables the JWT auth method, configures it against Authentik, and
-   creates per-(mcp, identity) policies + roles.
-
-4. **Caddy site block** — use the `caddy-add-block` skill for
-   `mcp.pape.house → mcp.service.pape.house:8443` (forward_auth NOT
-   needed; the hub validates JWTs itself).
-
-5. **Deploy via Portainer** — Repository (Git) stack pointing at
-   `docker-compose.yml` on `main`.
-
-6. **Smoke test the 10 verification steps** in
-   [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) § Verification.
-
-## Authentik setup (manual UI clicks)
-
-Per identity that should reach the gateway, create one OAuth2/OpenID
-Provider in Authentik:
-
-- **Provider name:** `mcp-<identity>` (e.g. `mcp-ironclaw`)
-- **Audiences:** `mcp-<identity>` (matches `audience_prefix` + suffix)
-- **Subject mode:** depends on whether the consumer is a human (use
-  username) or a service account (client credentials)
-- Issue a token; for service accounts, save it on the LXC at
-  `/etc/mcp-pape-house/clients/<identity>.token` (consumed by the
-  agent process, not by the gateway)
-
-For the hub itself (`mcp-fanout-svc`):
-- Provider name: `mcp-fanout-svc`
-- Audience: `mcp-fanout-svc`
-- The token Authentik issues for this client is what goes into
-  `/etc/mcp-pape-house/fanout_jwt` (used to log in to bao).
+[MIT](./LICENSE).
