@@ -69,7 +69,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    MCP_HUB_CONFIG=/etc/mcp-pape-house/policy.yaml \
+    MCP_HUB_CONFIG=/etc/mcp-gateway/policy.yaml \
     MCP_HUB_RUNTIME_DIR=/run/mcp-tokens
 
 EXPOSE 8443

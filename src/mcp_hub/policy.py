@@ -142,7 +142,7 @@ class AuthStrategyConfig(BaseModel):
       Resolves a per-identity secret from the configured ``secret_backend``.
     - ``jwt_passthrough`` — config: empty.
     - ``fanout_jwt`` — config: ``path`` (str, optional; default
-      ``/etc/mcp-pape-house/fanout_jwt``). Forwards the hub's own
+      ``/etc/mcp-gateway/fanout_jwt``). Forwards the hub's own
       service-account JWT (audience ``mcp-fanout-svc``) as the upstream
       Bearer regardless of caller identity. Pair with ``scope: shared``
       container MCPs whose wrapper accepts ``OIDC_BOOT_AUDIENCE``.

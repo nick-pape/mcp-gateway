@@ -1,7 +1,7 @@
 """Entrypoint for ``python -m mcp_hub`` and the ``mcp-hub`` console script.
 
 Loads ``policy.yaml`` (path from ``MCP_HUB_CONFIG`` env, default
-``/etc/mcp-pape-house/policy.yaml``), builds the hub, registers the
+``/etc/mcp-gateway/policy.yaml``), builds the hub, registers the
 ``/hitl/ack`` webhook route on the FastMCP HTTP app (when the approver
 needs it), and runs streamable HTTP.
 
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def _config_path() -> Path:
-    return Path(os.environ.get("MCP_HUB_CONFIG", "/etc/mcp-pape-house/policy.yaml"))
+    return Path(os.environ.get("MCP_HUB_CONFIG", "/etc/mcp-gateway/policy.yaml"))
 
 
 def _runtime_dir() -> Path:

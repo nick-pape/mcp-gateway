@@ -11,7 +11,7 @@ writable by the hub process. If the destination is inside a Docker
 bind-mounted single-file mount (e.g.
 ``-v /host/file:/container/file``), the rename will fail because the
 file's inode is bound to the host's. Bind-mount the *directory*
-instead. The compose file does this for ``/etc/mcp-pape-house``.
+instead. The compose file does this for the config dir.
 
 Registered as the entry point ``file`` in group ``mcp_hub.token_sinks``
 (see ``pyproject.toml``).
