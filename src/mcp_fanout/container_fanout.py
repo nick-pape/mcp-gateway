@@ -67,6 +67,11 @@ DEFAULT_SPAWN_TIMEOUT_S: float = 60.0
 DEFAULT_REQUEST_TIMEOUT_S: float = 180.0  # tolerates HEB Playwright self-heal (~30-60s sweep)
 DEFAULT_EVICTION_INTERVAL_S: float = 60.0
 DEFAULT_CONTAINER_PORT: int = 8080
+# How the hub reaches a spawned wrapper's published port. `host.docker.internal`
+# resolves the host on Docker Desktop (and Linux Docker run with
+# `--add-host=host-gateway`); set `container_host` in policy for rootless /
+# Podman / k8s where that name doesn't resolve.
+DEFAULT_CONTAINER_HOST: str = "host.docker.internal"
 DEFAULT_AUDIENCE_TEMPLATE: str = "mcp-{identity}"
 SHARED_KEY: str = "__shared__"
 
@@ -163,7 +168,7 @@ class ContainerFanout:
         spawn_timeout_s: float = DEFAULT_SPAWN_TIMEOUT_S,
         request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
         eviction_interval_s: float = DEFAULT_EVICTION_INTERVAL_S,
-        container_host: str = "host.docker.internal",
+        container_host: str = DEFAULT_CONTAINER_HOST,
         container_port: int = DEFAULT_CONTAINER_PORT,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:

@@ -66,6 +66,18 @@ def test_identity_policy_secrets_optional() -> None:
     assert p.secrets == {}
 
 
+def test_container_host_rejected_on_stdio() -> None:
+    """#16: `container_host` is container-transport only."""
+    import copy
+
+    from pydantic import ValidationError
+
+    raw = copy.deepcopy(MINIMAL)
+    raw["mcps"]["technitium"]["container_host"] = "host.docker.internal"  # type: ignore[index]
+    with pytest.raises(ValidationError, match="container-only"):
+        HubConfig.model_validate(raw)
+
+
 def _policy(overrides: dict[str, object] | None = None) -> Policy:
     """Build a Policy from MINIMAL with optional overrides merged in."""
     import copy

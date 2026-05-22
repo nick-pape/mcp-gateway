@@ -25,6 +25,7 @@ import httpx
 import yaml
 
 from mcp_fanout import (
+    DEFAULT_CONTAINER_HOST,
     ContainerFanout,
     Fanout,
     HttpFanout,
@@ -626,6 +627,7 @@ def build_fanout(
         idle_timeout_s=mcp_config.idle_timeout_s,
         spawn_timeout_s=mcp_config.spawn_timeout_s,
         eviction_interval_s=mcp_config.eviction_interval_s,
+        container_host=mcp_config.container_host or DEFAULT_CONTAINER_HOST,
         http_client=http_client,
     )
 

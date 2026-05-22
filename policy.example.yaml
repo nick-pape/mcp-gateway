@@ -146,6 +146,33 @@ mcps:
         field: api_token
         as_agent: true
 
+  # ── Container-transport MCP (opt-in; the ONLY transport that needs Docker) ──
+  # The hub spawns a wrapper container per identity on demand via the Docker API
+  # and forwards to its published port. Requirements:
+  #   - Docker API reachable by the hub: mount /var/run/docker.sock or set
+  #     DOCKER_HOST (docker.from_env() reads the standard env).
+  #   - container_host: how the hub reaches a spawned container's port.
+  #     host.docker.internal (default) works on Docker Desktop and on Linux
+  #     Docker run with --add-host=host-gateway; set it (e.g. the bridge gateway
+  #     172.17.0.1) for rootless Docker / Podman / k8s.
+  #   - The per-identity UID range is pre-created at image build (UID_BASE /
+  #     UID_COUNT build ARGs) — bump for rootless subuid maps.
+  # stdio and http (above) need NO Docker — prefer them when you can. Grant an
+  # identity `browser_*` in allowed_tools to actually enable this MCP.
+  browser:
+    transport: container
+    image: ghcr.io/example/browser-mcp:1
+    scope: per-identity                    # one wrapper container per identity
+    container_host: host.docker.internal   # override for rootless / Podman / k8s
+    auth:
+      type: jwt_passthrough                # wrapper validates the forwarded JWT
+    env:
+      MCP_COMMAND: "browser-mcp"
+    secrets_to_env:
+      BROWSER_TOKEN:
+        path: services/browser/{identity}
+        field: api_token
+
 identities:
   ironclaw:
     aud: mcp-ironclaw
