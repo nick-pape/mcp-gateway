@@ -42,8 +42,8 @@ from .approvers.store import (
     TransientStore,
 )
 from .auth import (
-    AuthentikJWTValidator,
     InboundAuthenticator,
+    OidcJwtValidator,
     StaticTokenAuthenticator,
     TrustedProxyAuthenticator,
 )
@@ -229,7 +229,7 @@ def build_inbound_auth(
 ) -> InboundAuthenticator:
     """Construct the inbound authenticator selected by ``auth.mode``.
 
-    - ``oidc`` → :class:`AuthentikJWTValidator` (validate inbound JWTs vs JWKS).
+    - ``oidc`` → :class:`OidcJwtValidator` (validate inbound JWTs vs JWKS).
     - ``static_token`` → :class:`StaticTokenAuthenticator` (opaque bearer tokens
       from ``token_file`` mapped to identities; no IdP).
     - ``trusted_proxy`` → :class:`TrustedProxyAuthenticator` (trust a fronting
@@ -239,12 +239,15 @@ def build_inbound_auth(
     modes validate resolved identities against it (fail-closed).
     """
     if auth.mode == "oidc":
-        # Presence guaranteed by AuthConfig._check_mode_fields.
-        assert auth.jwks_uri and auth.issuer and auth.audience_prefix
-        return AuthentikJWTValidator(
-            jwks_uri=auth.jwks_uri,
+        # Presence guaranteed by AuthConfig._check_mode_fields (issuer + an
+        # identity strategy; jwks_uri may be discovered from the issuer).
+        assert auth.issuer is not None
+        return OidcJwtValidator(
             issuer=auth.issuer,
+            jwks_uri=auth.jwks_uri,
             audience_prefix=auth.audience_prefix,
+            identity_claim=auth.identity_claim,
+            audience=auth.audience,
             algorithms=auth.algorithms,
             clock_skew_s=auth.clock_skew_s,
             cache_ttl_s=auth.cache_ttl_s,

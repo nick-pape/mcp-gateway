@@ -16,8 +16,8 @@ from pydantic import ValidationError
 from starlette.requests import Request
 
 from mcp_hub.auth import (
-    AuthentikJWTValidator,
     AuthFailed,
+    OidcJwtValidator,
     StaticTokenAuthenticator,
     TrustedProxyAuthenticator,
 )
@@ -142,6 +142,24 @@ def test_authconfig_cross_mode_field_rejected() -> None:
         )
 
 
+def test_authconfig_oidc_requires_identity_strategy() -> None:
+    # issuer present but neither audience_prefix nor identity_claim.
+    with pytest.raises(ValidationError, match="identity strategy"):
+        AuthConfig(issuer="https://i/")
+
+
+def test_authconfig_oidc_identity_claim_only_ok() -> None:
+    # No jwks_uri (discovery), no audience_prefix, identity from a claim.
+    cfg = AuthConfig(issuer="https://i/", identity_claim="sub")
+    assert cfg.mode == "oidc"
+    assert cfg.jwks_uri is None
+
+
+def test_authconfig_identity_claim_is_oidc_only() -> None:
+    with pytest.raises(ValidationError, match="does not use"):
+        AuthConfig(mode="static_token", token_file="/x", identity_claim="sub")
+
+
 # ---------------------------------------------------------------------------
 # build_inbound_auth dispatch
 # ---------------------------------------------------------------------------
@@ -150,7 +168,15 @@ def test_authconfig_cross_mode_field_rejected() -> None:
 async def test_build_inbound_auth_oidc() -> None:
     cfg = AuthConfig(issuer="https://i/", jwks_uri="https://j/", audience_prefix="mcp-")
     auth = build_inbound_auth(cfg, identities=frozenset({"alfred"}))
-    assert isinstance(auth, AuthentikJWTValidator)
+    assert isinstance(auth, OidcJwtValidator)
+    await auth.close()
+
+
+async def test_build_inbound_auth_oidc_identity_claim_discovery() -> None:
+    # issuer-only + identity_claim: jwks_uri discovered lazily, identity from sub.
+    cfg = AuthConfig(issuer="https://i/", identity_claim="sub")
+    auth = build_inbound_auth(cfg, identities=frozenset({"alfred"}))
+    assert isinstance(auth, OidcJwtValidator)
     await auth.close()
 
 

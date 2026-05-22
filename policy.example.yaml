@@ -22,6 +22,11 @@ auth:
   # See policy.example.minimal.yaml for a complete static_token quickstart.
   # NOTE: jwt_passthrough, secret_bearer `as_agent`, and container MCPs require oidc.
   mode: oidc
+  # In oidc mode jwks_uri is OPTIONAL — discovered from the issuer's
+  # /.well-known/openid-configuration when omitted. Identity defaults to the
+  # aud-suffix after audience_prefix (below); for IdPs without a per-identity
+  # audience set `identity_claim:` instead (e.g. sub / azp / client_id), and
+  # optionally `audience:` for an exact aud check.
   # Authentik global issuer. With issuer_mode=global on the providers,
   # all JWTs carry iss=https://auth.example.com/. The hub validates this
   # exact match.
