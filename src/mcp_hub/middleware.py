@@ -32,7 +32,7 @@ from mcp import McpError
 from mcp.types import CallToolRequestParams, ErrorData, ListToolsRequest
 
 from .audit import Audit, AuditLine, hash_args, new_request_id, now_iso
-from .auth import AuthentikJWTValidator, AuthFailed
+from .auth import AuthFailed, InboundAuthenticator
 from .errors import ErrorCode
 from .interfaces import ApprovalRequest, ApprovalResult, Approver, CallOutcome
 from .policy import HITLAction, Policy
@@ -61,21 +61,23 @@ _RPC_POLICY_REJECTED = -32002
 
 
 class IdentityMiddleware(Middleware):
-    """Validate the inbound JWT and attach identity to context state.
+    """Resolve the calling identity and attach it to context state.
 
-    Reads the ``Authorization: Bearer <jwt>`` header from the underlying
-    Starlette request, validates against Authentik via the configured
-    :class:`AuthentikJWTValidator`, and sets two state keys:
+    Delegates request→identity to the configured
+    :class:`mcp_hub.auth.InboundAuthenticator` (OIDC JWT, static token, or
+    trusted proxy — selected by ``auth.mode``), then sets state keys:
 
-    - ``identity`` — the resolved identity name (from the aud-suffix)
+    - ``identity`` — the resolved identity name
     - ``request_id`` — a fresh ULID, used by audit + HITL approver
+    - ``bearer_token`` — the inbound credential, when the authenticator
+      surfaces one (OIDC mode); read by forwarding fanout strategies
 
     For non-HTTP transports (stdio, used in some tests), this middleware
     no-ops and lets later middleware handle missing identity.
     """
 
-    def __init__(self, validator: AuthentikJWTValidator) -> None:
-        self._validator = validator
+    def __init__(self, authenticator: InboundAuthenticator) -> None:
+        self._auth = authenticator
 
     async def on_message(
         self,
@@ -88,18 +90,8 @@ class IdentityMiddleware(Middleware):
             # No HTTP request in scope (e.g. stdio transport in tests).
             return await call_next(context)
 
-        auth_header = request.headers.get("authorization", "")
-        if not auth_header.lower().startswith("bearer "):
-            raise McpError(
-                ErrorData(
-                    code=_RPC_AUTH_REJECTED,
-                    message=f"{ErrorCode.AUTH_FAILED}: missing bearer token",
-                )
-            )
-
-        token = auth_header[len("bearer ") :].strip()
         try:
-            identity = await self._validator.validate(token)
+            identity = await self._auth.authenticate(request)
         except AuthFailed as exc:
             raise McpError(
                 ErrorData(
@@ -110,11 +102,12 @@ class IdentityMiddleware(Middleware):
 
         _ctx(context).set_state("identity", identity.name)
         _ctx(context).set_state("request_id", new_request_id())
-        # Stash the validated bearer token for HTTP-fanout auth strategies
-        # that need to forward it (e.g., JwtPassthrough). Stdio fanouts
-        # never read this; the cost of always setting it is negligible.
+        # Stash the inbound bearer for HTTP-fanout strategies that forward it
+        # (JwtPassthrough, SecretBearer as-agent). Only OIDC mode surfaces one;
+        # non-OIDC modes leave it None and those strategies are config-rejected.
         # The key matches mcp_hub.auth_strategies.CTX_KEY_BEARER_TOKEN.
-        _ctx(context).set_state("bearer_token", token)
+        if identity.bearer_token is not None:
+            _ctx(context).set_state("bearer_token", identity.bearer_token)
         return await call_next(context)
 
 

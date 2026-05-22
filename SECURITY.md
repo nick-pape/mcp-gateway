@@ -26,6 +26,26 @@ disclosure.
 Pre-1.0: only the latest `main` is supported. Once releases are tagged, this
 table will list the supported version range.
 
+## Inbound auth hardening
+
+`auth.mode` selects how callers are authenticated; each has deployment
+responsibilities:
+
+- **`oidc`** (default): inbound OIDC JWTs validated against a pinned JWKS.
+- **`static_token`**: opaque bearer tokens mapped to identities. Generate
+  high-entropy tokens (`openssl rand -hex 32`), keep them in a `0400`,
+  root-owned file referenced by `token_file` — **never inline in `policy.yaml`** —
+  and rotate them like any credential.
+- **`trusted_proxy`**: the hub trusts an `identity_header` injected by a fronting
+  auth proxy. This is only safe because the proxy must also send a shared secret
+  (`shared_secret_file`) in the `x-mcp-gateway-auth` header (constant-time
+  compared). **Network-isolate the hub so only the proxy can reach it** —
+  otherwise anyone who can reach the hub and learns the secret can assert any
+  identity. Treat that secret as a high-value credential.
+
+All modes fail closed: an unknown token, a missing/incorrect proxy secret, or an
+unknown identity is rejected, never defaulted.
+
 ## Scope notes
 
 - The hub validates inbound JWTs and enforces per-identity tool policy and

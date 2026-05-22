@@ -41,7 +41,7 @@ from mcp.types import TextContent
 from mcp_fanout import ContainerFanout, Fanout, HttpFanout
 
 from .audit import Audit
-from .auth import AuthentikJWTValidator
+from .auth import InboundAuthenticator
 from .auth_strategies import CTX_KEY_BEARER_TOKEN
 from .errors import ErrorCode
 from .factory import build_docker_client, build_fanout
@@ -84,7 +84,7 @@ class Hub:
         policy: Policy,
         secret_backend: SecretBackend,
         approver: Approver,
-        validator: AuthentikJWTValidator,
+        validator: InboundAuthenticator,
         audit: Audit,
         runtime_dir: Path,
     ) -> None:

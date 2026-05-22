@@ -22,6 +22,12 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   the store audits the agent), via a new optional `jwt=` hook on the
   `SecretBackend.resolve()` Protocol. All-autonomous HTTP MCPs boot via a
   no-auth reachability probe.
+- Non-OIDC inbound auth via `auth.mode`, behind a new `InboundAuthenticator`
+  Protocol: `static_token` (opaque bearer tokens → identities from a file; **no
+  IdP**) and `trusted_proxy` (trust a fronting proxy's identity header, gated by
+  a constant-time shared-secret check). `oidc` stays the default — making a true
+  no-IdP `docker compose up` possible. (`jwt_passthrough` / `as_agent` /
+  container MCPs remain oidc-only, with clear config errors otherwise.)
 - GitHub Actions CI (ruff + mypy --strict + pytest) and a generic image build
   published to `ghcr.io/nick-pape/mcp-gateway`.
 - gitleaks secret-scanning CI gate + pre-commit hook, with a custom rule for

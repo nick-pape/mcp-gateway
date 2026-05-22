@@ -11,6 +11,17 @@ server:
   hitl_webhook_path: /hitl/ack
 
 auth:
+  # Inbound auth mode. Default `oidc` (shown below). To run with NO IdP:
+  #   mode: static_token
+  #   token_file: /etc/mcp-gateway/tokens.yaml   # YAML mapping `identity: <token>`
+  # or to delegate to a fronting auth proxy (oauth2-proxy / Authelia / Caddy):
+  #   mode: trusted_proxy
+  #   identity_header: X-Auth-Request-User
+  #   shared_secret_file: /etc/mcp-gateway/proxy_secret  # proxy must echo it in
+  #                                                       # header x-mcp-gateway-auth
+  # See policy.example.minimal.yaml for a complete static_token quickstart.
+  # NOTE: jwt_passthrough, secret_bearer `as_agent`, and container MCPs require oidc.
+  mode: oidc
   # Authentik global issuer. With issuer_mode=global on the providers,
   # all JWTs carry iss=https://auth.example.com/. The hub validates this
   # exact match.
