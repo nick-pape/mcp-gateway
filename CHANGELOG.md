@@ -69,3 +69,14 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   Authentik global-issuer mode).
 - FastMCP server name and package docstrings are now `mcp-gateway`-branded;
   `policy.example.yaml` and `scripts/` use generic `example.com` hostnames.
+
+### Documentation
+- Rewrote `architecture.md` around the generic design: pluggable axes + the three
+  transports (stdio/http/container) + three auth modes (oidc/static_token/
+  trusted_proxy) as first-class, with Authentik/OpenBao/ntfy demoted to a worked
+  example. Removed the stale baked-in-MCP multi-stage Dockerfile, `su-exec`,
+  `AuthentikJWTValidator`, and "~250 LoC" references.
+- Pruned `KNOWN_LIMITATIONS.md`: marked the stdio-only-transport (#3) and
+  build-time `git clone` (#14) limitations resolved, rewrote the Authentik-coupling
+  entry (#5), and updated the credential-injection (#1) and Layer-3 rotation (#2)
+  entries to reflect the http/container transports and the generic refresher.

@@ -42,7 +42,7 @@ adapters install side-by-side and are selected with a dotted path
 |---|---|---|
 | Secrets | `env`, `file` (SOPS/age-friendly), `bao` (Vault/OpenBao) | `mcp_hub.secret_backends` |
 | Approvals (HITL) | `auto`, `reject`, `ntfy` | `mcp_hub.approvers` |
-| Token refresh | `authentik_client_credentials`, `file` sink | `mcp_hub.token_sources` / `token_sinks` |
+| Token refresh | `oidc_client_credentials` (alias: `authentik_client_credentials`), `file` sink | `mcp_hub.token_sources` / `token_sinks` |
 | Inbound auth | OIDC JWT (any JWKS issuer), **static-token** (no IdP), **trusted-proxy** | `auth.mode` in `policy.yaml` |
 
 **Zero-infra mode:** `auth: {mode: static_token}` + `secret_backend: {name: file}`

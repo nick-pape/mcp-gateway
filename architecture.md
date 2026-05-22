@@ -1,510 +1,397 @@
-# Architecture: single-container hub with in-process fanout
+# Architecture
 
 > Sister doc: [`landscape.md`](./landscape.md) for the survey that led to
-> "build" instead of adopt.
->
-> This describes the **reference deployment**. The IdP (Authentik), secret
-> backend (OpenBao/Vault), and approver (ntfy) named throughout are the
-> author's concrete choices — each is pluggable behind a small interface
-> (see [`README.md`](./README.md)).
+> "build" instead of adopt. [`README.md`](./README.md) is the quickstart;
+> [`CONTRIBUTING.md`](./CONTRIBUTING.md) is the plugin-author guide;
+> [`KNOWN_LIMITATIONS.md`](./KNOWN_LIMITATIONS.md) is the honest gap list.
 
-## Vision
+`mcp-gateway` is a **single process** that sits in front of many MCP servers and
+adds, per calling identity, the things individual MCP servers don't:
+authentication, per-tool authorization, human-in-the-loop (HITL) approvals,
+audit logging, and per-identity secret injection + process isolation.
 
-A **single docker compose service** running an MCP gateway that:
+It is **infrastructure-agnostic by construction**: secrets, inbound auth, HITL
+approvals, and token refresh are each pluggable behind a small interface, and
+the upstream MCPs it federates are reached over one of three transports. None of
+the concrete backends are baked in — the image is generic. The Authentik +
+OpenBao + ntfy deployment named throughout the [worked example](#appendix-worked-example-authentik-openbao-ntfy)
+is the author's homelab; swap any axis without forking.
 
-1. Authenticates inbound calls via **Authentik OIDC JWT** (audience-per-identity)
-2. **Curates `list_tools`** per identity (disallowed tools are *invisible*
-   to the agent's LLM, never auto-rejected)
-3. Applies per-tool **HITL policy** on `call_tool` (`auto-approve` /
-   `push-approve` / `reject`)
-4. **Multiplexes per-identity stdio MCP children** via the in-process
-   `Fanout` module — one stdio process per (MCP × identity) tuple,
-   each running as a distinct UID
-5. **Audits** every request and tool call (JSONL → Loki)
+LiteLLM is not in this picture. Agents drive their own tool-use loops and reach
+the gateway directly.
 
-LiteLLM is not in this picture. Agents drive their own tool-use loops
-and reach the gateway directly.
+## What the hub adds
+
+For every request, the hub layers five concerns on top of the upstream MCP —
+the middleware chain runs in this order:
+
+1. **Inbound auth** — establish *who is calling* via the configured
+   [`auth.mode`](#inbound-auth-modes) (OIDC JWT, static token, or trusted
+   proxy). The result is an `Identity`.
+2. **Tool curation** — `list_tools` returns only the tools whose name matches
+   that identity's `allowed_tools` globs. Disallowed tools are **invisible** to
+   the agent's LLM, never auto-rejected (the "no-oracle" property — see
+   [Security model](#security-model)).
+3. **HITL gate** — on `call_tool`, the per-tool policy decides
+   `auto-approve` / `push-approve` / `reject`. `push-approve` blocks on an
+   operator acknowledgement via the configured [approver](#human-in-the-loop-hitl).
+4. **Fanout** — route the call to a per-identity worker for the owning MCP,
+   over that MCP's [transport](#transports).
+5. **Audit** — one structured line per request at egress (see
+   [Audit + observability](#audit--observability)).
+
+## Pluggable axes
+
+Each axis resolves an implementation **by name** from `policy.yaml`. The three
+entry-point axes also accept a **dotted path** (`name: my_pkg.module:MyClass`),
+so a third-party adapter installs side-by-side and is selected with no fork —
+resolution is entry-point first, then dotted-path fallback (see
+`src/mcp_hub/secrets/registry.py`, `src/mcp_hub/refresher/registry.py`). See
+[`CONTRIBUTING.md`](./CONTRIBUTING.md) for the plugin-author loop.
+
+| Axis | Built-ins | Selected by |
+|---|---|---|
+| Secrets | `env`, `file` (SOPS/age-friendly), `bao` (Vault/OpenBao) | `secret_backend.name` (group `mcp_hub.secret_backends`) |
+| Inbound auth | `oidc` (any JWKS issuer), `static_token` (no IdP), `trusted_proxy` | `auth.mode` |
+| Approvals (HITL) | `auto`, `reject`, `ntfy` | `approver.name` (group `mcp_hub.approvers`) |
+| Token refresh | `oidc_client_credentials` source, `file` sink | `token_refresh.*.source/sink.type` (groups `mcp_hub.token_sources` / `token_sinks`) |
+
+**Zero-infra mode:** `auth: {mode: static_token}` + `secret_backend: {name: file}`
+(or `env`) + `approver: {name: auto}` needs no IdP / Vault / ntfy. See
+[`policy.example.minimal.yaml`](./policy.example.minimal.yaml).
+
+### Inbound auth modes
+
+`auth.mode` picks one of three built-in authenticators (the `InboundAuthenticator`
+Protocol in `src/mcp_hub/auth.py`); all of them resolve to an identity that must
+exist in `policy.yaml` (fail-closed):
+
+- **`oidc`** — validate the inbound `Authorization: Bearer <JWT>` against the
+  IdP's JWKS. `jwks_uri` is optional: when omitted it is discovered from
+  `<issuer>/.well-known/openid-configuration`. Identity defaults to the `aud`
+  suffix after `audience_prefix` (e.g. `mcp-ironclaw` → `ironclaw`); for IdPs
+  without a per-identity audience, set `identity_claim` (`sub` / `azp` /
+  `client_id`) and optionally `audience` for an exact check.
+- **`static_token`** — a YAML `identity: <token>` mapping at `token_file`;
+  the bearer is matched in constant time. No IdP required.
+- **`trusted_proxy`** — delegate auth to a fronting proxy (oauth2-proxy /
+  Authelia / Caddy forward-auth) that sets `identity_header` and echoes a shared
+  secret in `x-mcp-gateway-auth`. The hub trusts the header only when the shared
+  secret matches.
+
+> `jwt_passthrough`, `secret_bearer` with `as_agent`, and the **container**
+> transport need a real inbound JWT, so they require `auth.mode: oidc`.
+
+## Transports
+
+The fanout registers every upstream MCP's tools under a `<mcp>_` prefix and
+routes each call to a **per-identity** worker. There are three transports;
+**stdio and http need no Docker** — prefer them.
+
+| Transport | Worker | Per-identity auth to upstream | Needs Docker |
+|---|---|---|---|
+| **stdio** | a child process per (MCP × identity), each `gosu`'d to a distinct UID | secret written to a `0400` file; path passed via `secret_env_name` | no |
+| **http** | a forward to an HTTP-transport MCP over the network | `auth: none` / `secret_bearer` (per-identity token in `Authorization`) / `jwt_passthrough` (forward the caller's JWT) | no |
+| **container** | a wrapper container per identity, spawned on demand via the Docker API | `jwt_passthrough` to the wrapper; `secrets_to_env` for upstream creds | **yes** (opt-in) |
+
+- **stdio** is the strongest-isolation path: each child runs as its own UID and
+  the secret never enters any process's environment (see
+  [Security model](#security-model)).
+- **http** is the lightest: federate an existing HTTP MCP (a sidecar in the same
+  compose stack, or a remote one) with no process management. `secret_bearer`
+  supports [as-agent](#identity--secrets) attribution.
+- **container** is opt-in and the **only** transport that needs Docker. It
+  requires the Docker API reachable by the hub (mount `/var/run/docker.sock` or
+  set `DOCKER_HOST` — `docker.from_env()` reads the standard env) **and** a
+  `container_host` the hub can use to reach a spawned wrapper's published port.
+  `host.docker.internal` (the default) works on Docker Desktop and on Linux
+  Docker run with `--add-host=host-gateway`; set `container_host` (e.g. the
+  bridge gateway `172.17.0.1`) for rootless Docker / Podman / k8s.
 
 ## Component diagram
 
 ```mermaid
 flowchart TB
-    subgraph agents["Agents"]
+    subgraph agents["Agents / clients"]
         A1[ironclaw]
-        A2[paperless-bot]
-        A3[claude-code-dev]
+        A2[interactive human]
+        A3[assistant-agent]
     end
 
-    AUTH[("OIDC IdP<br/>(e.g. Authentik)")]
-    BAO[("Secret backend<br/>(e.g. Vault / OpenBao)")]
-    NTFY[("Approver<br/>(e.g. ntfy)")]
+    AUTH[("Inbound auth source<br/>(OIDC IdP / static tokens /<br/>trusted proxy)")]
+    SECRET[("Secret backend<br/>(env / file / bao)")]
+    APPROVE[("Approver<br/>(auto / reject / ntfy)")]
+    PROXY["Reverse proxy<br/>(TLS termination)"]
 
-    CADDY["Reverse proxy<br/>(e.g. Caddy)"]
+    subgraph host["gateway host — single container"]
+        HUB["Hub (FastMCP, Python)<br/>auth → curate list_tools → HITL → audit"]
 
-    subgraph mcp_lxc["gateway host — single container"]
-        HUB["Hub (FastMCP, Python, ~250 LoC)<br/>- JWT validate (aud → identity)<br/>- Policy: list_tools filter + HITL<br/>- Audit"]
-
-        subgraph fanouts["In-process Fanout instances"]
-            F1["Fanout(technitium)"]
-            F2["Fanout(paperless)"]
-            F3["Fanout(authentik)"]
+        subgraph fanout["Fanout router (by tool prefix)"]
+            direction TB
+            STDIO["stdio fanout"]
+            HTTP["http fanout"]
+            CTR["container fanout"]
         end
 
-        subgraph stdio_children["Stdio children (su-exec'd to distinct UIDs)"]
-            T1[(technitium<br/>UID 1001<br/>ironclaw)]
-            T2[(technitium<br/>UID 1002<br/>paperless-bot)]
-            T3[(technitium<br/>UID 1003<br/>claude-code-dev)]
-            P1[(paperless<br/>UID 1011<br/>ironclaw)]
-            P2[(paperless<br/>UID 1012<br/>paperless-bot)]
-            AK1[(authentik<br/>UID 1021<br/>claude-code-dev)]
+        subgraph children["stdio children (gosu'd to distinct UIDs)"]
+            T1[(technitium · UID 1011 · ironclaw)]
+            T2[(technitium · UID 1031 · assistant)]
         end
     end
 
-    A1 -->|JWT aud=mcp-ironclaw| CADDY
-    A2 -->|JWT aud=mcp-paperless-bot| CADDY
-    A3 -->|JWT aud=mcp-claude-code-dev| CADDY
-    CADDY -->|Streamable HTTP| HUB
+    UP_HTTP[("HTTP MCP<br/>(e.g. Outline, Home Assistant)")]
+    UP_CTR[("wrapper container<br/>per identity (Docker API)")]
 
-    HUB --> F1
-    HUB --> F2
-    HUB --> F3
+    A1 -->|bearer| PROXY
+    A2 -->|bearer| PROXY
+    A3 -->|bearer| PROXY
+    PROXY -->|Streamable HTTP| HUB
 
-    F1 -.->|stdio pipe| T1
-    F1 -.->|stdio pipe| T2
-    F1 -.->|stdio pipe| T3
-    F2 -.->|stdio pipe| P1
-    F2 -.->|stdio pipe| P2
-    F3 -.->|stdio pipe| AK1
+    HUB --> STDIO
+    HUB --> HTTP
+    HUB --> CTR
 
-    HUB -.->|JWKS fetch + serve-stale-on-failure| AUTH
-    HUB -->|push approval| NTFY
-    NTFY -->|webhook ack| HUB
+    STDIO -.->|stdio pipe| T1
+    STDIO -.->|stdio pipe| T2
+    HTTP  -.->|per-identity bearer / JWT| UP_HTTP
+    CTR   -.->|Docker API + container_host| UP_CTR
 
-    F1 -.->|JWT swap (per identity at boot)| BAO
-    F2 -.->|JWT swap (per identity at boot)| BAO
-    F3 -.->|JWT swap (per identity at boot)| BAO
+    HUB  -.->|validate identity| AUTH
+    HUB  -->|request approval| APPROVE
+    APPROVE -->|webhook ack| HUB
+
+    STDIO -.->|resolve per-identity secret| SECRET
+    HTTP  -.->|resolve per-identity secret| SECRET
+    CTR   -.->|resolve per-identity secret| SECRET
 ```
 
-Containers: **1**. Stdio children: M × N (M MCP types × N identities).
-All siblings, all in the same container, isolated by UID.
+Containers: **1** (plus opt-in container-transport wrappers). stdio children:
+one per (MCP × identity), all siblings in the hub container, isolated by UID.
 
-## End-to-end flow
+## End-to-end request flow
 
-1. **Agent → reverse proxy.** POST to `https://<gateway-host>/mcp` with
-   `Authorization: Bearer <OIDC-JWT>`. The JWT's `aud` claim is the
-   agent's identity (`mcp-ironclaw`, `mcp-paperless-bot`, etc.).
-2. **The reverse proxy** terminates TLS, forwards to the gateway
-   container's `:8443`.
-3. **Hub auth middleware:** validates the JWT against pinned Authentik
-   JWKS, extracts identity from `aud` claim. Attaches
-   `request.state.identity` (e.g., `"ironclaw"`).
-4. **`list_tools`:** hub returns only tools whose name matches the
-   identity's `allowed_tools` glob list. The LLM never sees
-   `authentik_*_delete` if `ironclaw` doesn't have it.
-5. **`call_tool`:** hub middleware:
-   - Look up policy: `auto-approve` / `push-approve` / `reject`
-   - On `reject` → MCP error `POLICY_REJECTED`
-   - On `push-approve` → ntfy push with bao-stored ack token; await
-     webhook ack; on timeout → `POLICY_HITL_TIMEOUT`
-   - On `auto-approve` → straight through
-6. **Hub → Fanout:** call `fanout.call(identity, request)`. Hub picks
-   the right `Fanout` instance by tool prefix
-   (`technitium_*` → `Fanout(technitium)`).
-7. **Fanout → stdio child:** writes JSON-RPC to that child's stdin,
-   awaits response on its stdout. The child uses its bao-injected
-   token-file (`/run/ironclaw-technitium-token`, mode 0400 owned by
-   UID 1001) to call the upstream service API.
-8. **Result** bubbles back through fanout → hub → agent. Audit line
+1. **Agent → reverse proxy.** POST to `https://<gateway-host>/mcp` with the
+   credential the configured `auth.mode` expects (a bearer JWT for `oidc`, a
+   static token for `static_token`, or proxy-set headers for `trusted_proxy`).
+2. **Reverse proxy** terminates TLS and forwards to the container's `:8443`.
+   The credential is the auth; no mTLS required.
+3. **Inbound auth** resolves the `Identity` (e.g. JWT signature + `aud`/claim →
+   `ironclaw`). Unknown identity → empty `tools/list` and `POLICY_REJECTED` on
+   call (no-oracle).
+4. **`list_tools`** returns only tools matching the identity's `allowed_tools`
+   globs.
+5. **`call_tool`** consults the per-tool HITL policy:
+   - `reject` → `POLICY_REJECTED`
+   - `push-approve` → request approval via the approver; await ack; on timeout
+     → `POLICY_HITL_TIMEOUT`
+   - `auto-approve` → straight through
+6. **Fanout** picks the worker by tool prefix (`technitium_*` → the technitium
+   MCP) and dispatches over that MCP's transport (write to a stdio child / HTTP
+   call / container wrapper).
+7. **Result** bubbles back through fanout → hub → agent. One audit line is
    written at hub egress.
 
-## Hub responsibilities
+## Security model
 
-```python
-# ~250 LoC of Python. Pseudocode shape:
+The threat model is a **compromised upstream MCP or poisoned tool result** — a
+tool-result string with executable content reflected through an MCP's parser —
+trying to read another identity's credentials or act beyond its grant.
 
-from fastmcp import FastMCP
-from .fanout import Fanout
-from .auth import AuthentikJWTValidator
-from .hitl import NtfyApprover
+### Per-UID isolation (stdio transport)
 
-mcp = FastMCP("mcp-gateway")
-auth = AuthentikJWTValidator(jwks_uri=PINNED_JWKS_URI, audience_prefix="mcp-")
-hitl = NtfyApprover(...)
-policy = Policy.load("/etc/mcp-gateway/policy.yaml")
+`/proc/<pid>/environ` shows the env passed to `exec()`; even after `unsetenv()`,
+the original environ persists in `/proc` and is readable by any process running
+as the **same** UID. In a naive single-container fanout where all children share
+one UID, a compromised child could `cat /proc/<sibling-pid>/environ` and read a
+sibling identity's token.
 
-# One Fanout per MCP type. Eager spawn at startup (per design choice 1).
-fanouts = {
-    "technitium": Fanout(
-        mcp_name="technitium",
-        command=["node", "/app/mcps/technitium/dist/index.js"],
-        identities=policy.identity_secrets("technitium"),
-    ),
-    "paperless": Fanout(...),
-    "authentik": Fanout(...),
-}
-for f in fanouts.values():
-    f.start_eager_or_die()  # bao swap per identity, spawn all children;
-                            # any failure → exit nonzero (per design choice 2)
+Mitigations, stacked:
 
-@mcp.middleware
-async def auth_middleware(request, call_next):
-    jwt = strip_bearer(request.headers["Authorization"])
-    claims = auth.validate(jwt)               # signature + aud + iss + exp
-    request.state.identity = claims["aud"].removeprefix("mcp-")
-    return await call_next(request)
+1. **Each stdio child runs as a distinct UID** (`uid_base + per-MCP uid_offset`),
+   `gosu`'d at spawn. Linux blocks cross-UID `/proc/*/environ` reads.
+2. **Secrets are passed via `0400` token-files, not env vars.** Even within one
+   UID the env never held the secret — it holds a *path*; the secret is in a
+   file owned by the child's UID.
+3. **Forked/wrapped MCPs sanitize their own outputs.** Defense in depth.
 
-@mcp.tool_call_handler
-async def route(request, identity):
-    tool = request.params.name
-    if tool not in policy.allowed_tools(identity):
-        return mcp_error("POLICY_REJECTED")
-    decision = policy.hitl_decision(identity, tool)
-    if decision == "reject":
-        return mcp_error("POLICY_REJECTED")
-    if decision == "push-approve":
-        ok = await hitl.approve(identity=identity, tool=tool, args=request.params.args)
-        if not ok:
-            return mcp_error("POLICY_HITL_REJECTED")
-    fanout = fanouts[mcp_prefix(tool)]
-    return await fanout.call(identity, request)
-```
+The hub starts with just `CAP_SETUID` / `CAP_SETGID` (to `gosu` into the child
+UIDs); after spawning, it runs as a single unprivileged UID. The http and
+container transports keep the secret out of the hub's own environment the same
+way (per-identity resolution, not ambient env).
 
-## Fanout module (in-process)
+### No-oracle tool curation
 
-The fanout is a Python class, not a separate process. It holds N stdio
-child processes (one per identity), each as a distinct UID, and routes
-incoming requests to the correct child.
+Curation is by *visibility*, not rejection. A disallowed tool is absent from
+`tools/list`, and an unknown identity gets an empty list. The hub never reveals
+"this tool exists but you can't use it," so `tools/list` can't be used to
+enumerate capabilities. (Operationally this can be confusing during setup — see
+`KNOWN_LIMITATIONS.md` #12.)
 
-```python
-# ~200 LoC. Packaged separately as `mcp-fanout` so it's reusable
-# without our hub. Hub imports it; standalone CLI also possible.
-
-class Fanout:
-    def __init__(self, mcp_name: str, command: list[str],
-                 identities: dict[str, IdentityConfig]):
-        # IdentityConfig holds: bao path, allocated UID, env-var name MCP expects
-        self.mcp_name = mcp_name
-        self.command = command
-        self.identities = identities
-        self.children: dict[str, ChildProcess] = {}
-
-    async def start_eager_or_die(self):
-        # Per design choice 2: any identity failure → exit nonzero,
-        # whole stack restarts. Live token rotation handled later.
-        for identity, cfg in self.identities.items():
-            try:
-                await self._spawn(identity, cfg)
-            except Exception:
-                logger.exception(f"failed to start {self.mcp_name}/{identity}")
-                sys.exit(1)
-
-    async def _spawn(self, identity: str, cfg: IdentityConfig):
-        # 1. bao OIDC swap → ephemeral bao token bound to this fanout's role,
-        #    scoped to read THIS identity's secret path
-        bao_token = await bao_oidc_swap(
-            role=f"mcp-{self.mcp_name}-{identity}",
-            jwt=read("/run/secrets/fanout_jwt"),
-        )
-        # 2. read secret
-        secret = await bao_kv_get(bao_token, cfg.secret_path, cfg.secret_field)
-        # 3. write to per-UID tmpfs file mode 0400 owned by cfg.uid
-        path = f"/run/{identity}-{self.mcp_name}-token"
-        write_token_file(path, secret, owner_uid=cfg.uid, mode=0o400)
-        # 4. spawn child via su-exec to cfg.uid; pass token-file path via env
-        proc = await asyncio.create_subprocess_exec(
-            "su-exec", f"{cfg.uid}:{cfg.uid}", *self.command,
-            env={cfg.token_env_name: path},   # e.g., TECHNITIUM_TOKEN_FILE
-            stdin=PIPE, stdout=PIPE, stderr=PIPE,
-        )
-        self.children[identity] = ChildProcess(proc, lock=asyncio.Lock())
-
-    async def call(self, identity: str, request: dict) -> dict:
-        child = self.children.get(identity)
-        if child is None:
-            raise IdentityNotFound(identity)
-        async with child.lock:                  # one in-flight call per child
-            child.proc.stdin.write(json.dumps(request).encode() + b"\n")
-            await child.proc.stdin.drain()
-            line = await child.proc.stdout.readline()
-            return json.loads(line)
-```
-
-### Per-UID isolation: why and how
-
-`/proc/<pid>/environ` shows the env that was passed to `exec()`. Even if
-the MCP `unsetenv()`s after reading, the original environ persists in
-/proc and is readable by any process running as the same UID.
-
-In a single-container fanout where all children share UID 1000, a
-compromised `paperless-bot` child can `cat /proc/<sibling-pid>/environ`
-and read `ironclaw`'s Technitium token. The compromise vector is real
-in this threat model: a poisoned tool result string with executable
-content getting reflected through the MCP's parser.
-
-Mitigations stacked:
-
-1. **Each child runs as a distinct UID** allocated at hub startup
-   (`1001`, `1002`, …). Linux blocks cross-UID `/proc/*/environ` reads.
-2. **Secrets are passed via token-files**, not env vars. Even within the
-   same UID, the env never had the secret (the env has a *path*; the
-   secret is in a file mode 0400 owned by the child's UID).
-3. **Forked MCPs sanitize their own outputs.** Defense in depth.
-
-The hub container starts with `cap_add: [CAP_SETUID, CAP_SETGID]` and
-no other capabilities. After spawning all children, the hub itself
-continues running as a single unprivileged UID (it doesn't need
-privileged operations after eager spawn).
-
-## Image structure (multi-stage)
-
-```dockerfile
-# === Build stages: one per MCP, parallelizable ===
-FROM node:22-alpine AS technitium-build
-WORKDIR /src
-RUN git clone --depth 1 --branch main \
-    https://github.com/nick-pape/technitium-mcp-secure /src && \
-    npm ci && npm run build
-
-FROM python:3.13-slim AS paperless-build
-WORKDIR /src
-RUN pip install uv && \
-    uv pip install --system paperless-mcp@git+https://github.com/.../paperless-mcp@vX.Y.Z
-
-FROM golang:1.23-alpine AS portainer-build   # hypothetical Go MCP later
-# ...
-
-# === Runtime ===
-FROM python:3.13-slim AS runtime
-RUN apt-get update && apt-get install -y \
-    nodejs su-exec ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
-
-# Hub + fanout module
-COPY hub/ /app/hub/
-RUN pip install /app/hub  # installs `mcp-fanout` and the hub package
-
-# MCP source from build stages
-COPY --from=technitium-build /src/dist /app/mcps/technitium/dist
-COPY --from=technitium-build /src/node_modules /app/mcps/technitium/node_modules
-COPY --from=paperless-build /usr/local/lib/python3.13/site-packages /app/mcps/paperless/
-
-# Pre-allocate UIDs that the fanout will spawn into
-RUN for i in $(seq 1001 1099); do \
-      adduser --disabled-password --uid $i --gecos "" --no-create-home mcp-$i || true; \
-    done
-
-# Hub runs as unprivileged UID 1000 with CAP_SETUID added at compose level
-RUN adduser --disabled-password --uid 1000 --gecos "" hub
-USER hub
-
-ENTRYPOINT ["python", "-m", "hub"]
-```
-
-Adding a new MCP:
-
-1. Add a new build stage to the Dockerfile (one git URL + build command)
-2. Add a `COPY --from=...` line for the runtime stage
-3. Add the MCP to `policy.yaml` (which identities, allowed tools, HITL)
-4. Rebuild + redeploy
-
-## Authentik configuration
-
-One **OAuth2/OpenID Provider** per agent identity. Each issues JWTs
-with a distinct audience claim:
-
-| Authentik provider name | Audience | Used by |
-|---|---|---|
-| `mcp-ironclaw` | `mcp-ironclaw` | IronClaw autonomous agent |
-| `mcp-paperless-bot` | `mcp-paperless-bot` | paperless processing bot |
-| `mcp-claude-code-dev` | `mcp-claude-code-dev` | local Claude Code dev sessions |
-| `mcp-fanout-svc` | `mcp-fanout-svc` | fanout itself, for bao swap |
-
-The hub validates `aud == "mcp-<identity>"` and uses the suffix as the
-identity name. No identity DB beyond the policy YAML.
-
-Agents authenticate via:
-- **Autonomous agents**: client_credentials grant, client_id+secret
-  stored in their environment (their concern, not ours)
-- **Claude Code dev**: device flow on first run, refresh token cached
-- **n8n / scripts**: client_credentials with HTTP node
-
-## bao configuration
-
-### Per-identity-per-MCP roles
-
-For each (MCP × identity) tuple, a JWT auth role bound to a narrow
-policy that reads exactly one secret path:
-
-```hcl
-# bao policy: mcp-technitium-ironclaw
-path "secret/data/services/technitium/ironclaw" {
-  capabilities = ["read"]
-}
-```
-
-```hcl
-# bao role bound to fanout's JWT identity, allowed for one path per identity
-{
-  "role_type": "jwt",
-  "user_claim": "sub",
-  "bound_audiences": ["mcp-fanout-svc"],
-  "bound_subject":   "mcp-fanout-svc",
-  "policies":        ["mcp-technitium-ironclaw"],
-  "ttl":             "1h",
-  "max_ttl":         "1h"
-}
-```
-
-The fanout container holds **one** long-lived JWT (the
-`mcp-fanout-svc` identity). For each (MCP × identity) at boot, it
-swaps that JWT at bao for an ephemeral bao token bound to that one
-narrow path, reads the secret, drops the token. Container memory only.
-
-The fanout's own JWT is mounted as a docker secret, mode 0400, owned
-by UID 1000. The unprivileged hub user (1000) reads it once at startup;
-children (1001+) never see it.
-
-### Secret layout
-
-```
-secret/services/
-  technitium/
-    ironclaw         { api_token: "..." }
-    paperless-bot    { api_token: "..." }
-    claude-code-dev  { api_token: "..." }
-  paperless/
-    ironclaw         { api_token: "..." }
-    paperless-bot    { api_token: "..." }
-  authentik/
-    claude-code-dev  { api_token: "..." }
-```
-
-Per-identity tokens give true upstream attribution: Technitium audit
-log shows `ironclaw-svc` (the Technitium-side service account) made
-the change, not "the gateway."
-
-For services where one shared token is acceptable (or required, e.g.,
-Paperless without per-user accounts), all identities point at the same
-secret path: `secret/services/paperless/shared`.
-
-## Tool curation + HITL: `policy.yaml`
-
-```yaml
-version: 1
-identities:
-  ironclaw:
-    aud: "mcp-ironclaw"
-    uid_base: 1001            # ironclaw's children get UIDs 1001, 1011, 1021...
-    allowed_tools:
-      - "technitium_dns_*"
-      - "technitium_dhcp_list_*"
-      - "paperless_get_*"
-      - "paperless_search_*"
-    hitl:
-      defaults: auto-approve
-      overrides:
-        "technitium_dns_delete_record":   push-approve
-        "technitium_dns_add_record":      push-approve
-    secrets:
-      technitium: { path: "secret/data/services/technitium/ironclaw", field: "api_token", env: "TECHNITIUM_TOKEN_FILE" }
-      paperless:  { path: "secret/data/services/paperless/shared",    field: "api_token", env: "PAPERLESS_TOKEN_FILE" }
-
-  paperless-bot:
-    aud: "mcp-paperless-bot"
-    uid_base: 1002
-    allowed_tools: ["paperless_*"]
-    hitl: { defaults: auto-approve }
-    secrets:
-      paperless: { path: "secret/data/services/paperless/shared", field: "api_token", env: "PAPERLESS_TOKEN_FILE" }
-
-  claude-code-dev:
-    aud: "mcp-claude-code-dev"
-    uid_base: 1003
-    allowed_tools: ["*"]
-    hitl:
-      defaults: auto-approve
-      overrides:
-        "technitium_dns_delete_record":   push-approve
-        "technitium_dhcp_remove_*":       push-approve
-        "authentik_*_create":             push-approve
-        "authentik_*_delete":             push-approve
-    secrets:
-      technitium: { path: "secret/data/services/technitium/claude-code-dev", field: "api_token", env: "TECHNITIUM_TOKEN_FILE" }
-      paperless:  { path: "secret/data/services/paperless/shared",          field: "api_token", env: "PAPERLESS_TOKEN_FILE" }
-      authentik:  { path: "secret/data/services/authentik/claude-code-dev", field: "api_token", env: "AUTHENTIK_TOKEN_FILE" }
-```
-
-Hub watches `policy.yaml` and reloads on change for tool/HITL changes;
-identity-set changes (add/remove identities, add/remove MCPs) require
-restart (per design choice 2: simple eager v1).
-
-## HITL via ntfy: fixed topic + bao-stored ack token
-
-```python
-async def push_approve(identity: str, tool: str, args: dict) -> bool:
-    nonce = secrets.token_urlsafe(32)
-    ack_token = secrets.token_urlsafe(48)
-
-    # Store expected ack_token in bao with TTL
-    await bao_kv_put(f"hitl/pending/{nonce}",
-                     {"ack_token": ack_token, "tool": tool, "identity": identity},
-                     ttl="300s")
-
-    # Publish to FIXED ntfy topic. ntfy publish auth gates who can post here.
-    await ntfy_publish(
-        topic="mcp-hitl-approvals",
-        title=f"[{identity}] {tool}?",
-        message=render_args(args),
-        actions=[
-            {"action":"http","label":"Approve",
-             "url":f"https://<gateway-host>/hitl/ack?nonce={nonce}",
-             "method":"POST",
-             "body":json.dumps({"ack_token":ack_token,"decision":"approve"})},
-            {"action":"http","label":"Reject",
-             "url":f"https://<gateway-host>/hitl/ack?nonce={nonce}",
-             "method":"POST",
-             "body":json.dumps({"ack_token":ack_token,"decision":"reject"})},
-        ],
-    )
-
-    try:
-        decision = await asyncio.wait_for(_pending[nonce].wait(), timeout=120)
-        return decision == "approve"
-    except asyncio.TimeoutError:
-        return False
-    finally:
-        await bao_kv_delete(f"hitl/pending/{nonce}")
-```
-
-Properties:
-
-- **Fixed topic** (`mcp-hitl-approvals`) — phone subscribes once, no
-  wildcards needed (ntfy doesn't support them; multi-topic comma-list
-  works but isn't necessary here)
-- **ntfy publish auth** — only the hub can push to this topic; topic
-  publish key stored in bao
-- **Ack token validated against bao** — knowing the topic doesn't let
-  an attacker self-approve; only the hub generates valid ack_tokens
-- **Async webhook-driven** — no polling, no event-loop blocking
-- **Fixed timeout** — explicit reject after 120s; pending state
-  self-destructs via bao TTL even if hub crashes
-
-## Security findings, addressed explicitly
+### Security findings, addressed explicitly
 
 | Finding | Mitigation |
 |---|---|
-| JWT `kid`-as-URL hijack | JWKS URI pinned at startup; `kid` resolved against cached JWKS only; explicit `algorithms=["RS256"]` |
-| Cross-identity `/proc/environ` exfil | Each child runs as distinct UID; secrets via per-UID token-files (mode 0400), never env |
-| Token in env via `/proc` | Same fix — env contains the *path*, not the secret |
-| ntfy self-approval if topic guessable | Fixed topic + ntfy publish auth; the secret is the bao-stored ack_token, not the topic |
-| JWKS cache cold-fail | Serve-stale-on-failure for warm cache; cold-start failure propagates (no fail-open) |
-| Sync-blocking HITL polling | Fully async; webhook-driven, not polling; per-request timeout |
-| Pending HITL evaporates on reboot | bao TTL on pending entries (5 min); restart returns clean `HITL_TIMEOUT` to in-flight callers |
-| Hub OOM kills everything | Container memory limits + healthcheck + Portainer auto-restart; failure mode is "all-down" not "silent half-up" |
+| JWT `kid`-as-URL hijack | JWKS resolved against the cached document only (discovered or pinned); explicit `algorithms` allowlist |
+| Cross-identity `/proc/environ` exfil | Each stdio child a distinct UID; secrets via `0400` token-files, never env |
+| Token in env via `/proc` | Same fix — env holds the *path*, not the secret |
+| Approver self-approval if topic guessable | Fixed topic + publish auth; the secret is the backend-stored ack token, not the topic |
+| JWKS cache cold-fail | Serve-stale-on-failure for a warm cache; cold-start failure propagates (no fail-open) |
+| Sync-blocking HITL polling | Fully async, webhook-driven; per-request timeout |
+| Pending HITL evaporates on reboot | TTL'd pending entries in the transient store; restart returns a clean `HITL_TIMEOUT` |
+| Hub OOM kills everything | Container memory limits + healthcheck + restart policy; failure mode is "all-down," not "silent half-up" |
+
+## Identity & secrets
+
+Each identity declares its per-MCP secrets, addressed per-(MCP × identity) so the
+upstream service sees true attribution (its audit log shows `ironclaw`, not "the
+gateway"). Where one shared token is acceptable, identities point at the same
+path.
+
+Two identity kinds change *who proves identity to the secret backend*:
+
+- **`delegated`** (default) — a human or client driving tools. The hub is a
+  **deputy**: it authenticates to the secret backend with its own service
+  identity and reads the per-identity secret on the caller's behalf.
+- **`autonomous`** (`kind: autonomous`) — a headless agent acting on its own.
+  On MCPs that opt in (`auth.config.as_agent: true`), the agent authenticates to
+  the secret backend **as itself** (for the bao backend, a role bound to
+  `aud=mcp-<identity>`), so the backend audits the agent rather than the hub's
+  deputy. The injected downstream credential is the same per-identity token
+  either way; `as_agent` only closes the confused-deputy gap on *who* proved
+  identity to the store. This is what makes e.g. an Outline note written by an
+  agent attributed to the agent, not the hub.
+
+The secret backend itself is pluggable (`env` / `file` / `bao`); the
+[worked example](#appendix-worked-example-authentik-openbao-ntfy) shows the bao
+role/path layout.
+
+## Configuration
+
+`policy.yaml` is the single config (path `MCP_HUB_CONFIG`, default
+`/etc/mcp-gateway/policy.yaml`). Don't hand-copy from here — start from the
+maintained examples:
+
+- [`policy.example.minimal.yaml`](./policy.example.minimal.yaml) — smallest
+  working config, no external infra.
+- [`policy.example.yaml`](./policy.example.yaml) — full annotated reference
+  (OIDC auth, bao secrets, ntfy HITL, token refresh, all three transports,
+  delegated + autonomous identities).
+
+The shape, in miniature:
+
+```yaml
+version: 1                       # additive-only; see KNOWN_LIMITATIONS #16 / HubConfig.version
+
+auth:
+  mode: oidc                     # or static_token / trusted_proxy
+  issuer: https://auth.example.com/
+  audience_prefix: "mcp-"        # aud suffix = identity (or set identity_claim)
+
+secret_backend: { name: bao, config: { addr: https://secrets.example.com, ... } }
+approver:       { name: ntfy, config: { server: https://notify.example.com, topic: mcp-hitl-approvals } }
+
+mcps:
+  technitium:                    # stdio transport (default)
+    command: ["node", "/app/mcps/technitium/dist/index.js"]
+    secret_env_name: TECHNITIUM_TOKEN_FILE
+    uid_offset: 10
+
+identities:
+  ironclaw:
+    aud: mcp-ironclaw
+    uid_base: 1001
+    allowed_tools: ["technitium_dns_*", "technitium_dhcp_list_*"]
+    hitl:
+      defaults: auto-approve
+      overrides: { technitium_dns_delete_record: push-approve }
+    secrets:
+      technitium: { path: services/technitium/ironclaw, field: api_token }
+```
+
+Placeholders `{identity}` and `{mcp}` expand wherever a path or template appears
+(identity secret paths, `path_template`, `secrets_to_env.*.path`,
+`audience_template`, the bao `role_template`), unified in
+`src/mcp_hub/templating.py`.
+
+## Human-in-the-loop (HITL)
+
+`push-approve` tools block on an operator acknowledgement through the configured
+[approver](#pluggable-axes) (`auto` / `reject` / `ntfy`, or a third-party Slack/
+Telegram/webhook adapter). The mechanism, with `ntfy` as the worked example:
+
+1. The hub mints a nonce + ack token and stores the pending decision in a
+   **transient store** with a TTL (so a hub crash can't leave a call wedged —
+   it self-expires to `HITL_TIMEOUT`).
+2. It publishes a prompt to a **fixed topic** with Approve/Reject actions whose
+   callbacks carry the ack token. Publish auth gates who can post; only the hub
+   can mint a valid ack token, so knowing the topic doesn't let an attacker
+   self-approve.
+3. The operator taps; the approver's webhook route (`WebhookApprover`) resolves
+   the pending decision. No polling, no event-loop blocking.
+4. On no response within the timeout, the call returns `POLICY_HITL_TIMEOUT`.
+
+Args are hashed in the prompt/audit by default; a per-tool flag unlocks full
+args for debugging.
+
+## Image & deployment
+
+The image is **generic and MCP-agnostic** (`ghcr.io/nick-pape/mcp-gateway`,
+published by `.github/workflows/image.yml`). It bakes **no MCP servers** — just
+the hub venv, `tini` (reaps stdio children), `gosu` (drops to per-identity UIDs),
+`curl` (healthcheck), and the pre-created UID range. There is no build-time
+`git clone` of upstream MCPs.
+
+```dockerfile
+# Two stages: uv-built hub venv → slim runtime. (See ./Dockerfile.)
+FROM python:3.13-slim AS hub-build
+RUN pip install --no-cache-dir uv
+COPY pyproject.toml uv.lock README.md ./
+COPY src/ ./src/
+RUN uv sync --frozen --no-dev --no-editable
+
+FROM python:3.13-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gosu tini && rm -rf /var/lib/apt/lists/*
+
+# Pre-create the per-identity UID range. Configurable so deployments aren't
+# locked to 1001-1099 — bump UID_BASE for rootless subuid maps.
+ARG UID_BASE=1001
+ARG UID_COUNT=99
+RUN for i in $(seq "$UID_BASE" "$((UID_BASE + UID_COUNT - 1))"); do \
+        useradd -u "$i" -M -s /usr/sbin/nologin "mcp$i"; done
+
+COPY --from=hub-build /app/.venv /app/.venv
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["python", "-m", "mcp_hub"]
+```
+
+**Bringing your own MCPs:**
+
+- **stdio** — layer them onto the base image with a thin
+  `FROM ghcr.io/nick-pape/mcp-gateway` overlay (add the runtime + the MCP build,
+  reference it in `command:`). The private `ai-pape-house` repo is this homelab's
+  overlay (Technitium, Vikunja, …). Nothing about the MCP lives in the base image.
+- **http** — run the MCP as a sibling container or remote service and federate it
+  with `transport: http`. No overlay, no Docker socket.
+- **container** — set `transport: container` + an `image:`; the hub spawns
+  wrappers via the Docker API. Needs the socket + `container_host` (above).
+
+To deploy, the broad shape:
+
+1. **Inbound auth** — pick a `mode`. For `oidc`, one provider/audience per
+   identity, plus a service identity for the secret backend's login.
+2. **Secret backend** (`env` / `file` / `bao`) — each identity's per-MCP secrets,
+   e.g. at `services/<mcp>/<identity>`.
+3. **`policy.yaml`** — identities, allowed-tool globs, HITL policy, MCPs.
+4. **Reverse proxy** — terminate TLS, forward to the container's `:8443`.
+5. **MCPs** — overlay (stdio), federate (http), or socket (container) per above.
+
+See [`README.md`](./README.md) and [`docker-compose.yml`](./docker-compose.yml)
+for a runnable starting point.
 
 ## Audit + observability
 
-JSONL on stderr → Loki via Promtail.
+JSONL on stderr → log pipeline (e.g. Promtail → Loki).
 
 ```json
 {
@@ -515,69 +402,108 @@ JSONL on stderr → Loki via Promtail.
   "tool": "technitium_dhcp_set_reservation",
   "args_hash": "sha256:...",
   "decision": "auto-approve",
-  "fanout": "technitium",
-  "child_uid": 1001,
+  "mcp": "technitium",
+  "transport": "stdio",
   "status": "ok",
   "duration_ms": 142,
   "hitl_duration_ms": 0
 }
 ```
 
-Args hashed by default; per-tool flag in policy unlocks full args
-(debugging only).
+Args hashed by default; a per-tool policy flag unlocks full args (debugging only).
 
-Error code taxonomy:
+Error-code taxonomy:
 
-- `POLICY_REJECTED` — tool not in identity's `allowed_tools`
-- `POLICY_HITL_REJECTED` — operator rejected via ntfy
+- `POLICY_REJECTED` — tool not in the identity's `allowed_tools` (or unknown identity)
+- `POLICY_HITL_REJECTED` — operator rejected the approval
 - `POLICY_HITL_TIMEOUT` — operator didn't respond in time
-- `AUTH_FAILED` — JWT invalid / expired / wrong audience
-- `IDENTITY_UNKNOWN` — JWT valid but `aud` not in policy.yaml
-- `BACKEND_CHILD_DEAD` — fanout's stdio child crashed
+- `AUTH_FAILED` — credential invalid / expired / wrong audience
+- `IDENTITY_UNKNOWN` — credential valid but identity not in `policy.yaml`
+- `BACKEND_CHILD_DEAD` — a stdio child crashed (see `KNOWN_LIMITATIONS.md` #4)
 - `INTERNAL_ERROR` — gateway bug; alert
 
-## Deploying
+## Appendix: worked example (Authentik, OpenBao, ntfy)
 
-The hub ships as a generic image (`ghcr.io/nick-pape/mcp-gateway`); a
-deployment is that image plus a `policy.yaml` and whatever backends it
-references. The broad shape:
+This is the author's homelab deployment — one concrete instantiation of the
+pluggable axes. Each piece is swappable.
 
-1. **IdP**: one OIDC provider/audience per identity, plus one service
-   identity for the fanout's secret-backend login (`mcp-fanout-svc`).
-2. **Secret backend** (`env` / `file` / `bao`): each identity's per-MCP
-   secrets, e.g. at `services/<mcp>/<identity>`.
-3. **`policy.yaml`**: identities, allowed-tool globs, HITL policy, MCPs.
-4. **Reverse proxy**: terminate TLS and forward to the container's `:8443`
-   (the JWT is the auth; no mTLS required).
-5. **MCPs**: bake stdio MCPs into a thin `FROM ghcr.io/nick-pape/mcp-gateway`
-   overlay, or federate HTTP MCPs over the network.
+### Inbound auth: Authentik OIDC (`auth.mode: oidc`)
 
-See [`README.md`](./README.md) and [`docker-compose.yml`](./docker-compose.yml)
-for a runnable starting point, and [`policy.example.yaml`](./policy.example.yaml)
-for a full annotated config.
+One **OAuth2/OpenID Provider** per agent identity, each issuing JWTs with a
+distinct audience:
 
-## Open design questions
+| Provider | Audience | Used by |
+|---|---|---|
+| `mcp-ironclaw` | `mcp-ironclaw` | IronClaw autonomous agent |
+| `mcp-interactive` | `mcp-interactive` | human-driven Claude Code / Cursor |
+| `mcp-fanout-svc` | `mcp-fanout-svc` | the hub itself, for bao login |
 
-1. **Live token rotation.** Per design choice 2: out of scope for v1
-   — restart the stack to rotate. v2 candidate: fanout exposes an HTTP
-   admin endpoint (auth via local socket / shared secret) to trigger
-   per-(MCP, identity) child restart with fresh bao swap.
-2. **Per-tool args allowlist.** E.g., `paperless_send_email` only to
-   internal addresses. Out of scope for v1. Add as a hub middleware
-   layer later.
-3. **Audit args-when-non-sensitive.** v1: always hash. v2: per-tool
-   override flag in policy.
-4. **Single-instance HA.** Out of scope. If hub dies, restart via
-   Portainer; agents see brief auth errors.
-5. **Adding a new identity hot.** v1 requires restart. v2 candidate:
-   fanout admin endpoint + signal-based child spawn.
+The hub validates `iss` (Authentik's `issuer_mode=global` puts the same issuer on
+every JWT), resolves identity from the `aud` suffix after `audience_prefix:
+"mcp-"`, and discovers JWKS from the issuer (or `jwks_uri` pinned per-app — every
+app under one signing key returns the same JWKS).
 
-## Out of scope (deliberately)
+Agents authenticate via `client_credentials` (autonomous), device flow
+(interactive Claude Code), or an HTTP node (n8n/scripts). The static
+`/oauth/register` shim hands every interactive caller the same `mcp-interactive`
+client — sufficient for the homelab, not real DCR (`KNOWN_LIMITATIONS.md` #6).
 
-- Admin UI
-- DB-backed state
-- LiteLLM integration (agents reach LiteLLM independently if they want)
-- A2A registry (separate concern)
-- Tool argument schema rewriting / transformation
-- HA / multi-instance
-- Live identity / MCP add-and-remove without restart
+### Secrets: OpenBao (`secret_backend: {name: bao}`)
+
+For each (MCP × identity), a JWT auth role bound to a policy that reads exactly
+one secret path:
+
+```hcl
+# bao policy: mcp-technitium-ironclaw
+path "secret/data/services/technitium/ironclaw" { capabilities = ["read"] }
+```
+
+```hcl
+# bao role (role_template "mcp-{mcp}-{identity}")
+{ "role_type": "jwt", "user_claim": "sub",
+  "bound_audiences": ["mcp-fanout-svc"], "policies": ["mcp-technitium-ironclaw"],
+  "ttl": "1h", "max_ttl": "1h" }
+```
+
+The hub holds **one** long-lived JWT (`mcp-fanout-svc`); per (MCP × identity) it
+swaps that JWT at bao for an ephemeral token scoped to one narrow path, reads the
+secret, drops the token (deputy mode). For `autonomous` identities on an
+`as_agent: true` MCP, the agent's *own* JWT (role bound to `aud=mcp-<identity>`)
+does the swap instead, so bao audits the agent.
+
+Secret layout:
+
+```
+secret/services/
+  technitium/{ironclaw,interactive}   { api_token: "..." }
+  outline/{interactive,assistant-agent}  { api_token: "..." }
+```
+
+**Refreshing the hub's JWT.** Authentik bug #16621 silently caps
+`access_token_validity`, so the hub rotates its own `fanout_jwt` via the token
+refresher: a `oidc_client_credentials` source (RFC 6749; works against any OIDC
+IdP — the old `authentik_client_credentials` name is a back-compat alias) → a
+`file` sink every ~10 min, which `bao` reads freshly on each login.
+
+### HITL: ntfy (`approver: {name: ntfy}`)
+
+The hub publishes prompts to a fixed topic (`mcp-hitl-approvals`) with Approve/
+Reject actions; the operator's phone is subscribed once. Publish auth (token in
+the secret backend) gates posting; the ack token (in the transient store with a
+TTL) is the actual secret, so the topic being known doesn't allow self-approval.
+
+## Open questions / out of scope
+
+Tracked in detail in [`KNOWN_LIMITATIONS.md`](./KNOWN_LIMITATIONS.md). The
+headline gaps and deliberate non-goals:
+
+- **Live policy reload** (#10) — `policy.yaml` changes that add/remove identities
+  or MCPs require a restart (HITL-override changes are picked up). A SIGHUP diff
+  is the v2 candidate.
+- **stdio child failure recovery** (#4) — eager-or-die at boot; no post-boot
+  respawn supervision yet.
+- **Scale** — per-(MCP × identity) workers are N×M (#7); no `tools/list`
+  pagination (#8); per-call JWT verification cost (#9).
+- **Deliberately out of scope** — admin UI, DB-backed state, LiteLLM
+  integration, multi-instance HA, an internal user model (identities come from
+  the external auth source), tool-argument schema rewriting.
