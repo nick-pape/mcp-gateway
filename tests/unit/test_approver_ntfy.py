@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from mcp_hub.approvers.ntfy import NtfyApprover
+from mcp_hub.approvers.store import InMemoryTransientStore
 from mcp_hub.bao_client import BaoClient
 from mcp_hub.interfaces import ApprovalRequest, ApprovalResult, Approver
 from tests.fakes.fake_bao import FakeBao
@@ -117,6 +118,27 @@ def _last_publish_secrets(fake_ntfy: FakeNtfy) -> tuple[str, str, str, str]:
 def test_satisfies_approver_protocol(approver: NtfyApprover) -> None:
     assert isinstance(approver, Approver)
     assert approver.name == "ntfy"
+
+
+async def test_works_with_in_memory_store_no_bao(
+    fake_ntfy: FakeNtfy, publish_token_file: Path
+) -> None:
+    """End-to-end approve cycle with InMemoryTransientStore — no bao at all."""
+    approver = NtfyApprover(
+        store=InMemoryTransientStore(),
+        ntfy_server=NTFY_SERVER,
+        topic_template="mcp-hitl-approvals",
+        publish_token_path=publish_token_file,
+        webhook_base_url=WEBHOOK_BASE,
+        http_client=httpx.AsyncClient(transport=fake_ntfy.transport),
+    )
+    task = asyncio.create_task(approver.request_approval(_request(), timeout_s=5.0))
+    await asyncio.sleep(0.05)  # let it stage + publish
+    nonce, _ack, approve_body, _reject = _last_publish_secrets(fake_ntfy)
+    status = await approver.handle_webhook(nonce=nonce, body=json.loads(approve_body))
+    assert status == 200
+    assert await task == ApprovalResult.APPROVED
+    await approver.close()
 
 
 def test_rejects_non_http_ntfy_server(jwt_file: Path, publish_token_file: Path) -> None:

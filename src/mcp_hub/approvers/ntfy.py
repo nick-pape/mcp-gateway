@@ -50,7 +50,12 @@ from typing import Any
 
 import httpx
 
-from mcp_hub.bao_client import BaoClient, BaoError, compare_digest
+from mcp_hub.approvers.store import (
+    BaoTransientStore,
+    TransientStore,
+    TransientStoreError,
+)
+from mcp_hub.bao_client import BaoClient, compare_digest
 from mcp_hub.interfaces import (
     ApprovalRequest,
     ApprovalResult,
@@ -84,8 +89,9 @@ class NtfyApprover:
     def __init__(
         self,
         *,
-        bao_client: BaoClient,
-        bao_role: str,
+        store: TransientStore | None = None,
+        bao_client: BaoClient | None = None,
+        bao_role: str = "",
         ntfy_server: str,
         # Topic to publish to. May contain ``{identity}`` as a
         # placeholder — substituted per-call from
@@ -122,8 +128,19 @@ class NtfyApprover:
             ) from exc
         if not topic_template:
             raise ValueError("topic_template must be non-empty")
-        self._bao = bao_client
-        self._bao_role = bao_role
+        # Storage for pending HITL state is pluggable: an in-memory store
+        # (no external dep) or a bao-backed one for crash-safety. Accept a
+        # ready store, or build a bao one from the legacy bao_* args.
+        if store is not None:
+            self._store: TransientStore = store
+        elif bao_client is not None:
+            self._store = BaoTransientStore(
+                bao_client=bao_client,
+                bao_role=bao_role,
+                path_template=bao_path_template,
+            )
+        else:
+            raise ValueError("NtfyApprover requires either store= or bao_client=")
         self._ntfy_server = ntfy_server.rstrip("/")
         self._topic_template = topic_template
         self._publish_token_path = Path(publish_token_path)
@@ -131,7 +148,6 @@ class NtfyApprover:
         self._webhook_url = f"{webhook_base_url.rstrip('/')}{webhook_path}"
         self._timeout_default_s = timeout_default_s
         self._ack_ttl_s = ack_ttl_s
-        self._bao_path_template = bao_path_template
         self._rate_limit_per_identity = rate_limit_per_identity
         self._http = http_client or httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT_S)
         self._owns_client = http_client is None
@@ -145,6 +161,7 @@ class NtfyApprover:
         self._pending_lock = asyncio.Lock()
 
     async def close(self) -> None:
+        await self._store.close()
         if self._owns_client:
             await self._http.aclose()
 
@@ -249,28 +266,25 @@ class NtfyApprover:
         nonce = secrets.token_urlsafe(32)
         ack_token = secrets.token_urlsafe(48)
 
-        bao_path = self._bao_path_template.format(nonce=nonce)
-
-        # 3. Stage the pending entry in memory and in bao.
+        # 3. Stage the pending entry: in memory (for the waiting coroutine)
+        # and in the transient store (for the webhook handler + crash-safety).
         pending = _Pending()
         self._pending[nonce] = pending
 
         try:
             try:
-                bao_token = await self._bao.jwt_login(role=self._bao_role)
-                await self._bao.kv_write(
-                    token=bao_token,
-                    path=bao_path,
-                    data={
+                await self._store.put(
+                    nonce,
+                    {
                         "ack_token": ack_token,
                         "identity": request.identity,
                         "tool": request.tool,
                     },
                     ttl_s=self._ack_ttl_s,
                 )
-            except BaoError:
+            except TransientStoreError:
                 logger.exception(
-                    "ntfy approver: failed to stage ack token in bao for "
+                    "ntfy approver: failed to stage ack token for "
                     "identity=%s tool=%s; failing closed",
                     request.identity,
                     request.tool,
@@ -285,7 +299,7 @@ class NtfyApprover:
                 logger.exception(
                     "ntfy approver: ntfy publish failed; cleaning up bao entry"
                 )
-                await self._cleanup_bao(bao_path)
+                await self._store.delete(nonce)
                 return ApprovalResult.REJECTED
 
             # 5. Await webhook signal.
@@ -307,7 +321,7 @@ class NtfyApprover:
             # Always best-effort cleanup of bao entry. bao TTL would do it
             # eventually, but explicit delete on completion keeps the path
             # clean for observability.
-            await self._cleanup_bao(bao_path)
+            await self._store.delete(nonce)
 
     async def _publish(
         self,
@@ -319,7 +333,7 @@ class NtfyApprover:
         try:
             publish_token = self._publish_token_path.read_text(encoding="utf-8").strip()
         except OSError as exc:
-            raise BaoError(
+            raise ValueError(
                 f"cannot read ntfy publish token at {self._publish_token_path}: {exc}"
             ) from exc
 
@@ -373,15 +387,6 @@ class NtfyApprover:
         )
         response.raise_for_status()
 
-    async def _cleanup_bao(self, bao_path: str) -> None:
-        """Best-effort delete of the bao pending entry."""
-        try:
-            bao_token = await self._bao.jwt_login(role=self._bao_role)
-            await self._bao.kv_delete(token=bao_token, path=bao_path)
-        except BaoError:
-            # If cleanup fails, bao TTL still evicts. Log and move on.
-            logger.warning("ntfy approver: bao cleanup failed for %s", bao_path)
-
     # -----------------------------------------------------------------------
     # Webhook handler (called by the hub server for POST /hitl/ack)
     # -----------------------------------------------------------------------
@@ -423,22 +428,15 @@ class NtfyApprover:
             )
             return 200
 
-        bao_path = self._bao_path_template.format(nonce=nonce)
-
-        # Read the staged ack_token from bao. If it doesn't exist (TTL
-        # expired, already consumed, never existed), silently ignore.
-        try:
-            bao_token = await self._bao.jwt_login(role=self._bao_role)
-            stored = await self._bao.kv_read(token=bao_token, path=bao_path)
-        except BaoError as exc:
-            # Most common cause: stale ack — TTL expired or already
-            # consumed (e.g., user double-tapped the notification).
-            # Per the no-oracle property, we still return 200 regardless.
+        # Read the staged ack_token. If it's gone (TTL expired, already
+        # consumed via double-tap, or never existed), silently ignore — the
+        # no-oracle property means we still return 200 regardless.
+        stored = await self._store.get(nonce)
+        if stored is None:
             logger.info(
                 "ntfy webhook: stale ack ignored for nonce=%s "
-                "(already consumed or expired): %s",
+                "(already consumed or expired)",
                 _redact(nonce),
-                exc,
             )
             return 200
 
@@ -450,17 +448,9 @@ class NtfyApprover:
             )
             return 200
 
-        # Atomic consumption: delete the bao entry BEFORE signaling.
-        # If we crashed between signal and delete, a replay could
-        # re-trigger; deleting first prevents that.
-        try:
-            await self._bao.kv_delete(token=bao_token, path=bao_path)
-        except BaoError:
-            logger.warning(
-                "ntfy webhook: bao delete failed for nonce=%s; "
-                "proceeding anyway (TTL will clean up)",
-                _redact(nonce),
-            )
+        # Atomic consumption: delete the entry BEFORE signaling. If we crashed
+        # between signal and delete, a replay could re-trigger; delete first.
+        await self._store.delete(nonce)
 
         pending = self._pending.get(nonce)
         if pending is None:
