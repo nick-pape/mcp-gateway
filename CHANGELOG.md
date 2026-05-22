@@ -18,6 +18,8 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - Bao backend `auth.method: token` (static Vault token) alongside `jwt`.
 - GitHub Actions CI (ruff + mypy --strict + pytest) and a generic image build
   published to `ghcr.io/nick-pape/mcp-gateway`.
+- gitleaks secret-scanning CI gate + pre-commit hook, with a custom rule for
+  opaque URL-path tokens (`.gitleaks.toml`).
 - `policy.example.minimal.yaml` + an example `docker-compose.yml`.
 - LICENSE, SECURITY.md, CONTRIBUTING.md, CODE_OF_CONDUCT.md.
 
