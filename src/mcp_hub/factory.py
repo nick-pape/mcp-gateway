@@ -34,6 +34,11 @@ from .approvers.auto import AutoApprover
 from .approvers.ntfy import NtfyApprover
 from .approvers.registry import resolve_approver
 from .approvers.reject import RejectApprover
+from .approvers.store import (
+    BaoTransientStore,
+    InMemoryTransientStore,
+    TransientStore,
+)
 from .auth_strategies import (
     DEFAULT_BAO_CACHE_TTL_S,
     DEFAULT_FANOUT_JWT_PATH,
@@ -146,20 +151,28 @@ def build_approver(
         return RejectApprover()
     if cls is NtfyApprover:
         cfg = approver.config
-        # Reuse bao address from secret_backend; per-approver bao_addr override
-        # is accepted but uncommon (one bao instance in the homelab).
-        bao_addr = cfg.get("bao_addr") or _required_str(
-            config.secret_backend.config,
-            "addr",
-            "secret_backend.config.addr (for approver to share)",
-        )
-        bao_jwt_path = _required_str(cfg, "bao_jwt_path", "approver.config.bao_jwt_path")
-        bao_role = _required_str(cfg, "bao_role", "approver.config.bao_role")
-        bao = BaoClient(
-            addr=bao_addr,
-            jwt_path=bao_jwt_path,
-            http_client=http_client,
-        )
+        # Pending-approval store: bao-backed when bao_* config is present
+        # (crash-safe across restarts), else in-memory (no external dependency,
+        # so HITL needs no Vault). Reuses the secret_backend bao address.
+        store: TransientStore
+        if cfg.get("bao_jwt_path") or cfg.get("bao_role"):
+            bao_addr = cfg.get("bao_addr") or _required_str(
+                config.secret_backend.config,
+                "addr",
+                "secret_backend.config.addr (for approver to share)",
+            )
+            bao_jwt_path = _required_str(
+                cfg, "bao_jwt_path", "approver.config.bao_jwt_path"
+            )
+            bao_role = _required_str(cfg, "bao_role", "approver.config.bao_role")
+            store = BaoTransientStore(
+                bao_client=BaoClient(
+                    addr=bao_addr, jwt_path=bao_jwt_path, http_client=http_client
+                ),
+                bao_role=bao_role,
+            )
+        else:
+            store = InMemoryTransientStore()
         # Accept either ``topic_template`` (recommended; supports
         # ``{identity}`` substitution per call) or ``topic`` (legacy
         # static name, no substitution). At least one must be set.
@@ -170,8 +183,7 @@ def build_approver(
                 "(e.g. 'mcp-hitl-{identity}') or topic (static)"
             )
         return NtfyApprover(
-            bao_client=bao,
-            bao_role=bao_role,
+            store=store,
             ntfy_server=_required_str(cfg, "server", "approver.config.server"),
             topic_template=topic_template,
             publish_token_path=_required_str(
