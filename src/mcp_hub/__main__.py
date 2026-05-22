@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -23,10 +24,10 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .approvers.ntfy import NtfyApprover
 from .audit import Audit
 from .auth import AuthentikJWTValidator
 from .factory import build_approver, build_refresher_manager, build_secret_backend
+from .interfaces import WebhookApprover, WebhookRoute
 from .policy import Policy
 from .server import Hub
 
@@ -104,21 +105,30 @@ async def _async_main() -> int:
     # Hub is up + bao login succeeded → safe to rotate underneath.
     refresher_manager.start_background()
 
-    # Wire /hitl/ack webhook route iff the approver supports it (NtfyApprover).
-    if isinstance(approver, NtfyApprover):
-        async def hitl_ack(request: Request) -> Response:
-            nonce = request.query_params.get("nonce", "")
-            try:
-                body: dict[str, Any] = await request.json()
-            except (ValueError, RuntimeError):
-                body = {}
-            status = await approver.handle_webhook(nonce=nonce, body=body)
-            return JSONResponse({"ok": True}, status_code=status)
+    # Mount any callback routes the approver needs (e.g. ntfy's /hitl/ack).
+    # Generic: any approver implementing WebhookApprover self-registers its
+    # routes; auto/reject implement nothing and register none.
+    if isinstance(approver, WebhookApprover):
+        for route in approver.webhook_routes():
 
-        # FastMCP exposes its underlying ASGI app for adding custom routes.
-        # The exact attribute name varies by version; read the source if this
-        # breaks. As of 2.14, ``mcp.streamable_http_app()`` returns the app.
-        hub.mcp.custom_route(server_cfg.hitl_webhook_path, methods=["POST"])(hitl_ack)
+            def _adapter(
+                r: WebhookRoute,
+            ) -> Callable[[Request], Awaitable[Response]]:
+                async def _handler(request: Request) -> Response:
+                    try:
+                        body: dict[str, Any] = await request.json()
+                    except (ValueError, RuntimeError):
+                        body = {}
+                    status, payload = await r.handler(
+                        dict(request.query_params), body
+                    )
+                    return JSONResponse(payload, status_code=status)
+
+                return _handler
+
+            hub.mcp.custom_route(route.path, methods=list(route.methods))(
+                _adapter(route)
+            )
 
     async def health(_request: Request) -> Response:
         return JSONResponse({"status": "ok"})

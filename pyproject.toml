@@ -60,6 +60,14 @@ env = "mcp_hub.secrets.env:EnvSecretBackend"
 file = "mcp_hub.secrets.file:FileSecretBackend"
 bao = "mcp_hub.secrets.bao:BaoSecretBackend"
 
+# Approver (HITL) adapters. Built-ins below; third-party adapters (Slack,
+# Telegram, webhook, ...) declare the same group in their own pyproject.toml.
+# See src/mcp_hub/approvers/registry.py.
+[project.entry-points."mcp_hub.approvers"]
+auto = "mcp_hub.approvers.auto:AutoApprover"
+reject = "mcp_hub.approvers.reject:RejectApprover"
+ntfy = "mcp_hub.approvers.ntfy:NtfyApprover"
+
 [dependency-groups]
 dev = [
     "pytest>=8,<9",
