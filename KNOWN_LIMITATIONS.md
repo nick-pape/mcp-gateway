@@ -1,9 +1,8 @@
 # Known Limitations
 
 Honest accounting of architectural gaps, scale concerns, and OSS-readiness
-TODOs. This document is the inverse of `BACKLOG.md` — that file lists
-features we'd like to add; this file lists problems with what's already
-shipped. They're related but they're different lists.
+TODOs. This is the inverse of a roadmap: not features we'd like to add, but
+problems with what's already shipped.
 
 If you're evaluating this project for use: **read this file first.** The
 defaults work for the homelab use case it was built for; if your
@@ -221,13 +220,12 @@ pre-built binaries from a release artifact.
 
 ## OSS-readiness
 
-### 15. No README
+### 15. No end-to-end deployment guide
 
-Setup, configuration, deployment, and operating instructions don't
-exist as a unified document. The codebase is well-commented and the
-architecture docs (`architecture.md`, `landscape.md`,
-`IMPLEMENTATION_PLAN.md`) are thorough — but they're insider docs, not
-"someone landed here from a Hacker News link" docs.
+A top-level `README.md` now exists, but there's no single walkthrough that
+takes a new adopter from zero to a running multi-identity deployment for a
+given backend set. The codebase comments and `architecture.md` are
+thorough but read as design docs, not "first deploy" docs.
 
 Table-stakes for OSS launch.
 
@@ -245,11 +243,10 @@ which fields are required vs optional.
 
 ### 17. Documentation lives in scattered markdown files
 
-`architecture.md`, `landscape.md`, `IMPLEMENTATION_PLAN.md`,
-`BACKLOG.md`, `KNOWN_LIMITATIONS.md` (this file) are all good but
-fragmented. A unified docs site (mkdocs / Docusaurus / hand-rolled
-GitHub Pages) would help discoverability and let us link sections
-between docs cleanly.
+`README.md`, `architecture.md`, `landscape.md`, `CHANGELOG.md`, and
+`KNOWN_LIMITATIONS.md` (this file) are all good but fragmented. A unified
+docs site (mkdocs / Docusaurus / hand-rolled GitHub Pages) would help
+discoverability and let us link sections between docs cleanly.
 
 ---
 

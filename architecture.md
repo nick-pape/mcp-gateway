@@ -1,7 +1,12 @@
-# Architecture: `mcp.pape.house` — single-container hub with in-process fanout
+# Architecture: single-container hub with in-process fanout
 
 > Sister doc: [`landscape.md`](./landscape.md) for the survey that led to
 > "build" instead of adopt.
+>
+> This describes the **reference deployment**. The IdP (Authentik), secret
+> backend (OpenBao/Vault), and approver (ntfy) named throughout are the
+> author's concrete choices — each is pluggable behind a small interface
+> (see [`README.md`](./README.md)).
 
 ## Vision
 
@@ -30,13 +35,13 @@ flowchart TB
         A3[claude-code-dev]
     end
 
-    AUTH[("Authentik<br/>auth.pape.house")]
-    BAO[("bao<br/>secrets.pape.house")]
-    NTFY[("ntfy<br/>notify.service.pape.house")]
+    AUTH[("OIDC IdP<br/>(e.g. Authentik)")]
+    BAO[("Secret backend<br/>(e.g. Vault / OpenBao)")]
+    NTFY[("Approver<br/>(e.g. ntfy)")]
 
-    CADDY["Caddy<br/>caddy.service.pape.house"]
+    CADDY["Reverse proxy<br/>(e.g. Caddy)"]
 
-    subgraph mcp_lxc["mcp.service.pape.house LXC — single container"]
+    subgraph mcp_lxc["gateway host — single container"]
         HUB["Hub (FastMCP, Python, ~250 LoC)<br/>- JWT validate (aud → identity)<br/>- Policy: list_tools filter + HITL<br/>- Audit"]
 
         subgraph fanouts["In-process Fanout instances"]
@@ -85,10 +90,11 @@ All siblings, all in the same container, isolated by UID.
 
 ## End-to-end flow
 
-1. **Agent → Caddy.** POST to `https://mcp.pape.house/mcp` with
-   `Authorization: Bearer <Authentik-JWT>`. The JWT's `aud` claim is the
+1. **Agent → reverse proxy.** POST to `https://<gateway-host>/mcp` with
+   `Authorization: Bearer <OIDC-JWT>`. The JWT's `aud` claim is the
    agent's identity (`mcp-ironclaw`, `mcp-paperless-bot`, etc.).
-2. **Caddy** terminates TLS, forwards to `mcp.service.pape.house:8443`.
+2. **The reverse proxy** terminates TLS, forwards to the gateway
+   container's `:8443`.
 3. **Hub auth middleware:** validates the JWT against pinned Authentik
    JWKS, extracts identity from `aud` claim. Attaches
    `request.state.identity` (e.g., `"ironclaw"`).
@@ -121,10 +127,10 @@ from .fanout import Fanout
 from .auth import AuthentikJWTValidator
 from .hitl import NtfyApprover
 
-mcp = FastMCP("mcp.pape.house")
+mcp = FastMCP("mcp-gateway")
 auth = AuthentikJWTValidator(jwks_uri=PINNED_JWKS_URI, audience_prefix="mcp-")
 hitl = NtfyApprover(...)
-policy = Policy.load("/etc/mcp-pape-house/policy.yaml")
+policy = Policy.load("/etc/mcp-gateway/policy.yaml")
 
 # One Fanout per MCP type. Eager spawn at startup (per design choice 1).
 fanouts = {
@@ -451,11 +457,11 @@ async def push_approve(identity: str, tool: str, args: dict) -> bool:
         message=render_args(args),
         actions=[
             {"action":"http","label":"Approve",
-             "url":f"https://mcp.pape.house/hitl/ack?nonce={nonce}",
+             "url":f"https://<gateway-host>/hitl/ack?nonce={nonce}",
              "method":"POST",
              "body":json.dumps({"ack_token":ack_token,"decision":"approve"})},
             {"action":"http","label":"Reject",
-             "url":f"https://mcp.pape.house/hitl/ack?nonce={nonce}",
+             "url":f"https://<gateway-host>/hitl/ack?nonce={nonce}",
              "method":"POST",
              "body":json.dumps({"ack_token":ack_token,"decision":"reject"})},
         ],
@@ -530,33 +536,25 @@ Error code taxonomy:
 - `BACKEND_CHILD_DEAD` — fanout's stdio child crashed
 - `INTERNAL_ERROR` — gateway bug; alert
 
-## Build sequence
+## Deploying
 
-1. **Stand up `mcp.service.pape.house` LXC + Portainer** via `add-service-ct` skill
-2. **bao setup**:
-   - Enable JWT auth method against Authentik issuer
-   - Per-MCP-per-identity policies (e.g., `mcp-technitium-ironclaw`)
-   - Per-identity-per-MCP secrets at `secret/services/<mcp>/<identity>`
-3. **Authentik setup**:
-   - One OAuth2/OpenID Provider per identity (`mcp-ironclaw`, etc.)
-   - One for the fanout itself (`mcp-fanout-svc`) — JWT mounted into container
-4. **Forked Technitium MCP**: add DHCP tool handlers (parallel workstream)
-5. **`mcp-fanout` Python module** (~200 LoC). Standalone tests with
-   fake stdio MCP first.
-6. **Hub** (~250 LoC): JWT validation + policy + HITL approver +
-   import fanout. End-to-end test with a single fake MCP and 2
-   identities.
-7. **Multi-stage Dockerfile** with Technitium MCP first.
-8. **Caddy block** for `mcp.pape.house` (TLS terminate; no mTLS in v1
-   — Authentik JWT is the auth)
-9. **End-to-end smoke**: Claude Code → Authentik device flow →
-   `mcp.pape.house` → list_tools (curated) → call_tool (auto-approve) → result
-10. **HITL smoke**: trigger a `push-approve` tool from Claude Code,
-    receive ntfy push, approve, see result
-11. **Run the CT hostname cleanup** through this path. First real use
-    end-to-end validation.
-12. **Add additional MCPs** (Authentik, Paperless, etc.) one stage at
-    a time in the Dockerfile.
+The hub ships as a generic image (`ghcr.io/nick-pape/mcp-gateway`); a
+deployment is that image plus a `policy.yaml` and whatever backends it
+references. The broad shape:
+
+1. **IdP**: one OIDC provider/audience per identity, plus one service
+   identity for the fanout's secret-backend login (`mcp-fanout-svc`).
+2. **Secret backend** (`env` / `file` / `bao`): each identity's per-MCP
+   secrets, e.g. at `services/<mcp>/<identity>`.
+3. **`policy.yaml`**: identities, allowed-tool globs, HITL policy, MCPs.
+4. **Reverse proxy**: terminate TLS and forward to the container's `:8443`
+   (the JWT is the auth; no mTLS required).
+5. **MCPs**: bake stdio MCPs into a thin `FROM ghcr.io/nick-pape/mcp-gateway`
+   overlay, or federate HTTP MCPs over the network.
+
+See [`README.md`](./README.md) and [`docker-compose.yml`](./docker-compose.yml)
+for a runnable starting point, and [`policy.example.yaml`](./policy.example.yaml)
+for a full annotated config.
 
 ## Open design questions
 

@@ -37,8 +37,8 @@ dependencies = [
     # Globally-unique IDs for audit request_id (lexicographically sortable).
     "python-ulid>=3,<4",
 
-    # Docker SDK — used by ContainerFanout to spawn wrapper containers on
-    # ai.service.pape.house. docker-py is sync; we wrap calls via
+    # Docker SDK — used by ContainerFanout to spawn wrapper containers on a
+    # configured Docker host. docker-py is sync; we wrap calls via
     # asyncio.to_thread (see src/mcp_fanout/container_fanout.py).
     "docker>=7,<8",
 ]

@@ -29,7 +29,7 @@ from tests.fakes.fake_ntfy import FakeNtfy
 
 BAO_ADDR = "https://bao.test"
 NTFY_SERVER = "https://ntfy.test"
-WEBHOOK_BASE = "https://mcp.pape.house"
+WEBHOOK_BASE = "https://mcp.example.com"
 BAO_ROLE = "mcp-hitl"
 
 
@@ -94,8 +94,8 @@ def _request(
         mcp_name=tool.split("_", 1)[0],
         tool=tool,
         justification="user explicitly asked to remove the stale record",
-        args={"domain": "stale.pape.house"},
-        args_summary="domain=stale.pape.house",
+        args={"domain": "stale.example.com"},
+        args_summary="domain=stale.example.com",
     )
 
 
