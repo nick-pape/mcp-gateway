@@ -37,14 +37,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import secrets
 import time
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import httpx
 import jwt
 
 from .errors import ErrorCode
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +74,50 @@ class AuthFailed(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Identity:
-    """The validated agent identity extracted from a JWT's audience claim."""
+    """The resolved calling identity, plus the raw inbound bearer when present.
+
+    ``bearer_token`` is the credential the request carried (the JWT, in OIDC
+    mode). HTTP-fanout strategies that forward the caller's token — JwtPassthrough
+    and SecretBearer's as-agent path — read it from context. Non-OIDC modes that
+    have no forwardable token leave it ``None``.
+    """
 
     name: str
     claims: dict[str, Any]
+    bearer_token: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Inbound authenticator Protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class InboundAuthenticator(Protocol):
+    """Resolves the calling identity from an inbound HTTP request.
+
+    Implementations own the full "request → Identity" step (header extraction
+    included), so :class:`mcp_hub.middleware.IdentityMiddleware` is agnostic to
+    the auth mechanism (OIDC JWT, static token, trusted proxy, ...). Raise
+    :class:`AuthFailed` on any failure; the middleware maps it to an MCP auth
+    error. Must be coroutine-safe — one instance is shared across all in-flight
+    requests.
+    """
+
+    async def authenticate(self, request: Request) -> Identity: ...
+
+    async def close(self) -> None: ...
+
+
+def _extract_bearer(request: Request) -> str:
+    """Pull the token out of ``Authorization: Bearer <token>`` or raise."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise AuthFailed(ErrorCode.AUTH_FAILED, "missing bearer token")
+    token = auth_header[len("bearer ") :].strip()
+    if not token:
+        raise AuthFailed(ErrorCode.AUTH_FAILED, "empty bearer token")
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +292,103 @@ class AuthentikJWTValidator:
             )
 
         return Identity(name=identity, claims=claims)
+
+    async def authenticate(self, request: Request) -> Identity:
+        """InboundAuthenticator: extract the bearer JWT and validate it.
+
+        Surfaces the raw JWT as ``Identity.bearer_token`` so passthrough /
+        as-agent fanout strategies can forward it upstream.
+        """
+        token = _extract_bearer(request)
+        identity = await self.validate(token)
+        return replace(identity, bearer_token=token)
+
+
+# ---------------------------------------------------------------------------
+# Non-OIDC authenticators (no IdP required)
+# ---------------------------------------------------------------------------
+
+
+class StaticTokenAuthenticator:
+    """InboundAuthenticator: opaque bearer tokens mapped to identities.
+
+    Zero-infra inbound auth — no IdP. Each identity has a high-entropy token
+    (loaded from a file, never policy.yaml). The inbound
+    ``Authorization: Bearer <token>`` is constant-time compared against every
+    known token; an unknown token raises :class:`AuthFailed` (fail-closed).
+
+    The token→identity map is built + validated (every identity must exist in
+    policy) by :func:`mcp_hub.factory.build_inbound_auth`.
+    """
+
+    def __init__(self, *, token_to_identity: dict[str, str]) -> None:
+        # (token, identity) pairs. Lookup compares against ALL of them with no
+        # early return, so neither a token value nor the number of configured
+        # tokens leaks via timing.
+        self._pairs: list[tuple[str, str]] = list(token_to_identity.items())
+
+    async def authenticate(self, request: Request) -> Identity:
+        token = _extract_bearer(request)
+        matched: str | None = None
+        for known_token, identity in self._pairs:
+            if secrets.compare_digest(token, known_token):
+                matched = identity
+        if matched is None:
+            raise AuthFailed(ErrorCode.AUTH_FAILED, "unknown static token")
+        return Identity(name=matched, claims={}, bearer_token=None)
+
+    async def close(self) -> None:
+        return None
+
+
+class TrustedProxyAuthenticator:
+    """InboundAuthenticator: trust an upstream auth proxy's identity header.
+
+    For deployments fronted by oauth2-proxy / Authelia / Caddy ``forward_auth``:
+    the proxy authenticates the user and injects ``identity_header``. To stop any
+    client that can reach the hub from spoofing that header, the proxy MUST also
+    send a shared-secret header (:attr:`SHARED_SECRET_HEADER`) matching the
+    configured secret — constant-time compared. Network-isolating the hub to the
+    proxy is recommended defense-in-depth. Fail-closed on any check.
+    """
+
+    # Header the proxy must set to the shared secret. Fixed name keeps config
+    # minimal; the secret itself comes from a file.
+    SHARED_SECRET_HEADER = "x-mcp-gateway-auth"  # noqa: S105 (header name, not a secret)
+
+    def __init__(
+        self,
+        *,
+        identity_header: str,
+        shared_secret: str,
+        valid_identities: frozenset[str],
+    ) -> None:
+        self._identity_header = identity_header.lower()
+        self._shared_secret = shared_secret
+        self._valid_identities = valid_identities
+
+    async def authenticate(self, request: Request) -> Identity:
+        presented = request.headers.get(self.SHARED_SECRET_HEADER, "")
+        if not presented or not secrets.compare_digest(presented, self._shared_secret):
+            raise AuthFailed(
+                ErrorCode.AUTH_FAILED,
+                "trusted-proxy shared secret missing or incorrect",
+            )
+        identity = request.headers.get(self._identity_header, "").strip()
+        if not identity:
+            raise AuthFailed(
+                ErrorCode.AUTH_FAILED,
+                f"trusted-proxy identity header {self._identity_header!r} missing",
+            )
+        if identity not in self._valid_identities:
+            raise AuthFailed(
+                ErrorCode.AUTH_FAILED,
+                f"trusted-proxy identity {identity!r} is not a known identity",
+            )
+        return Identity(name=identity, claims={}, bearer_token=None)
+
+    async def close(self) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------

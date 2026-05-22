@@ -74,10 +74,29 @@ class ServerConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
+    """Inbound auth config. ``mode`` selects how callers are authenticated:
+
+    - ``oidc`` (default): validate an inbound OIDC JWT against ``jwks_uri`` /
+      ``issuer``; identity = the ``aud`` suffix after ``audience_prefix``.
+      Requires ``issuer`` + ``jwks_uri`` + ``audience_prefix``.
+    - ``static_token``: opaque bearer tokens → identities, from ``token_file``
+      (YAML/JSON mapping ``identity: token``). No IdP. Requires ``token_file``.
+    - ``trusted_proxy``: trust a fronting auth proxy that injects
+      ``identity_header``; the proxy must also send the shared secret from
+      ``shared_secret_file`` (header ``x-mcp-gateway-auth``). Requires both.
+
+    ``jwt_passthrough``, ``secret_bearer`` with ``as_agent: true``, and
+    ``container``-transport MCPs all need an inbound JWT and therefore
+    ``mode: oidc`` — the factory rejects them otherwise.
+    """
+
     model_config = ConfigDict(extra="forbid")
-    issuer: str
-    jwks_uri: str
-    audience_prefix: str
+    mode: Literal["oidc", "static_token", "trusted_proxy"] = "oidc"
+
+    # ── oidc (required when mode=oidc) ──
+    issuer: str | None = None
+    jwks_uri: str | None = None
+    audience_prefix: str | None = None
     # OIDC discovery URL — used by bao's JWT auth method, NOT by the hub.
     # Authentik publishes per-app discovery URLs even when issuer_mode=global,
     # so this can differ from `issuer`. The hub itself uses `jwks_uri` directly.
@@ -85,6 +104,44 @@ class AuthConfig(BaseModel):
     algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
     clock_skew_s: int = 30
     cache_ttl_s: int = 600
+
+    # ── static_token (required when mode=static_token) ──
+    token_file: str | None = None
+
+    # ── trusted_proxy (required when mode=trusted_proxy) ──
+    identity_header: str | None = None
+    shared_secret_file: str | None = None
+
+    @model_validator(mode="after")
+    def _check_mode_fields(self) -> AuthConfig:
+        required = {
+            "oidc": ("issuer", "jwks_uri", "audience_prefix"),
+            "static_token": ("token_file",),
+            "trusted_proxy": ("identity_header", "shared_secret_file"),
+        }
+        missing = [f for f in required[self.mode] if getattr(self, f) is None]
+        if missing:
+            raise ValueError(f"auth.mode={self.mode!r} requires: {', '.join(missing)}")
+        # Reject fields belonging to a different mode (catch copy-paste/typos).
+        # Only the None-defaulted fields are checked; the OIDC tuning knobs with
+        # real defaults (algorithms/clock_skew_s/cache_ttl_s) are always benign.
+        cross = {
+            "oidc": ("token_file", "identity_header", "shared_secret_file"),
+            "static_token": (
+                "issuer", "jwks_uri", "audience_prefix", "oidc_discovery_url",
+                "identity_header", "shared_secret_file",
+            ),
+            "trusted_proxy": (
+                "issuer", "jwks_uri", "audience_prefix", "oidc_discovery_url",
+                "token_file",
+            ),
+        }
+        foreign = [f for f in cross[self.mode] if getattr(self, f) is not None]
+        if foreign:
+            raise ValueError(
+                f"auth.mode={self.mode!r} does not use: {', '.join(foreign)}"
+            )
+        return self
 
 
 class BackendChoice(BaseModel):

@@ -19,8 +19,10 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
+import yaml
 
 from mcp_fanout import (
     ContainerFanout,
@@ -38,6 +40,12 @@ from .approvers.store import (
     BaoTransientStore,
     InMemoryTransientStore,
     TransientStore,
+)
+from .auth import (
+    AuthentikJWTValidator,
+    InboundAuthenticator,
+    StaticTokenAuthenticator,
+    TrustedProxyAuthenticator,
 )
 from .auth_strategies import (
     DEFAULT_BAO_CACHE_TTL_S,
@@ -209,6 +217,99 @@ def _required_str(d: dict[str, object], key: str, label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Inbound auth (request -> identity)
+# ---------------------------------------------------------------------------
+
+
+def build_inbound_auth(
+    auth: AuthConfig,
+    *,
+    identities: frozenset[str],
+    http_client: httpx.AsyncClient | None = None,
+) -> InboundAuthenticator:
+    """Construct the inbound authenticator selected by ``auth.mode``.
+
+    - ``oidc`` → :class:`AuthentikJWTValidator` (validate inbound JWTs vs JWKS).
+    - ``static_token`` → :class:`StaticTokenAuthenticator` (opaque bearer tokens
+      from ``token_file`` mapped to identities; no IdP).
+    - ``trusted_proxy`` → :class:`TrustedProxyAuthenticator` (trust a fronting
+      proxy's identity header, gated by a shared secret).
+
+    ``identities`` is the set of identity names defined in policy; static/proxy
+    modes validate resolved identities against it (fail-closed).
+    """
+    if auth.mode == "oidc":
+        # Presence guaranteed by AuthConfig._check_mode_fields.
+        assert auth.jwks_uri and auth.issuer and auth.audience_prefix
+        return AuthentikJWTValidator(
+            jwks_uri=auth.jwks_uri,
+            issuer=auth.issuer,
+            audience_prefix=auth.audience_prefix,
+            algorithms=auth.algorithms,
+            clock_skew_s=auth.clock_skew_s,
+            cache_ttl_s=auth.cache_ttl_s,
+            http_client=http_client,
+        )
+
+    if auth.mode == "static_token":
+        assert auth.token_file is not None
+        raw = _load_yaml_file(auth.token_file, "auth.token_file")
+        token_to_identity: dict[str, str] = {}
+        for ident, tok in raw.items():
+            if ident not in identities:
+                raise ValueError(
+                    f"auth.token_file: identity {ident!r} is not defined in "
+                    f"policy.identities"
+                )
+            if not isinstance(tok, str) or not tok:
+                raise ValueError(
+                    f"auth.token_file: token for identity {ident!r} must be a "
+                    f"non-empty string"
+                )
+            if tok in token_to_identity:
+                raise ValueError(
+                    f"auth.token_file: duplicate token shared by "
+                    f"{token_to_identity[tok]!r} and {ident!r}"
+                )
+            token_to_identity[tok] = ident
+        if not token_to_identity:
+            raise ValueError(f"auth.token_file {auth.token_file!r} defines no tokens")
+        return StaticTokenAuthenticator(token_to_identity=token_to_identity)
+
+    # trusted_proxy
+    assert auth.identity_header and auth.shared_secret_file
+    try:
+        secret = Path(auth.shared_secret_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(
+            f"auth.shared_secret_file: cannot read {auth.shared_secret_file}: {exc}"
+        ) from exc
+    if not secret:
+        raise ValueError(
+            f"auth.shared_secret_file {auth.shared_secret_file!r} is empty"
+        )
+    return TrustedProxyAuthenticator(
+        identity_header=auth.identity_header,
+        shared_secret=secret,
+        valid_identities=identities,
+    )
+
+
+def _load_yaml_file(path: str, label: str) -> dict[str, Any]:
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"{label}: cannot read {path}: {exc}") from exc
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{label}: {path} is not valid YAML/JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{label}: {path} must be a mapping of identity -> token")
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Auth strategies (HTTP fanout)
 # ---------------------------------------------------------------------------
 
@@ -220,6 +321,7 @@ def build_auth_strategy(
     secret_backend: SecretBackend,
     mcp_identities: frozenset[str] = frozenset(),
     autonomous_identities: frozenset[str] = frozenset(),
+    auth_mode: str = "oidc",
 ) -> AuthStrategy:
     """Construct an :class:`AuthStrategy` from a policy config block.
 
@@ -255,6 +357,12 @@ def build_auth_strategy(
             raise ValueError(
                 f"mcps.{mcp_name}.auth.config.as_agent must be a boolean"
             )
+        if as_agent and auth_mode != "oidc":
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config.as_agent requires auth.mode=oidc "
+                f"(the agent's inbound JWT is needed; not available in "
+                f"{auth_mode!r} mode)"
+            )
         # as-agent fires per-identity: only autonomous-kind identities, and
         # only when this MCP opts in. Delegated identities stay deputy.
         as_agent_identities = autonomous_identities if as_agent else frozenset()
@@ -275,6 +383,11 @@ def build_auth_strategy(
         if cfg:
             raise ValueError(
                 f"mcps.{mcp_name}.auth.config: jwt_passthrough takes no config"
+            )
+        if auth_mode != "oidc":
+            raise ValueError(
+                f"mcps.{mcp_name}.auth: jwt_passthrough requires auth.mode=oidc "
+                f"(no inbound JWT to forward in {auth_mode!r} mode)"
             )
         return JwtPassthrough()
     if config.type == "fanout_jwt":
@@ -414,6 +527,7 @@ def build_fanout(
             secret_backend=secret_backend,
             mcp_identities=frozenset(http_identities),
             autonomous_identities=autonomous,
+            auth_mode=auth_config.mode if auth_config else "oidc",
         )
         # Order delegated-first so HttpFanout's boot identity (identities[0])
         # can run the deputy boot handshake whenever a delegated identity
@@ -443,6 +557,14 @@ def build_fanout(
             f"MCP {mcp_name!r} (container) requires auth_config= (for OIDC "
             f"issuer + discovery URL passed into spawned wrappers)"
         )
+    if auth_config.mode != "oidc":
+        raise ValueError(
+            f"MCP {mcp_name!r} (container) requires auth.mode=oidc; spawned "
+            f"wrappers validate per-identity OIDC JWTs, which {auth_config.mode!r} "
+            f"mode cannot provide"
+        )
+    # oidc mode guarantees issuer is set (AuthConfig validator); narrow for mypy.
+    assert auth_config.issuer is not None
     container_identities = _identities_for_http_mcp(mcp_name, identities)
     if not container_identities:
         raise ValueError(
@@ -459,6 +581,7 @@ def build_fanout(
         secret_backend=secret_backend,
         mcp_identities=frozenset(container_identities),
         autonomous_identities=container_autonomous,
+        auth_mode=auth_config.mode,
     )
     if auth_config.oidc_discovery_url is None:
         raise ValueError(

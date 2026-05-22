@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 import pytest
+from starlette.requests import Request
 
 from mcp_hub.auth import (
     AuthentikJWTValidator,
@@ -394,4 +395,33 @@ async def test_no_audience_claim_rejected(
     )
     with pytest.raises(AuthFailed, match="does not start with"):
         await validator.validate(token)
+    await validator.close()
+
+
+# ---------------------------------------------------------------------------
+# authenticate(request) — InboundAuthenticator entrypoint
+# ---------------------------------------------------------------------------
+
+
+def _req(headers: dict[str, str]) -> Request:
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    return Request({"type": "http", "headers": raw})
+
+
+async def test_authenticate_extracts_bearer_and_surfaces_it(
+    fake: FakeAuthentik, validator: AuthentikJWTValidator
+) -> None:
+    token = fake.issue(audience="mcp-ironclaw")
+    identity = await validator.authenticate(_req({"Authorization": f"Bearer {token}"}))
+    assert identity.name == "ironclaw"
+    # authenticate() surfaces the raw JWT for passthrough / as-agent strategies.
+    assert identity.bearer_token == token
+    await validator.close()
+
+
+async def test_authenticate_missing_bearer_raises(
+    validator: AuthentikJWTValidator,
+) -> None:
+    with pytest.raises(AuthFailed, match="missing bearer token"):
+        await validator.authenticate(_req({}))
     await validator.close()

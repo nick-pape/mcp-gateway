@@ -38,12 +38,12 @@ adapters install side-by-side and are selected with a dotted path
 | Secrets | `env`, `file` (SOPS/age-friendly), `bao` (Vault/OpenBao) | `mcp_hub.secret_backends` |
 | Approvals (HITL) | `auto`, `reject`, `ntfy` | `mcp_hub.approvers` |
 | Token refresh | `authentik_client_credentials`, `file` sink | `mcp_hub.token_sources` / `token_sinks` |
-| Inbound auth | generic OIDC (JWKS + issuer + audience) | _(static-token / non-OIDC mode planned — #7)_ |
+| Inbound auth | OIDC JWT (any JWKS issuer), **static-token** (no IdP), **trusted-proxy** | `auth.mode` in `policy.yaml` |
 
-**Zero-infra mode:** `secret_backend: {name: file}` (or `env`) + `approver:
-{name: auto}` needs no Vault/ntfy — see [`policy.example.minimal.yaml`](./policy.example.minimal.yaml).
-(Inbound auth currently still requires an OIDC issuer; a static-token mode is on
-the roadmap.)
+**Zero-infra mode:** `auth: {mode: static_token}` + `secret_backend: {name: file}`
+(or `env`) + `approver: {name: auto}` needs no IdP / Vault / ntfy — see
+[`policy.example.minimal.yaml`](./policy.example.minimal.yaml) for a complete
+no-infrastructure quickstart you can `docker compose up` and `curl`.
 
 ## Run it
 

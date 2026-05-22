@@ -1,22 +1,28 @@
-# mcp-gateway — minimal policy (no external infra for secrets or HITL)
+# mcp-gateway — minimal policy (NO external infrastructure)
 #
-# Secrets come from a local file (no Vault), approvals auto-approve (no ntfy),
-# and there's no token refresher. Drop this at /etc/mcp-gateway/policy.yaml.
-#
-# NOTE: inbound auth still needs an OIDC issuer today (any provider that exposes
-# a JWKS endpoint). A non-OIDC static-token mode is on the roadmap (issue #7).
+# Inbound auth uses static bearer tokens (no IdP), secrets come from a local
+# file (no Vault), approvals auto-approve (no ntfy), and there's no token
+# refresher. Drop this at /etc/mcp-gateway/policy.yaml — the genuine
+# "docker compose up and curl it" quickstart.
 
 version: 1
 
 server:
   bind: "0.0.0.0:8443"
 
+# Static-token inbound auth — no IdP. Each identity gets a high-entropy bearer
+# token in a SEPARATE file (keep secrets out of policy.yaml). The caller sends
+# `Authorization: Bearer <token>`; the hub maps the token to the identity.
+# Generate tokens with e.g.  openssl rand -hex 32
+#
+#   # /etc/mcp-gateway/tokens.yaml   (mode 0400, root-owned)
+#   agent: "<paste a long random token here>"
+#
+# To use an OIDC IdP instead (Keycloak/Authentik/Auth0/Zitadel) set mode: oidc
+# + issuer/jwks_uri/audience_prefix — see policy.example.yaml.
 auth:
-  # Point these at your OIDC provider (Keycloak, Authentik, Auth0, Zitadel, ...).
-  issuer: https://auth.example.com/
-  jwks_uri: https://auth.example.com/.well-known/jwks.json
-  audience_prefix: "mcp-"        # aud must start with this; the suffix is the identity
-  algorithms: ["RS256"]
+  mode: static_token
+  token_file: /etc/mcp-gateway/tokens.yaml
 
 # File-backed secrets — no external store. Pair with SOPS/age by pointing this
 # at a file your deploy decrypts at boot. Format: { "<path>": { "<field>": "<value>" } }
@@ -44,7 +50,7 @@ mcps:
 
 identities:
   agent:
-    aud: mcp-agent
+    aud: mcp-agent          # only consulted in oidc mode; required by schema
     uid_base: 1001
     allowed_tools:
       - "example_*"

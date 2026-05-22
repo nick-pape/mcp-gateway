@@ -25,8 +25,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .audit import Audit
-from .auth import AuthentikJWTValidator
-from .factory import build_approver, build_refresher_manager, build_secret_backend
+from .factory import (
+    build_approver,
+    build_inbound_auth,
+    build_refresher_manager,
+    build_secret_backend,
+)
 from .interfaces import WebhookApprover, WebhookRoute
 from .policy import Policy
 from .server import Hub
@@ -60,13 +64,9 @@ async def _async_main() -> int:
     # Single httpx client shared across backends to keep connection pools warm.
     http_client = httpx.AsyncClient(timeout=10.0)
 
-    validator = AuthentikJWTValidator(
-        jwks_uri=auth.jwks_uri,
-        issuer=auth.issuer,
-        audience_prefix=auth.audience_prefix,
-        algorithms=auth.algorithms,
-        clock_skew_s=auth.clock_skew_s,
-        cache_ttl_s=auth.cache_ttl_s,
+    validator = build_inbound_auth(
+        auth,
+        identities=frozenset(policy.config.identities),
         http_client=http_client,
     )
     secret_backend = build_secret_backend(policy.config, http_client=http_client)
@@ -135,8 +135,9 @@ async def _async_main() -> int:
 
     hub.mcp.custom_route("/health", methods=["GET"])(health)
 
-    # OAuth discovery + DCR shim. The hub doesn't run its own OAuth server;
-    # we proxy discovery to Authentik (mcp-interactive provider) and fake
+    # OAuth discovery + DCR shim — OIDC-only (the routes are mounted under the
+    # `auth.mode == "oidc"` guard below). The hub doesn't run its own OAuth
+    # server; we proxy discovery to Authentik (mcp-interactive provider) and fake
     # Dynamic Client Registration since Authentik's /application/o/register/
     # endpoint requires a per-tenant feature flag we haven't enabled. All
     # MCP clients land on the same registered Authentik client_id —
@@ -157,7 +158,7 @@ async def _async_main() -> int:
     # endpoints. Derived from the issuer so no fixed IdP URL is baked into the
     # generic image. Assumes Authentik global-issuer mode (iss == the IdP base);
     # in per-app issuer mode set auth.issuer to the IdP base.
-    AUTHENTIK_BASE = auth.issuer.rstrip("/")
+    AUTHENTIK_BASE = (auth.issuer or "").rstrip("/")
 
     def _public_base(request: Request) -> str:
         scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
@@ -220,23 +221,26 @@ async def _async_main() -> int:
             "client_name": body.get("client_name", "MCP Client"),
         }, status_code=201)
 
-    # Both /.well-known paths — clients vary on which they probe first.
-    hub.mcp.custom_route(
-        "/.well-known/oauth-protected-resource",
-        methods=["GET"],
-    )(oauth_protected_resource)
-    hub.mcp.custom_route(
-        "/.well-known/oauth-protected-resource/mcp",
-        methods=["GET"],
-    )(oauth_protected_resource)
-    hub.mcp.custom_route(
-        "/.well-known/oauth-authorization-server",
-        methods=["GET"],
-    )(oauth_authorization_server)
-    hub.mcp.custom_route(
-        "/oauth/register",
-        methods=["POST"],
-    )(oauth_register)
+    # Mount the OAuth discovery/DCR routes only in OIDC mode — they proxy an
+    # IdP that doesn't exist in static-token / trusted-proxy modes.
+    if auth.mode == "oidc":
+        # Both /.well-known paths — clients vary on which they probe first.
+        hub.mcp.custom_route(
+            "/.well-known/oauth-protected-resource",
+            methods=["GET"],
+        )(oauth_protected_resource)
+        hub.mcp.custom_route(
+            "/.well-known/oauth-protected-resource/mcp",
+            methods=["GET"],
+        )(oauth_protected_resource)
+        hub.mcp.custom_route(
+            "/.well-known/oauth-authorization-server",
+            methods=["GET"],
+        )(oauth_authorization_server)
+        hub.mcp.custom_route(
+            "/oauth/register",
+            methods=["POST"],
+        )(oauth_register)
 
     bind_host, _, bind_port_s = server_cfg.bind.partition(":")
     bind_port = int(bind_port_s) if bind_port_s else 8443

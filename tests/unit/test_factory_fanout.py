@@ -130,6 +130,32 @@ def test_build_auth_strategy_as_agent_must_be_bool() -> None:
         build_auth_strategy(mcp_name="outline", config=cfg, secret_backend=backend)
 
 
+def test_build_auth_strategy_jwt_passthrough_requires_oidc() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(type="jwt_passthrough", config={})
+    with pytest.raises(ValueError, match="requires auth.mode=oidc"):
+        build_auth_strategy(
+            mcp_name="x", config=cfg, secret_backend=backend, auth_mode="static_token"
+        )
+
+
+def test_build_auth_strategy_as_agent_requires_oidc() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(
+        type="secret_bearer",
+        config={"path_template": "services/x/{identity}", "as_agent": True},
+    )
+    with pytest.raises(ValueError, match="as_agent requires auth.mode=oidc"):
+        build_auth_strategy(
+            mcp_name="x",
+            config=cfg,
+            secret_backend=backend,
+            mcp_identities=frozenset({"a"}),
+            autonomous_identities=frozenset({"a"}),
+            auth_mode="trusted_proxy",
+        )
+
+
 def test_build_auth_strategy_bao_backed_bearer_requires_path_template() -> None:
     backend = EnvSecretBackend()
     cfg = AuthStrategyConfig(type="bao_backed_bearer", config={})
