@@ -25,7 +25,7 @@ Built-in strategies:
 
 - :class:`FanoutJwt` — forwards the hub's OWN service-account JWT
   (the rotated ``fanout_jwt`` written by ``mcp_hub.refresher`` to
-  ``/etc/mcp-pape-house/fanout_jwt``) as the upstream Bearer
+  ``/etc/mcp-gateway/fanout_jwt``) as the upstream Bearer
   regardless of caller identity. Use with ``scope: shared`` container
   MCPs whose wrapper accepts ``aud=mcp-fanout-svc`` via
   ``OIDC_BOOT_AUDIENCE``. Per-identity HITL/audit still happens
@@ -283,7 +283,7 @@ class NoneStrategy:
 # Default path matches the refresher sink configured in policy.example.yaml
 # (``token_refresh.fanout_jwt.sink.config.path``). Can be overridden in
 # ``policy.yaml`` per fanout via ``auth.config.path``.
-DEFAULT_FANOUT_JWT_PATH: str = "/etc/mcp-pape-house/fanout_jwt"
+DEFAULT_FANOUT_JWT_PATH: str = "/etc/mcp-gateway/fanout_jwt"
 
 
 class FanoutJwt:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -211,18 +212,20 @@ class Hub:
         # we fall back to no token — works fine for fanouts that don't
         # need one (BaoBackedBearer-only HTTP federations).
         boot_bearer: str | None = None
-        from pathlib import Path as _P
-        for candidate in ("/etc/mcp-pape-house/fanout_jwt",):
-            p = _P(candidate)
-            if p.exists():  # noqa: ASYNC240 — one-shot boot read; sync is fine
-                with contextlib.suppress(OSError):
-                    boot_bearer = p.read_text().strip() or None  # noqa: ASYNC240
-                if boot_bearer:
-                    logger.info(
-                        "registering tools with boot-time bearer from %s (len=%d)",
-                        candidate, len(boot_bearer),
-                    )
-                    break
+        # fanout_jwt lives alongside policy.yaml in the config dir; derive it
+        # from MCP_HUB_CONFIG so it follows the deployment's path layout.
+        jwt_path = (
+            Path(os.environ.get("MCP_HUB_CONFIG", "/etc/mcp-gateway/policy.yaml")).parent
+            / "fanout_jwt"
+        )
+        if jwt_path.exists():
+            with contextlib.suppress(OSError):
+                boot_bearer = jwt_path.read_text().strip() or None
+            if boot_bearer:
+                logger.info(
+                    "registering tools with boot-time bearer from %s (len=%d)",
+                    jwt_path, len(boot_bearer),
+                )
         boot_request_context: dict[str, Any] = {}
         if boot_bearer is not None:
             boot_request_context[CTX_KEY_BEARER_TOKEN] = boot_bearer

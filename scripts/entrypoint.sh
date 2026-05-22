@@ -12,10 +12,10 @@
 
 set -eu
 
-POLICY_PATH="${MCP_HUB_CONFIG:-/etc/mcp-pape-house/policy.yaml}"
+POLICY_PATH="${MCP_HUB_CONFIG:-/etc/mcp-gateway/policy.yaml}"
 RUNTIME_DIR="${MCP_HUB_RUNTIME_DIR:-/run/mcp-tokens}"
 # fanout_jwt is now refresher-managed: written by the hub at startup
-# (see mcp_hub.refresher) into the bind-mounted /etc/mcp-pape-house/
+# (see mcp_hub.refresher) into the bind-mounted /etc/mcp-gateway/
 # directory. We don't sanity-check its existence at entrypoint time
 # anymore — the refresher creates it during the initial mint.
 FANOUT_CLIENT_SECRET="/run/secrets/fanout_client_secret"
