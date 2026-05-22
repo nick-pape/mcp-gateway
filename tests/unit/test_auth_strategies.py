@@ -13,6 +13,7 @@ from mcp_hub.auth_strategies import (
     BaoBackedBearer,
     JwtPassthrough,
     NoneStrategy,
+    SecretBearer,
 )
 from mcp_hub.interfaces import (
     ResolvedSecret,
@@ -33,15 +34,18 @@ class _FakeBackend:
     def __init__(self) -> None:
         self.values: dict[tuple[str, str, str], str] = {}
         self.calls: list[tuple[str, str, str]] = []
+        # Per-call as-agent JWT (None for the deputy path). Parallel to calls.
+        self.jwts: list[str | None] = []
         self.fail_with: Exception | None = None
 
     def seed(self, *, mcp: str, identity: str, path: str, value: str) -> None:
         self.values[(mcp, identity, path)] = value
 
     async def resolve(
-        self, *, mcp: str, identity: str, ref: SecretRef
+        self, *, mcp: str, identity: str, ref: SecretRef, jwt: str | None = None
     ) -> ResolvedSecret:
         self.calls.append((mcp, identity, ref.path))
+        self.jwts.append(jwt)
         if self.fail_with is not None:
             raise self.fail_with
         key = (mcp, identity, ref.path)
@@ -246,6 +250,96 @@ async def test_bao_backed_bearer_close_is_noop() -> None:
     )
     headers = await strategy.auth_header(identity="x", request_context={})
     assert headers == {"Authorization": "Bearer v"}
+
+
+# ---------------------------------------------------------------------------
+# SecretBearer — as-agent (per-identity autonomous vs delegated)
+# ---------------------------------------------------------------------------
+
+
+def test_secret_bearer_boot_capable_defaults_true() -> None:
+    strategy = SecretBearer(
+        secret_backend=_FakeBackend(),
+        mcp_name="outline",
+        path_template="services/outline/{identity}",
+        field="api_token",
+    )
+    assert strategy.boot_capable is True
+
+
+def test_secret_bearer_boot_capable_false_when_all_as_agent() -> None:
+    strategy = SecretBearer(
+        secret_backend=_FakeBackend(),
+        mcp_name="outline",
+        path_template="services/outline/{identity}",
+        field="api_token",
+        as_agent_identities=frozenset({"alfred"}),
+        boot_capable=False,
+    )
+    assert strategy.boot_capable is False
+
+
+async def test_secret_bearer_as_agent_forwards_inbound_jwt() -> None:
+    backend = _FakeBackend()
+    backend.seed(
+        mcp="outline",
+        identity="alfred",
+        path="services/outline/alfred",
+        value="alfred-tok",
+    )
+    strategy = SecretBearer(
+        secret_backend=backend,
+        mcp_name="outline",
+        path_template="services/outline/{identity}",
+        field="api_token",
+        as_agent_identities=frozenset({"alfred"}),
+    )
+    headers = await strategy.auth_header(
+        identity="alfred",
+        request_context={CTX_KEY_BEARER_TOKEN: "alfred-inbound-jwt"},
+    )
+    assert headers == {"Authorization": "Bearer alfred-tok"}
+    # The agent's inbound JWT was forwarded to the backend (as-agent login).
+    assert backend.jwts == ["alfred-inbound-jwt"]
+
+
+async def test_secret_bearer_delegated_identity_passes_no_jwt() -> None:
+    backend = _FakeBackend()
+    backend.seed(
+        mcp="outline",
+        identity="interactive",
+        path="services/outline/interactive",
+        value="human-tok",
+    )
+    # `interactive` is NOT in the as-agent set → deputy path, even though an
+    # inbound JWT is present in the request context.
+    strategy = SecretBearer(
+        secret_backend=backend,
+        mcp_name="outline",
+        path_template="services/outline/{identity}",
+        field="api_token",
+        as_agent_identities=frozenset({"alfred"}),
+    )
+    headers = await strategy.auth_header(
+        identity="interactive",
+        request_context={CTX_KEY_BEARER_TOKEN: "human-inbound-jwt"},
+    )
+    assert headers == {"Authorization": "Bearer human-tok"}
+    # Deputy path: backend resolves with jwt=None (hub's own credentials).
+    assert backend.jwts == [None]
+
+
+async def test_secret_bearer_as_agent_missing_jwt_raises() -> None:
+    backend = _FakeBackend()
+    strategy = SecretBearer(
+        secret_backend=backend,
+        mcp_name="outline",
+        path_template="services/outline/{identity}",
+        field="api_token",
+        as_agent_identities=frozenset({"alfred"}),
+    )
+    with pytest.raises(ValueError, match="inbound JWT is required"):
+        await strategy.auth_header(identity="alfred", request_context={})
 
 
 # ---------------------------------------------------------------------------

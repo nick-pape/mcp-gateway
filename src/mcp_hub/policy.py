@@ -138,8 +138,15 @@ class AuthStrategyConfig(BaseModel):
 
     - ``secret_bearer`` (alias: ``bao_backed_bearer``) — config:
       ``path_template`` (str, required; e.g. ``"services/outline/{identity}"``),
-      ``field`` (str, default ``"api_token"``), ``cache_ttl_s`` (float, default 30).
-      Resolves a per-identity secret from the configured ``secret_backend``.
+      ``field`` (str, default ``"api_token"``), ``cache_ttl_s`` (float, default 30),
+      ``as_agent`` (bool, default False). Resolves a per-identity secret from the
+      configured ``secret_backend``. When ``as_agent`` is True, autonomous
+      identities (``kind: autonomous``) authenticate to the secret store using
+      their *own* inbound JWT (e.g. a bao role bound to ``aud=mcp-<identity>``)
+      instead of the hub's deputy credentials — closing the confused-deputy gap
+      so the store audits the agent. The injected downstream Bearer is still the
+      per-agent token at ``path_template``; only the store-side auth principal
+      changes. Delegated identities on the same MCP stay deputy.
     - ``jwt_passthrough`` — config: empty.
     - ``fanout_jwt`` — config: ``path`` (str, optional; default
       ``/etc/mcp-gateway/fanout_jwt``). Forwards the hub's own
@@ -360,6 +367,14 @@ class IdentityPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
     aud: str
     uid_base: int
+    # Identity CLASS — the delegated-vs-autonomous distinction:
+    #   - "delegated": a human driving a tool (interactive, claude-code-dev).
+    #     Reads secrets via the hub's deputy credentials downstream.
+    #   - "autonomous": an agent acting on its own. On MCPs that opt in
+    #     (auth.config.as_agent: true), authenticates to the secret store AS
+    #     ITSELF using its inbound JWT, and gets its own per-agent token.
+    # Defaults to delegated so existing identities keep current behavior.
+    kind: Literal["delegated", "autonomous"] = "delegated"
     allowed_tools: list[str] = Field(min_length=1)
     hitl: HITLPolicy = Field(default_factory=HITLPolicy)
     secrets: dict[str, SecretRefModel]

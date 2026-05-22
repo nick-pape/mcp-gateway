@@ -67,6 +67,7 @@ class BaoSecretBackend:
         mcp: str,
         identity: str,
         ref: SecretRef,
+        jwt: str | None = None,
     ) -> ResolvedSecret:
         role = self._role_template.format(mcp=mcp, identity=identity)
         try:
@@ -74,7 +75,11 @@ class BaoSecretBackend:
                 assert self._static_token is not None  # guaranteed by __init__
                 token = self._static_token
             else:
-                token = await self._bao.jwt_login(role=role)
+                # jwt=None → BaoClient reads the hub's fanout_jwt from disk
+                # (deputy path, used at boot / stdio+container spawn).
+                # jwt=<agent JWT> → bao authenticates the agent itself
+                # against the role (which must bind aud=mcp-<identity>).
+                token = await self._bao.jwt_login(role=role, jwt=jwt)
             data = await self._bao.kv_read(token=token, path=ref.path)
         except BaoError as exc:
             raise SecretResolutionError(

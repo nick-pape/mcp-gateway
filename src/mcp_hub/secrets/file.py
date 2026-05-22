@@ -71,7 +71,10 @@ class FileSecretBackend:
         mcp: str,
         identity: str,
         ref: SecretRef,
+        jwt: str | None = None,
     ) -> ResolvedSecret:
+        # file backend has no per-caller auth; the as-agent ``jwt`` is ignored.
+        del jwt
         entry = self._data.get(ref.path)
         if not isinstance(entry, dict) or ref.field not in entry:
             raise SecretResolutionError(

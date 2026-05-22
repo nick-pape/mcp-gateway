@@ -218,11 +218,18 @@ def build_auth_strategy(
     mcp_name: str,
     config: AuthStrategyConfig,
     secret_backend: SecretBackend,
+    mcp_identities: frozenset[str] = frozenset(),
+    autonomous_identities: frozenset[str] = frozenset(),
 ) -> AuthStrategy:
     """Construct an :class:`AuthStrategy` from a policy config block.
 
     Dispatches on ``config.type``. Adding a new strategy: extend this
     function and document the new ``type`` in ``policy.example.yaml``.
+
+    ``mcp_identities`` is the full set of identities registered with this MCP;
+    ``autonomous_identities`` is the subset whose policy ``kind`` is
+    ``autonomous``. For ``secret_bearer`` with ``as_agent: true`` these drive
+    the per-identity as-agent behavior + the boot-capability flag.
     """
     cfg = config.config
     if config.type in ("secret_bearer", "bao_backed_bearer"):
@@ -243,12 +250,26 @@ def build_auth_strategy(
             raise ValueError(
                 f"mcps.{mcp_name}.auth.config.cache_ttl_s must be a number"
             ) from exc
+        as_agent = cfg.get("as_agent", False)
+        if not isinstance(as_agent, bool):
+            raise ValueError(
+                f"mcps.{mcp_name}.auth.config.as_agent must be a boolean"
+            )
+        # as-agent fires per-identity: only autonomous-kind identities, and
+        # only when this MCP opts in. Delegated identities stay deputy.
+        as_agent_identities = autonomous_identities if as_agent else frozenset()
+        # Boot can run the deputy handshake unless EVERY identity is as-agent.
+        boot_capable = not (
+            bool(as_agent_identities) and as_agent_identities >= mcp_identities
+        )
         return SecretBearer(
             secret_backend=secret_backend,
             mcp_name=mcp_name,
             path_template=path_template,
             field=field,
             cache_ttl_s=cache_ttl_s,
+            as_agent_identities=as_agent_identities,
+            boot_capable=boot_capable,
         )
     if config.type == "jwt_passthrough":
         if cfg:
@@ -384,16 +405,27 @@ def build_fanout(
                 f"allowed_tools globs cover it (no glob with prefix "
                 f"{mcp_name!r} or '*')"
             )
+        autonomous = frozenset(
+            n for n in http_identities if identities[n].kind == "autonomous"
+        )
         strategy = build_auth_strategy(
             mcp_name=mcp_name,
             config=mcp_config.auth,
             secret_backend=secret_backend,
+            mcp_identities=frozenset(http_identities),
+            autonomous_identities=autonomous,
         )
+        # Order delegated-first so HttpFanout's boot identity (identities[0])
+        # can run the deputy boot handshake whenever a delegated identity
+        # exists (as-agent identities can't authenticate at boot).
+        ordered_identities = [
+            n for n in http_identities if n not in autonomous
+        ] + [n for n in http_identities if n in autonomous]
         return HttpFanout(
             mcp_name=mcp_name,
             url=mcp_config.url,
             auth_strategy=strategy,
-            identities=http_identities,
+            identities=ordered_identities,
             http_client=http_client,
         )
 
@@ -418,10 +450,15 @@ def build_fanout(
             f"allowed_tools globs cover it (no glob with prefix "
             f"{mcp_name!r} or '*')"
         )
+    container_autonomous = frozenset(
+        n for n in container_identities if identities[n].kind == "autonomous"
+    )
     container_strategy = build_auth_strategy(
         mcp_name=mcp_name,
         config=mcp_config.auth,
         secret_backend=secret_backend,
+        mcp_identities=frozenset(container_identities),
+        autonomous_identities=container_autonomous,
     )
     if auth_config.oidc_discovery_url is None:
         raise ValueError(

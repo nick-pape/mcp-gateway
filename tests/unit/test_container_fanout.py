@@ -69,7 +69,9 @@ class _StubSecretBackend:
         mcp: str,
         identity: str,
         ref: SecretRef,
+        jwt: str | None = None,
     ) -> ResolvedSecret:
+        del jwt
         key = (mcp, identity, ref.path, ref.field)
         self.resolutions.append(key)
         if key in self.fail_for:

@@ -7,8 +7,11 @@ Reads ``policy.yaml`` and configures bao:
 2. Configures it against the Authentik OIDC discovery URL from policy
 3. Creates one **policy** per ``(mcp, identity)`` granting read on the
    identity's secret path
-4. Creates one **JWT role** per ``(mcp, identity)`` bound to the
-   ``mcp-fanout-svc`` subject and the new policy
+4. Creates one **JWT role** per ``(mcp, identity)`` bound to the new policy.
+   The role's bound audience is the hub's ``mcp-fanout-svc`` (deputy) by
+   default; for an **autonomous** identity on an MCP that opts into as-agent
+   (``auth.config.as_agent: true``) the role instead binds the agent's own
+   audience (``aud: mcp-<identity>``) so bao authenticates the agent itself
 5. If ``approver.name == ntfy``, creates an HITL policy + role granting
    read/write/delete on ``hitl/pending/*`` (the transient KV the
    NtfyApprover uses for ack-token storage)
@@ -180,11 +183,33 @@ def bootstrap(policy_path: Path, addr: str, token: str) -> int:
 
         print("[2] Per-(mcp, identity) policies + roles")
         identities: dict[str, Any] = raw.get("identities", {})
+        mcps: dict[str, Any] = raw.get("mcps", {})
         for identity_name, identity in identities.items():
+            is_autonomous = identity.get("kind") == "autonomous"
             for mcp_name, secret in identity.get("secrets", {}).items():
                 role_name = f"mcp-{mcp_name}-{identity_name}"
                 upsert_policy(c, role_name, secret_read_policy(secret["path"]))
-                upsert_jwt_role(c, role_name, policies=[role_name])
+                # as-agent: an autonomous identity on an MCP that opts in
+                # (auth.config.as_agent: true) authenticates to bao AS ITSELF,
+                # so the role must accept the agent's own audience. Everyone
+                # else (delegated humans, non-as_agent MCPs) stays deputy and
+                # the role accepts the hub's fanout-svc audience.
+                mcp_as_agent = bool(
+                    mcps.get(mcp_name, {})
+                    .get("auth", {})
+                    .get("config", {})
+                    .get("as_agent", False)
+                )
+                if is_autonomous and mcp_as_agent:
+                    agent_aud = identity.get("aud", f"mcp-{identity_name}")
+                    upsert_jwt_role(
+                        c,
+                        role_name,
+                        policies=[role_name],
+                        bound_audiences=[agent_aud],
+                    )
+                else:
+                    upsert_jwt_role(c, role_name, policies=[role_name])
 
         print("[3] HITL transient store")
         if raw.get("approver", {}).get("name") == "ntfy":
