@@ -12,30 +12,33 @@ deployment differs, one of these will probably bite you.
 
 ## Architectural / adoption-blockers
 
-### 1. Credential injection has exactly one shape
+### 1. stdio credential injection has one shape
 
-The `Fanout._spawn` flow writes a per-identity token file at a path the
-upstream MCP reads via an env var (`secret_env_name` in `MCPConfig`).
-That's *one* of many shapes upstream MCPs actually need:
+The HTTP and container transports now cover the network-credential shapes
+(bearer header injection, OAuth pass-through). The remaining gap is the
+**stdio** path: `Fanout._spawn` writes a per-identity token file at a path the
+upstream MCP reads via an env var (`secret_env_name` in `MCPConfig`). That's
+*one* of many shapes a spawned MCP can need:
 
-- ✅ File path via env var (us; `technitium-mcp-secure`)
-- ❌ Env var with the literal token value (`TOKEN=xxx ./mcp-server`)
-- ❌ CLI flag (`--token=xxx` or `--api-key xxx`)
+- ✅ File path via env var (stdio; `technitium-mcp-secure`)
+- ✅ HTTP `Authorization: Bearer xxx` header injection — done for the **http**
+  transport via `auth.type: secret_bearer` (per-identity token from the secret
+  backend)
+- ✅ "Upstream MCP does its own OAuth flow" — done via `auth.type:
+  jwt_passthrough` (forward the caller's JWT; with `as_agent`, the agent proves
+  its own identity to the secret backend)
+- ❌ Env var with the literal token value (`TOKEN=xxx ./mcp-server`) — stdio
+- ❌ CLI flag (`--token=xxx` or `--api-key xxx`) — stdio
 - ❌ Config file written at a known path in a specific format
-  (JSON / YAML / TOML / INI)
-- ❌ HTTP `Authorization: Bearer xxx` header injection (for the
-  upcoming HTTP-transport upstream MCPs)
-- ❌ "Upstream MCP does its own OAuth flow" — should NOT inject
-  anything, and should NOT spawn the MCP under our identity at all
+  (JSON / YAML / TOML / INI) — stdio
 
-Today: shipping a new MCP federation almost always means either forking
-the upstream MCP to accept our shape (the `technitium-mcp-secure`
-pattern) or writing a wrapper script. Both are friction.
+Today: a stdio MCP that wants a non-file shape still means forking the upstream
+to accept our shape (the `technitium-mcp-secure` pattern) or writing a wrapper.
 
-**Right shape:** a `TokenInjector` Protocol with the above as concrete
-implementations, declared per-MCP in `policy.yaml`. ~5 implementations
-covers ~80% of upstream MCPs. The remaining 20% can write a custom
-injector or fork.
+**Right shape:** a stdio `TokenInjector` Protocol with the remaining shapes as
+concrete implementations, declared per-MCP in `policy.yaml`. ~3 more
+implementations cover most spawned MCPs; the rest can write a custom injector
+or fork.
 
 ### 2. Layer 3 secrets never rotate
 
@@ -47,10 +50,10 @@ Three layers of credential lifetime:
 | 2 (ephemeral, memory) | bao token via JWT swap | Auto on bao TTL |
 | 3 (long-lived, in bao KV) | Technitium API token | **Never** |
 
-Layer 3 is the gap. The refresher framework exists (in `mcp_hub/refresher/`),
-but only ships an `AuthentikClientCredentialsSource` and `FileSink`. To
-refresh a Layer 3 secret like a Portainer self-rotated token, we'd need
-a `BaoKVSink` and a `PortainerSelfRotateSource`. Mostly unwritten.
+Layer 3 is the gap. The refresher framework exists (in `mcp_hub/refresher/`)
+and is plugin-pluggable, but only ships an `oidc_client_credentials` source and
+a `file` sink. To refresh a Layer 3 secret like a Portainer self-rotated token,
+we'd need a `BaoKVSink` and a `PortainerSelfRotateSource`. Mostly unwritten.
 
 We're loud about "no long-lived ambient creds" while quietly relying on
 sealed long-lived creds in bao. Honest: bao seal is a meaningful
@@ -58,14 +61,13 @@ mitigation, but rotation is the proper fix.
 
 ### 3. Stdio-only upstream MCPs
 
-`Fanout` assumes spawn-and-pipe. The MCP transport spec defines stdio
-*and* Streamable HTTP; many upstream MCPs ship HTTP-only (Home
-Assistant's built-in MCP server, several vendor offerings).
-
-Need: an `UpstreamTransport` abstraction with `StdioTransport` (today)
-and `StreamableHTTPTransport` (TODO) implementations. The HTTP variant
-also needs the `TokenInjector#header` shape (#1) for `Authorization`
-header.
+**Resolved.** The fanout now supports three transports
+(`mcps.<name>.transport`): **stdio** (spawn-and-pipe, `Fanout`), **http**
+(`HttpFanout`, for HTTP-transport upstreams like Home Assistant's MCP server),
+and **container** (`ContainerFanout`, opt-in). The http transport carries the
+`Authorization` header via `auth.type: secret_bearer` / `jwt_passthrough`
+(closing the #1 header shape for the network path). See `architecture.md`
+"Transports."
 
 ### 4. No upstream MCP failure recovery
 
@@ -80,21 +82,26 @@ respawn with bounded backoff; on persistent failure (N retries),
 suspend the child + remove its tools from `tools/list` until manual
 intervention.
 
-### 5. Authentik-coupled in non-obvious places
+### 5. Some Authentik-flavored remnants
 
-The architecture pretends to be IdP-agnostic but bakes in Authentik
-quirks:
+**Mostly resolved.** Inbound auth is now IdP-agnostic: `OidcJwtValidator`
+(renamed from `AuthentikJWTValidator`) discovers JWKS from the issuer's
+`/.well-known/openid-configuration`, resolves identity from the `aud` suffix
+**or** a configurable `identity_claim` (`sub`/`azp`/`client_id`), and there are
+two non-OIDC modes (`static_token`, `trusted_proxy`) for deployments with no
+IdP. Keycloak/Okta/Cognito should validate without code changes.
 
-- `issuer_mode=global` (Authentik's choice, not OIDC standard)
-- The Authentik bug-#16621 workaround (refresh `client_credentials`
-  JWTs every 10 min because `access_token_validity` PATCHes
-  silently no-op since 2025.6)
-- Per-app discovery URL pattern (`/application/o/<slug>/`)
-- Authentik's specific PKCE redirect URI matching modes
+What's still Authentik-flavored:
 
-`AuthentikJWTValidator` is the right Protocol shape but the only
-concrete impl. Keycloak, Okta, Cognito each have their own oddities.
-The second-IdP user will hit this immediately.
+- The **bug-#16621 workaround** — Authentik silently caps
+  `access_token_validity`, so the bao deployment refreshes its
+  `client_credentials` JWT every ~10 min. Other IdPs can refresh on the real
+  token lifetime; the `rotate_every` is just configured conservatively.
+- The **DCR shim** (#6) — `/oauth/register` is a static stub tied to the
+  Authentik "interactive" client pattern; not real Dynamic Client Registration.
+
+These are deployment/refresh details, not validation coupling. The second-IdP
+user hits the refresh cadence and the DCR shim, not the validator.
 
 ### 6. No real Dynamic Client Registration
 
@@ -198,23 +205,20 @@ the no-oracle property.
 
 Unit tests are good (`tests/unit/test_*.py` covers protocols,
 middleware, refresher, approver in isolation with fakes). End-to-end
-tests don't exist — the full Authentik → bao → fanout → upstream MCP
+tests don't exist — the full IdP → secret backend → fanout → upstream MCP
 chain is verified manually via curl + actual deploy.
 
 CI runs unit tests; regressions in the integration boundary (e.g., a
-bao client API change, an Authentik discovery doc field rename) won't
+secret-backend client API change, an OIDC discovery doc field rename) won't
 catch them. Manual smoke after each deploy is the current safety net.
 
 ### 14. Build-time `git clone` of upstream MCPs
 
-The Dockerfile clones `technitium-mcp-secure` from GitHub at build
-time, builds it from source, and bakes the binary into the image.
-Fragile: if the upstream repo is renamed/deleted, builds break;
-network at build time is required; no enforced version pinning.
-
-Should at least pin to a commit SHA via `--build-arg`, ideally vendor
-the upstream into the repo as a submodule, ideally-ideally pull
-pre-built binaries from a release artifact.
+**Resolved / moot for this repo.** The published image is generic and bakes
+**no** MCP servers — the `Dockerfile` is a two-stage hub-only build (no Node, no
+`git clone`). Deployments that bake in stdio MCPs do so in their own thin
+`FROM ghcr.io/nick-pape/mcp-gateway` overlay, where pinning the upstream is the
+overlay's concern. http/container MCPs need nothing baked at all.
 
 ---
 
