@@ -153,7 +153,11 @@ async def _async_main() -> int:
     #   except echoing redirect_uris back
 
     INTERACTIVE_CLIENT_ID = "mcp-interactive"
-    AUTHENTIK_BASE = "https://auth.pape.house"
+    # OAuth-proxy shim's upstream IdP base for the authorize/token/userinfo
+    # endpoints. Derived from the issuer so no fixed IdP URL is baked into the
+    # generic image. Assumes Authentik global-issuer mode (iss == the IdP base);
+    # in per-app issuer mode set auth.issuer to the IdP base.
+    AUTHENTIK_BASE = auth.issuer.rstrip("/")
 
     def _public_base(request: Request) -> str:
         scheme = request.headers.get("x-forwarded-proto", request.url.scheme)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idempotent bao bootstrap for mcp.pape.house.
+"""Idempotent bao bootstrap for mcp.example.com.
 
 Reads ``policy.yaml`` and configures bao:
 
@@ -17,9 +17,9 @@ Re-run is safe — bao's KV/policy/role endpoints are upsert.
 
 Usage::
 
-    BAO_ADDR=https://secrets.pape.house \\
+    BAO_ADDR=https://secrets.example.com \\
     BAO_TOKEN=<admin-token> \\
-    uv run python scripts/bootstrap_bao.py /etc/mcp-pape-house/policy.yaml
+    uv run python scripts/bootstrap_bao.py /etc/mcp-gateway/policy.yaml
 
 The admin token must have policy + auth-method capabilities. This is
 explicitly a one-time / occasional bootstrap; do not bake the admin
@@ -77,7 +77,7 @@ def configure_jwt_auth(
     """Point bao's JWT auth method at Authentik.
 
     Authentik with ``issuer_mode=global`` publishes the same ``iss``
-    claim across all providers (e.g., ``https://auth.pape.house/``) but
+    claim across all providers (e.g., ``https://auth.example.com/``) but
     discovery is still per-application. So we configure bao with:
 
     - ``oidc_discovery_url`` (per-app) — if given; bao uses this to

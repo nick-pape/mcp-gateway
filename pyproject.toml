@@ -1,10 +1,19 @@
 [project]
-name = "mcp-pape-house"
-version = "0.0.0"
-description = "Homelab MCP gateway: single container, in-process Fanout, Authentik OIDC, ntfy HITL, bao-injected per-identity secrets"
+name = "mcp-gateway"
+version = "0.1.0"
+description = "Multi-tenant MCP gateway: pluggable secrets/auth/approvals, per-identity isolation, HITL approvals, and audit."
 requires-python = ">=3.13"
 license = { text = "MIT" }
 authors = [{ name = "Nick Pape" }]
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "gateway", "oidc", "hitl", "ai-agents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Security",
+]
 
 # Production deps. Pin tightly; bump deliberately.
 dependencies = [
@@ -33,6 +42,11 @@ dependencies = [
     # asyncio.to_thread (see src/mcp_fanout/container_fanout.py).
     "docker>=7,<8",
 ]
+
+[project.urls]
+Homepage = "https://github.com/nick-pape/mcp-gateway"
+Repository = "https://github.com/nick-pape/mcp-gateway"
+Issues = "https://github.com/nick-pape/mcp-gateway/issues"
 
 [project.scripts]
 mcp-hub = "mcp_hub.__main__:main"

@@ -98,7 +98,7 @@ class Hub:
         # FastMCP app — middleware installed at __init__ so tests can drive
         # it before start() is called.
         self.mcp = FastMCP(
-            name="mcp.pape.house",
+            name="mcp-gateway",
             instructions="Multi-tenant MCP gateway. JWT auth required.",
         )
         self._install_middleware()

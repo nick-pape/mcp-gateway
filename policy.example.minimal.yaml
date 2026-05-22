@@ -1,0 +1,56 @@
+# mcp-gateway — minimal policy (no external infra for secrets or HITL)
+#
+# Secrets come from a local file (no Vault), approvals auto-approve (no ntfy),
+# and there's no token refresher. Drop this at /etc/mcp-gateway/policy.yaml.
+#
+# NOTE: inbound auth still needs an OIDC issuer today (any provider that exposes
+# a JWKS endpoint). A non-OIDC static-token mode is on the roadmap (issue #7).
+
+version: 1
+
+server:
+  bind: "0.0.0.0:8443"
+
+auth:
+  # Point these at your OIDC provider (Keycloak, Authentik, Auth0, Zitadel, ...).
+  issuer: https://auth.example.com/
+  jwks_uri: https://auth.example.com/.well-known/jwks.json
+  audience_prefix: "mcp-"        # aud must start with this; the suffix is the identity
+  algorithms: ["RS256"]
+
+# File-backed secrets — no external store. Pair with SOPS/age by pointing this
+# at a file your deploy decrypts at boot. Format: { "<path>": { "<field>": "<value>" } }
+secret_backend:
+  name: file
+  config:
+    path: /etc/mcp-gateway/secrets.yaml
+
+# Auto-approve everything (no human gate). Use `ntfy` (or a custom approver)
+# for real HITL.
+approver:
+  name: auto
+
+audit:
+  sink: stderr
+
+# One example stdio MCP. The hub spawns it per identity; its secret is read
+# from the file backend at path `services/example/<identity>` field `api_token`
+# and injected as the file named by EXAMPLE_TOKEN_FILE.
+mcps:
+  example:
+    command: ["python", "-m", "example_mcp"]
+    secret_env_name: EXAMPLE_TOKEN_FILE
+    uid_offset: 10
+
+identities:
+  agent:
+    aud: mcp-agent
+    uid_base: 1001
+    allowed_tools:
+      - "example_*"
+    hitl:
+      defaults: auto-approve
+    secrets:
+      example:
+        path: services/example/agent
+        field: api_token

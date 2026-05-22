@@ -1,6 +1,6 @@
-# mcp.pape.house — example policy
+# mcp.example.com — example policy
 #
-# Drop a real version of this at /etc/mcp-pape-house/policy.yaml on the
+# Drop a real version of this at /etc/mcp-gateway/policy.yaml on the
 # deploy host. Source of truth is git; the hub watches the file but a
 # restart is required when adding/removing identities or MCPs.
 
@@ -12,17 +12,17 @@ server:
 
 auth:
   # Authentik global issuer. With issuer_mode=global on the providers,
-  # all JWTs carry iss=https://auth.pape.house/. The hub validates this
+  # all JWTs carry iss=https://auth.example.com/. The hub validates this
   # exact match.
-  issuer: https://auth.pape.house/
+  issuer: https://auth.example.com/
   # JWKS endpoint for hub-side signature verification. Authentik exposes
   # this per-application, but every app under the same signing key returns
   # the same JWKS. Pinning to one is fine. Pick mcp-fanout-svc since it
   # always exists in this stack.
-  jwks_uri: https://auth.pape.house/application/o/mcp-fanout-svc/jwks/
+  jwks_uri: https://auth.example.com/application/o/mcp-fanout-svc/jwks/
   # bao uses this to bootstrap its JWT auth method. Per-app even with
   # global issuer; bao reads issuer from discovery and matches JWTs to it.
-  oidc_discovery_url: https://auth.pape.house/application/o/mcp-fanout-svc/
+  oidc_discovery_url: https://auth.example.com/application/o/mcp-fanout-svc/
   audience_prefix: "mcp-"        # aud must start with this; suffix = identity
   algorithms: ["RS256"]
   clock_skew_s: 30
@@ -31,17 +31,17 @@ auth:
 secret_backend:
   name: bao
   config:
-    addr: https://secrets.pape.house
+    addr: https://secrets.example.com
     # Refresher OUTPUT path: the file at this path is rotated by
     # mcp_hub.refresher every ~10min (see token_refresh.fanout_jwt
     # below). bao login reads it freshly each time.
-    role_jwt_path: /etc/mcp-pape-house/fanout_jwt
+    role_jwt_path: /etc/mcp-gateway/fanout_jwt
     role_template: "mcp-{mcp}-{identity}"
 
 approver:
   name: ntfy
   config:
-    server: https://notify.pape.house
+    server: https://notify.example.com
     topic: mcp-hitl-approvals
     publish_token_path: /run/secrets/ntfy_publish_token
     timeout_default_s: 120
@@ -64,14 +64,14 @@ token_refresh:
     source:
       type: authentik_client_credentials
       config:
-        token_url: https://auth.pape.house/application/o/token/
+        token_url: https://auth.example.com/application/o/token/
         client_id: mcp-fanout-svc
         client_secret_path: /run/secrets/fanout_client_secret
         scope: "openid mcp-fanout-svc"
     sink:
       type: file
       config:
-        path: /etc/mcp-pape-house/fanout_jwt
+        path: /etc/mcp-gateway/fanout_jwt
         # Quote the mode — YAML 1.1 does not parse 0o400 as octal.
         mode: "0o400"
     rotate_every: minutes=10
