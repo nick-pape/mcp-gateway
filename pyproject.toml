@@ -121,13 +121,8 @@ ignore = [
     "E501",      # long lines in tests (fixtures, assertions) are acceptable
     "RUF043",    # regex in pytest.raises(match=...) is fine unescaped
 ]
-# Sidecars / templates / scripts have their own concerns; scope out the strict
-# lints that don't fit their patterns (servers bind 0.0.0.0; the heb example
-# execs; the wrapper bridge re-raises without `from`).
-"email-mcp-proxy/**" = ["E501", "S104"]
-"index-mcp/**" = ["S104"]
+# scripts/ are operational helpers; scope out a security lint that doesn't fit.
 "scripts/**" = ["S105"]
-"wrapper-image/**" = ["E501", "S104", "S606", "S607", "B008", "B904"]
 
 [tool.mypy]
 python_version = "3.13"
