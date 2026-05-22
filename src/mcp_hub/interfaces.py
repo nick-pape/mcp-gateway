@@ -74,8 +74,17 @@ class SecretBackend(Protocol):
         mcp: str,
         identity: str,
         ref: SecretRef,
+        jwt: str | None = None,
     ) -> ResolvedSecret:
         """Return the secret for the given (mcp, identity, ref).
+
+        ``jwt`` is the "as-agent" hook: when provided, the backend should
+        authenticate to its store using *that* token (the inbound agent's
+        JWT) rather than its own service identity, so the store
+        authenticates and audits the agent itself. Backends that don't
+        support per-caller auth (``env``, ``file``) ignore it. When ``None``
+        (boot path, stdio/container spawn), the backend uses its own
+        credentials.
 
         Raises :class:`SecretResolutionError` on any failure — including
         missing keys, network errors, and policy denials.

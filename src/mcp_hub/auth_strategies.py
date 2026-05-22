@@ -115,6 +115,28 @@ class SecretBearer:
     The cache stores the resolved value per identity for ``cache_ttl_s``
     seconds. A short TTL is critical: bao tokens DO rotate and we
     don't want stale caches surviving across rotations.
+
+    ``as_agent_identities`` controls *who authenticates to the secret store*
+    per caller — the set of identities that should authenticate AS THEMSELVES:
+
+    - identity NOT in the set (delegated / deputy): the backend uses the hub's
+      own credentials to read the secret. Works at boot because no inbound
+      request is needed.
+    - identity IN the set (autonomous, as-agent): the strategy pulls the
+      inbound agent JWT from ``request_context[CTX_KEY_BEARER_TOKEN]`` and
+      passes it to the backend, so the store authenticates and audits the
+      *agent* (e.g. a bao role bound to ``aud=mcp-<identity>``). The downstream
+      Bearer injected is still the per-agent token at ``path_template``;
+      as-agent only changes who proves identity to the store (closes the
+      confused-deputy gap).
+
+    This is per-identity (not per-MCP) because shared MCPs serve both delegated
+    humans (stay deputy) and autonomous agents (as-agent).
+
+    ``boot_capable`` is set by the factory: True when at least one of the MCP's
+    identities can produce a header at boot (a delegated identity). Only False
+    when EVERY identity is as-agent — then :class:`HttpFanout` skips the
+    authenticated boot handshake and does a no-auth reachability probe.
     """
 
     name: str = "secret_bearer"
@@ -127,6 +149,8 @@ class SecretBearer:
         path_template: str,
         field: str,
         cache_ttl_s: float = DEFAULT_BAO_CACHE_TTL_S,
+        as_agent_identities: frozenset[str] | None = None,
+        boot_capable: bool = True,
     ) -> None:
         if "{identity}" not in path_template:
             # Allow callers to use a fully-static path (shared upstream
@@ -144,9 +168,21 @@ class SecretBearer:
         self._path_template = path_template
         self._field = field
         self._cache_ttl_s = cache_ttl_s
+        self._as_agent_identities: frozenset[str] = frozenset(as_agent_identities or ())
+        self._boot_capable = boot_capable
         # identity -> (header_value, expires_at_monotonic)
         self._cache: dict[str, tuple[str, float]] = {}
         self._lock = asyncio.Lock()
+
+    @property
+    def boot_capable(self) -> bool:
+        """Whether this strategy can produce a header at boot (no inbound JWT).
+
+        False only when EVERY identity on this MCP is as-agent (no delegated
+        identity to run the deputy boot handshake). HttpFanout reads this to
+        decide whether to skip the authenticated boot handshake.
+        """
+        return self._boot_capable
 
     async def auth_header(
         self,
@@ -154,15 +190,26 @@ class SecretBearer:
         identity: str,
         request_context: dict[str, Any],
     ) -> dict[str, str]:
-        # request_context is unused for bao-backed strategy — secret
-        # lookup is keyed entirely by identity.
-        del request_context
-        bearer = await self._resolve(identity)
+        agent_jwt: str | None = None
+        if identity in self._as_agent_identities:
+            agent_jwt = request_context.get(CTX_KEY_BEARER_TOKEN)
+            if not isinstance(agent_jwt, str) or not agent_jwt:
+                raise ValueError(
+                    f"SecretBearer(as-agent, mcp={self._mcp_name!r}, "
+                    f"identity={identity!r}): request_context missing "
+                    f"{CTX_KEY_BEARER_TOKEN!r}; the agent's inbound JWT is "
+                    f"required to authenticate to the secret store as the agent. "
+                    f"Ensure IdentityMiddleware ran first."
+                )
+        # Delegated identities pass agent_jwt=None → backend uses the hub's own
+        # credentials (deputy). Autonomous identities forward their inbound JWT.
+        bearer = await self._resolve(identity, agent_jwt)
         return {"Authorization": f"Bearer {bearer}"}
 
-    async def _resolve(self, identity: str) -> str:
+    async def _resolve(self, identity: str, agent_jwt: str | None = None) -> str:
         now = time.monotonic()
-        # Fast path: serve cached without lock if fresh.
+        # Fast path: serve cached without lock if fresh. (A cache hit needs no
+        # agent_jwt — the resolved downstream token is per-identity.)
         cached = self._cache.get(identity)
         if cached is not None and cached[1] > now:
             return cached[0]
@@ -180,7 +227,7 @@ class SecretBearer:
             )
             try:
                 resolved = await self._backend.resolve(
-                    mcp=self._mcp_name, identity=identity, ref=ref
+                    mcp=self._mcp_name, identity=identity, ref=ref, jwt=agent_jwt
                 )
             except SecretResolutionError:
                 # Don't cache failures; let the next call retry.

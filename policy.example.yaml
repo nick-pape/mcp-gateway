@@ -105,6 +105,26 @@ mcps:
     auth:
       type: none
 
+  # ── HTTP MCP with per-identity bearer + as-agent ──
+  # An HTTP upstream that authenticates each caller with its own bearer token
+  # (resolved from the secret backend at services/outline/<identity>). With
+  # `as_agent: true`, AUTONOMOUS identities (kind: autonomous, below)
+  # authenticate to the secret store using their OWN inbound JWT — for the bao
+  # backend, a role bound to aud=mcp-<identity> — so the store audits the agent
+  # rather than the hub's deputy. Delegated identities on the same MCP stay
+  # deputy. The injected downstream bearer is the per-identity token either way;
+  # as_agent only changes who proves identity to the store (confused-deputy
+  # closure). Omit `as_agent` (default false) to keep everyone on the deputy.
+  outline:
+    transport: http
+    url: https://notes.example.com/mcp
+    auth:
+      type: secret_bearer
+      config:
+        path_template: services/outline/{identity}
+        field: api_token
+        as_agent: true
+
 identities:
   ironclaw:
     aud: mcp-ironclaw
@@ -166,9 +186,12 @@ identities:
   interactive:
     aud: mcp-interactive
     uid_base: 1004
+    # kind defaults to "delegated" — a human driving tools. On the `outline`
+    # MCP (as_agent: true) this identity stays on the deputy path.
     allowed_tools:
       - "technitium_*"
       - "paperless_*"
+      - "outline_*"
     hitl:
       defaults: push-approve
       overrides:
@@ -201,4 +224,30 @@ identities:
         field: api_token
       paperless:
         path: services/paperless/shared
+        field: api_token
+      outline:
+        path: services/outline/interactive
+        field: api_token
+
+  # Autonomous identity — a headless agent acting on its own, not a human at a
+  # keyboard. `kind: autonomous` opts it into as-agent on MCPs that enable it
+  # (see `outline` above): it authenticates to the secret store as itself and
+  # reads its own per-agent token, so e.g. Outline attributes its writes to the
+  # agent rather than the hub. The delegated `interactive` identity above
+  # shares the same outline MCP but stays on the deputy path.
+  assistant-agent:
+    aud: mcp-assistant-agent
+    uid_base: 1005
+    kind: autonomous
+    allowed_tools:
+      - "outline_*"
+    hitl:
+      defaults: push-approve
+      overrides:
+        "outline_*list*": auto-approve
+        "outline_*get*": auto-approve
+        "outline_search*": auto-approve
+    secrets:
+      outline:
+        path: services/outline/assistant-agent
         field: api_token

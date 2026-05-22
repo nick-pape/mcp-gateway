@@ -119,6 +119,60 @@ async def test_jwt_login_reads_jwt_freshly_each_call(
 
 
 # ---------------------------------------------------------------------------
+# JWT login — as-agent (explicit jwt= instead of the on-disk deputy file)
+# ---------------------------------------------------------------------------
+
+
+async def test_jwt_login_explicit_jwt_overrides_disk(jwt_file: Path) -> None:
+    """as-agent: an explicit jwt= is used; the on-disk (deputy) file is ignored."""
+    jwt_file.write_text("deputy-jwt")  # the hub's own JWT — NOT what bao accepts
+    fake = FakeBao(
+        expected_jwt="agent-jwt",
+        role_to_token={"mcp-outline-alfred": "tok-alfred"},
+    )
+    client = BaoClient(
+        addr=BAO_ADDR,
+        jwt_path=jwt_file,
+        http_client=httpx.AsyncClient(transport=fake.transport),
+    )
+    token = await client.jwt_login(role="mcp-outline-alfred", jwt="agent-jwt")
+    assert token == "tok-alfred"
+    await client.close()
+
+
+async def test_jwt_login_explicit_jwt_needs_no_jwt_path(fake: FakeBao) -> None:
+    """as-agent needs no configured jwt_path (there is no deputy file)."""
+    client = BaoClient(
+        addr=BAO_ADDR,
+        http_client=httpx.AsyncClient(transport=fake.transport),
+    )
+    token = await client.jwt_login(role="mcp-technitium-ironclaw", jwt="test-jwt")
+    assert token == "tok-technitium-ironclaw"
+    await client.close()
+
+
+async def test_jwt_login_empty_explicit_jwt_raises(fake: FakeBao) -> None:
+    client = BaoClient(
+        addr=BAO_ADDR,
+        http_client=httpx.AsyncClient(transport=fake.transport),
+    )
+    with pytest.raises(BaoError, match="explicit jwt argument is empty"):
+        await client.jwt_login(role="default-role", jwt="   ")
+    await client.close()
+
+
+async def test_jwt_login_no_jwt_and_no_path_raises(fake: FakeBao) -> None:
+    """Neither a configured jwt_path (deputy) nor an explicit jwt (as-agent)."""
+    client = BaoClient(
+        addr=BAO_ADDR,
+        http_client=httpx.AsyncClient(transport=fake.transport),
+    )
+    with pytest.raises(BaoError, match="requires a configured jwt_path"):
+        await client.jwt_login(role="default-role")
+    await client.close()
+
+
+# ---------------------------------------------------------------------------
 # KV v2 read
 # ---------------------------------------------------------------------------
 

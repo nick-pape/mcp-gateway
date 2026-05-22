@@ -153,6 +153,22 @@ class HttpFanout:
             )
             self._owns_client = True
 
+        # Strategies that authenticate as the inbound agent (SecretBearer with
+        # only as-agent identities) have no JWT at boot — there is no request.
+        # They report boot_capable=False; skip the authenticated handshake and
+        # do a no-auth reachability probe so DNS/TLS/host-down still fail fast,
+        # deferring real per-agent auth to the first call.
+        if not getattr(self._auth, "boot_capable", True):
+            await self._boot_probe_no_auth()
+            logger.info(
+                "HttpFanout(%s) started via no-auth reachability probe "
+                "(strategy %r is per-agent; auth deferred to first call)",
+                self._mcp_name,
+                self._auth.name,
+            )
+            self._started = True
+            return
+
         # Use the first identity for the boot-time handshake. If the
         # auth strategy is identity-specific (BaoBackedBearer) this
         # also implicitly verifies the boot identity's secret resolves;
@@ -216,6 +232,47 @@ class HttpFanout:
             self._negotiated_protocol_version,
         )
         self._started = True
+
+    async def _boot_probe_no_auth(self) -> None:
+        """Confirm the upstream is reachable without sending credentials.
+
+        Used for ``boot_capable=False`` strategies (per-agent auth) where no
+        inbound JWT exists at boot. Sends an ``initialize`` with no
+        ``Authorization`` header; ANY HTTP response (including 401/403 from an
+        auth-required upstream) proves reachability. Only a network/transport
+        error fails boot — preserving fail-fast on DNS/TLS/host-down while not
+        requiring credentials.
+        """
+        assert self._http is not None
+        probe = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "clientInfo": {"name": "mcp-fanout-http-probe", "version": "0.0.0"},
+            },
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        try:
+            response = await self._http.post(
+                self._url, json=probe, headers=headers, timeout=self._request_timeout_s
+            )
+        except httpx.HTTPError as exc:
+            await self.close()
+            raise HttpUpstreamFailed(
+                f"HttpFanout({self._mcp_name}): boot reachability probe to "
+                f"{self._url} failed: {exc}"
+            ) from exc
+        logger.info(
+            "HttpFanout(%s) boot probe: upstream reachable (HTTP %d)",
+            self._mcp_name,
+            response.status_code,
+        )
 
     async def call(
         self,

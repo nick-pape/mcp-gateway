@@ -16,6 +16,12 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - `TransientStore` for HITL pending state — `InMemoryTransientStore` (default,
   zero-infra) and `BaoTransientStore` (crash-safe); ntfy no longer requires Vault.
 - Bao backend `auth.method: token` (static Vault token) alongside `jwt`.
+- As-agent per-identity secret-store auth: an `IdentityPolicy.kind: autonomous`
+  identity on a `secret_bearer` MCP with `as_agent: true` authenticates to the
+  secret store with its *own* inbound JWT (closing the confused-deputy gap so
+  the store audits the agent), via a new optional `jwt=` hook on the
+  `SecretBackend.resolve()` Protocol. All-autonomous HTTP MCPs boot via a
+  no-auth reachability probe.
 - GitHub Actions CI (ruff + mypy --strict + pytest) and a generic image build
   published to `ghcr.io/nick-pape/mcp-gateway`.
 - gitleaks secret-scanning CI gate + pre-commit hook, with a custom rule for

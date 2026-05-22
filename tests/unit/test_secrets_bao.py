@@ -188,3 +188,34 @@ async def test_custom_role_template(jwt_file: Path) -> None:
     resolved = await backend.resolve(mcp="technitium", identity="ironclaw", ref=ref)
     assert resolved.value == "v"
     await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# as-agent: resolve(jwt=...) authenticates as the agent, not the deputy
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_as_agent_uses_explicit_jwt(jwt_file: Path) -> None:
+    """resolve(jwt=<agent JWT>) logs in as the agent; the deputy file is ignored.
+
+    bao here only accepts the agent's JWT (role bound to aud=mcp-alfred), so a
+    deputy login would 403 — proving the explicit jwt is threaded through.
+    """
+    jwt_file.write_text("deputy-jwt")  # the hub's own (deputy) JWT
+    fake = FakeBao(
+        expected_jwt="alfred-jwt",
+        role_to_token={"mcp-outline-alfred": "tok-alfred"},
+    )
+    bao = BaoClient(
+        addr=BAO_ADDR,
+        jwt_path=jwt_file,
+        http_client=httpx.AsyncClient(transport=fake.transport),
+    )
+    backend = BaoSecretBackend(bao_client=bao)
+    fake.seed("services/outline/alfred", {"api_token": "alfred-outline-key"})
+    ref = SecretRef(path="services/outline/alfred", field="api_token")
+    resolved = await backend.resolve(
+        mcp="outline", identity="alfred", ref=ref, jwt="alfred-jwt"
+    )
+    assert resolved.value == "alfred-outline-key"
+    await backend.close()

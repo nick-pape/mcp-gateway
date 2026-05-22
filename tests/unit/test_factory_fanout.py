@@ -13,7 +13,12 @@ from pathlib import Path
 import pytest
 
 from mcp_fanout import Fanout, HttpFanout
-from mcp_hub.auth_strategies import BaoBackedBearer, JwtPassthrough, NoneStrategy
+from mcp_hub.auth_strategies import (
+    BaoBackedBearer,
+    JwtPassthrough,
+    NoneStrategy,
+    SecretBearer,
+)
 from mcp_hub.factory import build_auth_strategy, build_fanout
 from mcp_hub.policy import AuthStrategyConfig, HubConfig, MCPConfig
 from mcp_hub.secrets.env import EnvSecretBackend
@@ -51,6 +56,78 @@ def test_build_auth_strategy_secret_bearer() -> None:
     )
     assert isinstance(strategy, BaoBackedBearer)  # alias for SecretBearer
     assert strategy.name == "secret_bearer"
+
+
+# ---------------------------------------------------------------------------
+# build_auth_strategy — as-agent derivation
+# ---------------------------------------------------------------------------
+
+
+def test_build_auth_strategy_as_agent_marks_autonomous_identities() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(
+        type="secret_bearer",
+        config={"path_template": "services/outline/{identity}", "as_agent": True},
+    )
+    strategy = build_auth_strategy(
+        mcp_name="outline",
+        config=cfg,
+        secret_backend=backend,
+        mcp_identities=frozenset({"interactive", "alfred"}),
+        autonomous_identities=frozenset({"alfred"}),
+    )
+    assert isinstance(strategy, SecretBearer)
+    # Only the autonomous identity authenticates as-agent.
+    assert strategy._as_agent_identities == frozenset({"alfred"})
+    # A delegated identity (interactive) exists → boot can run the deputy handshake.
+    assert strategy.boot_capable is True
+
+
+def test_build_auth_strategy_without_as_agent_marks_none() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(
+        type="secret_bearer",
+        config={"path_template": "services/outline/{identity}"},
+    )
+    strategy = build_auth_strategy(
+        mcp_name="outline",
+        config=cfg,
+        secret_backend=backend,
+        mcp_identities=frozenset({"interactive", "alfred"}),
+        autonomous_identities=frozenset({"alfred"}),
+    )
+    assert isinstance(strategy, SecretBearer)
+    # as_agent not set → nobody authenticates as-agent (all deputy).
+    assert strategy._as_agent_identities == frozenset()
+    assert strategy.boot_capable is True
+
+
+def test_build_auth_strategy_all_autonomous_not_boot_capable() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(
+        type="secret_bearer",
+        config={"path_template": "services/outline/{identity}", "as_agent": True},
+    )
+    strategy = build_auth_strategy(
+        mcp_name="outline",
+        config=cfg,
+        secret_backend=backend,
+        mcp_identities=frozenset({"alfred"}),
+        autonomous_identities=frozenset({"alfred"}),
+    )
+    assert isinstance(strategy, SecretBearer)
+    # Every identity is as-agent → no delegated identity to boot-handshake with.
+    assert strategy.boot_capable is False
+
+
+def test_build_auth_strategy_as_agent_must_be_bool() -> None:
+    backend = EnvSecretBackend()
+    cfg = AuthStrategyConfig(
+        type="secret_bearer",
+        config={"path_template": "services/outline/{identity}", "as_agent": "yes"},
+    )
+    with pytest.raises(ValueError, match="as_agent must be a boolean"):
+        build_auth_strategy(mcp_name="outline", config=cfg, secret_backend=backend)
 
 
 def test_build_auth_strategy_bao_backed_bearer_requires_path_template() -> None:

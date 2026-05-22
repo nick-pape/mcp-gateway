@@ -96,21 +96,35 @@ class BaoClient:
     # Auth
     # -----------------------------------------------------------------------
 
-    async def jwt_login(self, *, role: str) -> str:
-        """Exchange the configured JWT for an ephemeral bao token.
+    async def jwt_login(self, *, role: str, jwt: str | None = None) -> str:
+        """Exchange a JWT for an ephemeral bao token.
 
-        Reads the JWT fresh from disk on each call. This is intentional:
-        the file may rotate; the cost (one read of a tiny file) is
-        negligible compared to the HTTPS round-trip that follows.
+        When ``jwt`` is None (the default), reads the configured JWT fresh
+        from disk on each call — the hub's own ``fanout_jwt`` (the deputy /
+        delegated path). The file may rotate; the cost (one read of a tiny
+        file) is negligible compared to the HTTPS round-trip that follows.
+
+        When ``jwt`` is provided, that token is used directly: the
+        "as-agent" path, where the caller passes the inbound agent's JWT so
+        bao authenticates and audits the *agent* (a role bound to
+        ``aud=mcp-<agent>``) rather than the hub's deputy identity.
         """
-        if self._jwt_path is None:
-            raise BaoError("jwt_login requires a configured jwt_path")
-        try:
-            jwt = self._jwt_path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise BaoError(f"cannot read JWT at {self._jwt_path}: {exc}") from exc
-        if not jwt:
-            raise BaoError(f"JWT file at {self._jwt_path} is empty")
+        if jwt is None:
+            if self._jwt_path is None:
+                raise BaoError(
+                    "jwt_login requires a configured jwt_path (deputy path) "
+                    "or an explicit jwt (as-agent path)"
+                )
+            try:
+                jwt = self._jwt_path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise BaoError(f"cannot read JWT at {self._jwt_path}: {exc}") from exc
+            if not jwt:
+                raise BaoError(f"JWT file at {self._jwt_path} is empty")
+        else:
+            jwt = jwt.strip()
+            if not jwt:
+                raise BaoError("explicit jwt argument is empty")
 
         body = await self._post(
             "auth/jwt/login",

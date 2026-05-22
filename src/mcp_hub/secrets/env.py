@@ -49,7 +49,10 @@ class EnvSecretBackend:
         mcp: str,
         identity: str,
         ref: SecretRef,
+        jwt: str | None = None,
     ) -> ResolvedSecret:
+        # env backend has no per-caller auth; the as-agent ``jwt`` is ignored.
+        del jwt
         env = env_var_name(mcp, identity)
         value = os.environ.get(env)
         if value is None:

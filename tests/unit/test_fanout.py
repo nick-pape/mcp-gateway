@@ -314,7 +314,9 @@ class _FilePassthroughBackend:
         mcp: str,
         identity: str,
         ref: SecretRef,
+        jwt: str | None = None,
     ) -> ResolvedSecret:
+        del jwt
         import os
 
         env = f"{mcp}_{identity}".upper().replace("-", "_")
