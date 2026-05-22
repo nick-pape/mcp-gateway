@@ -1,22 +1,23 @@
-"""Authentik ``client_credentials`` :class:`TokenSource`.
+"""OIDC ``client_credentials`` :class:`TokenSource`.
 
-Mints a fresh OAuth2 access token from Authentik's token endpoint
-using the ``client_credentials`` grant. Reads the client secret from a
-file path on each mint so the secret can be rotated underneath us
-without a refresher restart (e.g., via docker-secret update).
+Mints a fresh OAuth2 access token from an OIDC provider's token endpoint using
+the RFC 6749 ``client_credentials`` grant — works with any standards-compliant
+IdP (Authentik, Keycloak, Auth0, Zitadel, ...). Reads the client secret from a
+file path on each mint so the secret can be rotated underneath us without a
+refresher restart (e.g. via docker-secret update).
 
-Authentik's ``access_token_validity`` is per-provider, but bug
-goauthentik/authentik#16621 (open through 2025.x) silently no-ops
-PATCHes to that field — the default 15-minute lifetime is effectively
-mandatory. This source exists to live with that bug: re-mint at 2/3 of
-the validity window.
+The minted ``access_token`` is expected to be a JWT; its ``exp`` claim drives the
+re-mint schedule (the orchestrator re-mints before expiry). Short token
+lifetimes are common — e.g. Authentik's ``access_token_validity`` is effectively
+pinned to ~15 min by bug goauthentik/authentik#16621 — so the refresher exists
+to keep a fresh token on disk regardless of how short the window is.
 
-The minted token is a real RS256 JWT with standard OIDC claims (``iss``,
-``aud``, ``sub``, ``exp``, ``jti``). bao's ``auth/jwt/login`` validates
-it against Authentik's JWKS without further config.
+Downstream validators (e.g. OpenBao's ``auth/jwt/login``) verify the token
+against the IdP's JWKS; this source does not verify signatures itself.
 
-Registered as the entry point ``authentik_client_credentials`` in
-group ``mcp_hub.token_sources`` (see ``pyproject.toml``).
+Registered under both ``oidc_client_credentials`` (canonical) and
+``authentik_client_credentials`` (back-compat alias) in group
+``mcp_hub.token_sources`` (see ``pyproject.toml``).
 """
 
 from __future__ import annotations
@@ -34,19 +35,19 @@ from ..protocols import Token, TokenMintError
 logger = logging.getLogger(__name__)
 
 
-# Authentik's documented response shape (RFC 6749 §5.1):
+# RFC 6749 §5.1 token response shape:
 #   {"access_token": "<jwt>", "token_type": "Bearer",
 #    "expires_in": 900, "id_token": "<jwt>", "scope": "..."}
-# We don't trust expires_in alone; the JWT's ``exp`` claim is what bao
-# (or any other JWT validator) actually enforces. Decoding without
-# verification is fine here — bao re-verifies on the receiving end and
-# we'd rather schedule against the real expiry than a body field.
+# We don't trust expires_in alone; the JWT's ``exp`` claim is what the
+# downstream validator actually enforces. Decoding without verification is fine
+# here — the receiver re-verifies — and we'd rather schedule against the real
+# expiry than a body field.
 
 
-class AuthentikClientCredentialsSource:
-    """Mint OAuth2 JWTs from Authentik via ``client_credentials``."""
+class OidcClientCredentialsSource:
+    """Mint OAuth2 JWTs from an OIDC token endpoint via ``client_credentials``."""
 
-    name = "authentik_client_credentials"
+    name = "oidc_client_credentials"
 
     def __init__(
         self,
@@ -108,7 +109,7 @@ class AuthentikClientCredentialsSource:
             ) from exc
 
         # 4xx is generally not transient (auth misconfig, wrong client_id,
-        # revoked secret); 5xx is transient (Authentik upstream issue).
+        # revoked secret); 5xx is transient (upstream IdP issue).
         if resp.status_code >= 500:
             raise TokenMintError(
                 f"POST {self._token_url} returned {resp.status_code}: "
@@ -162,10 +163,10 @@ class AuthentikClientCredentialsSource:
         expires_at = datetime.fromtimestamp(exp, tz=UTC)
         ttl = expires_at - datetime.now(UTC)
         if ttl.total_seconds() <= 0:
-            # Authentik issued an already-expired token. Means our clock
-            # is wildly skewed, or Authentik is misconfigured. Either
-            # way, bao will reject this immediately — fail loudly here
-            # rather than write a useless token to disk.
+            # The IdP issued an already-expired token — clock skew or a
+            # misconfigured provider. The downstream validator will reject it
+            # immediately, so fail loudly here rather than write a useless
+            # token to disk.
             raise TokenMintError(
                 f"access_token from {self._token_url} is already expired "
                 f"(exp={expires_at.isoformat()}, now={datetime.now(UTC).isoformat()}); "
@@ -173,7 +174,7 @@ class AuthentikClientCredentialsSource:
             )
 
         logger.info(
-            "minted Authentik token via %s (client_id=%s, ttl=%.0fs, "
+            "minted client-credentials token via %s (client_id=%s, ttl=%.0fs, "
             "exp=%s)",
             self._token_url,
             self._client_id,
@@ -187,4 +188,4 @@ class AuthentikClientCredentialsSource:
             await self._http.aclose()
 
 
-__all__ = ["AuthentikClientCredentialsSource"]
+__all__ = ["OidcClientCredentialsSource"]

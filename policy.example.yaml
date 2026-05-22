@@ -78,7 +78,9 @@ audit:
 token_refresh:
   fanout_jwt:
     source:
-      type: authentik_client_credentials
+      # `oidc_client_credentials` works with any OIDC IdP (RFC 6749). The old
+      # name `authentik_client_credentials` is still accepted (back-compat alias).
+      type: oidc_client_credentials
       config:
         token_url: https://auth.example.com/application/o/token/
         client_id: mcp-fanout-svc

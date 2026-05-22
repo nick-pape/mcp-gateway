@@ -1,4 +1,4 @@
-"""Tests for AuthentikClientCredentialsSource."""
+"""Tests for OidcClientCredentialsSource."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import jwt
 import pytest
 
 from mcp_hub.refresher import TokenMintError
-from mcp_hub.refresher.builtins.authentik import AuthentikClientCredentialsSource
+from mcp_hub.refresher.builtins.oidc import OidcClientCredentialsSource
 
 TOKEN_URL = "https://auth.example/application/o/token/"
 CLIENT_ID = "mcp-fanout-svc"
@@ -21,8 +21,9 @@ def _make_jwt(*, exp_in_s: int = 900) -> str:
     """Hand-roll an unsigned JWT with the required claims.
 
     The source decodes without signature verification (it doesn't have
-    Authentik's public key — bao does the real verification). So an
-    HS256 with a known secret is fine; we just need valid structure.
+    the IdP's public key — the downstream validator does the real
+    verification). So an HS256 with a known secret is fine; we just need
+    valid structure.
     """
     payload = {
         "iss": "https://auth.example/",
@@ -45,8 +46,8 @@ def _transport(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.Mock
     return httpx.MockTransport(handler)
 
 
-def _source(secret_path: Path, transport: httpx.MockTransport) -> AuthentikClientCredentialsSource:
-    return AuthentikClientCredentialsSource(
+def _source(secret_path: Path, transport: httpx.MockTransport) -> OidcClientCredentialsSource:
+    return OidcClientCredentialsSource(
         token_url=TOKEN_URL,
         client_id=CLIENT_ID,
         client_secret_path=secret_path,
@@ -95,7 +96,7 @@ async def test_mint_omits_scope_when_unset(secret_path: Path) -> None:
         captured.update(dict(httpx.QueryParams(request.content.decode())))
         return httpx.Response(200, json={"access_token": _make_jwt(), "token_type": "Bearer"})
 
-    src = AuthentikClientCredentialsSource(
+    src = OidcClientCredentialsSource(
         token_url=TOKEN_URL,
         client_id=CLIENT_ID,
         client_secret_path=secret_path,
@@ -206,7 +207,7 @@ async def test_already_expired_token_rejected(secret_path: Path) -> None:
 
 
 async def test_missing_secret_file_non_transient(tmp_path: Path) -> None:
-    src = AuthentikClientCredentialsSource(
+    src = OidcClientCredentialsSource(
         token_url=TOKEN_URL,
         client_id=CLIENT_ID,
         client_secret_path=tmp_path / "nope",
@@ -224,7 +225,7 @@ async def test_missing_secret_file_non_transient(tmp_path: Path) -> None:
 async def test_empty_secret_file_non_transient(tmp_path: Path) -> None:
     p = tmp_path / "empty"
     p.write_text("")
-    src = AuthentikClientCredentialsSource(
+    src = OidcClientCredentialsSource(
         token_url=TOKEN_URL,
         client_id=CLIENT_ID,
         client_secret_path=p,

@@ -655,9 +655,9 @@ _DURATION_UNITS = {"seconds", "minutes", "hours", "days", "weeks"}
 def parse_duration(s: str) -> timedelta:
     """Parse a ``"unit=N"`` duration string into a timedelta.
 
-    Examples: ``"seconds=30"``, ``"minutes=10"``, ``"days=1"``. Matches
-    the format Authentik uses for its own durations, which is the
-    convention the rest of this codebase follows.
+    Examples: ``"seconds=30"``, ``"minutes=10"``, ``"days=1"``. The ``unit=N``
+    form is the duration convention used across this codebase's config
+    (token_refresh ``rotate_every`` / ``safety_buffer`` / backoff).
     """
     if not isinstance(s, str) or "=" not in s:
         raise ValueError(
