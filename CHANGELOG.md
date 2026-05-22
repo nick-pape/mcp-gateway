@@ -37,6 +37,10 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   any OIDC IdP; `authentik_client_credentials` kept as a back-compat alias. Plus
   a CONTRIBUTING plugin-author guide (worked example) covering all four
   entry-point groups.
+- Unified config templating: `{identity}` and `{mcp}` placeholders now work
+  uniformly across secret paths, `path_template`, `secrets_to_env`,
+  `audience_template`, and `role_template` (stdio `secrets.path` gains
+  templating too).
 - GitHub Actions CI (ruff + mypy --strict + pytest) and a generic image build
   published to `ghcr.io/nick-pape/mcp-gateway`.
 - gitleaks secret-scanning CI gate + pre-commit hook, with a custom rule for
@@ -45,6 +49,8 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - LICENSE, SECURITY.md, CONTRIBUTING.md, CODE_OF_CONDUCT.md.
 
 ### Changed
+- `identity.secrets` is now optional — http/container-only identities no longer
+  need placeholder `secrets:` entries. (Schema stays `version: 1`; additive-only.)
 - Renamed the distribution package `mcp-pape-house` → `mcp-gateway`.
 - The HTTP auth strategy `bao_backed_bearer` is now `secret_bearer`
   (`bao_backed_bearer` kept as a back-compat alias).

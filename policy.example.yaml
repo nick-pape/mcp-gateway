@@ -52,6 +52,9 @@ secret_backend:
     # mcp_hub.refresher every ~10min (see token_refresh.fanout_jwt
     # below). bao login reads it freshly each time.
     role_jwt_path: /etc/mcp-gateway/fanout_jwt
+    # Placeholder model: {identity} and {mcp} are expanded wherever a path or
+    # template appears — identities.*.secrets.path, mcps.*.auth.config.path_template,
+    # mcps.*.secrets_to_env.*.path, audience_template, and this role_template.
     role_template: "mcp-{mcp}-{identity}"
 
 approver:

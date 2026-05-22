@@ -241,6 +241,12 @@ Either bump version on each breaking change (and document the
 migration path) or commit to "additive-only forever" and document
 which fields are required vs optional.
 
+**Resolved 2026-05-22 (#18):** committed to additive-only — `version` stays 1
+while changes are additive (new optional fields, new placeholders); a genuinely
+breaking change bumps it and the loader gates on it. Documented on
+`HubConfig.version`; placeholders (`{identity}`/`{mcp}`) are unified via
+`mcp_hub.templating`.
+
 ### 17. Documentation lives in scattered markdown files
 
 `README.md`, `architecture.md`, `landscape.md`, `CHANGELOG.md`, and

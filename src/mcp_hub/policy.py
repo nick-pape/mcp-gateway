@@ -452,7 +452,11 @@ class IdentityPolicy(BaseModel):
     kind: Literal["delegated", "autonomous"] = "delegated"
     allowed_tools: list[str] = Field(min_length=1)
     hitl: HITLPolicy = Field(default_factory=HITLPolicy)
-    secrets: dict[str, SecretRefModel]
+    # Per-MCP secret refs resolved at stdio/container spawn. Optional — http /
+    # container MCPs that get their token via the auth strategy (`path_template`)
+    # or `secrets_to_env` need no entry here. Each `path` may use the
+    # `{identity}` / `{mcp}` placeholders (see mcp_hub.templating).
+    secrets: dict[str, SecretRefModel] = Field(default_factory=dict)
     # Per-tool argument overrides. Hub stamps these into the call's
     # arguments dict at dispatch time (clobbers agent-supplied values),
     # so an identity can be constrained to a SUBSET of a tool's surface
@@ -499,6 +503,9 @@ class TokenRefresherConfig(BaseModel):
 
 class HubConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    # Policy schema version (currently 1). Versioning policy: changes are
+    # additive-only (new optional fields, new placeholders), so v1 stays valid;
+    # a genuinely breaking change would bump this and the loader would gate on it.
     version: int
     server: ServerConfig = Field(default_factory=ServerConfig)
     auth: AuthConfig

@@ -69,6 +69,7 @@ from .secrets.bao import BaoSecretBackend
 from .secrets.env import EnvSecretBackend
 from .secrets.file import FileSecretBackend
 from .secrets.registry import resolve_secret_backend
+from .templating import expand_template
 
 
 def build_secret_backend(
@@ -487,7 +488,12 @@ def build_fanout(
             secret_model = identity_policy.secrets.get(mcp_name)
             if secret_model is None:
                 continue
-            ref = SecretRef(path=secret_model.path, field=secret_model.field)
+            ref = SecretRef(
+                path=expand_template(
+                    secret_model.path, identity=identity_name, mcp=mcp_name
+                ),
+                field=secret_model.field,
+            )
             uid = identity_policy.uid_base + mcp_config.uid_offset
             stdio_identities.append(
                 IdentityConfig(

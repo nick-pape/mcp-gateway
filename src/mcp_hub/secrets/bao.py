@@ -33,6 +33,7 @@ from mcp_hub.interfaces import (
     SecretRef,
     SecretResolutionError,
 )
+from mcp_hub.templating import expand_template
 
 _DEFAULT_ROLE_TEMPLATE = "mcp-{mcp}-{identity}"
 
@@ -69,7 +70,7 @@ class BaoSecretBackend:
         ref: SecretRef,
         jwt: str | None = None,
     ) -> ResolvedSecret:
-        role = self._role_template.format(mcp=mcp, identity=identity)
+        role = expand_template(self._role_template, identity=identity, mcp=mcp)
         try:
             if self._auth_method == "token":
                 assert self._static_token is not None  # guaranteed by __init__
