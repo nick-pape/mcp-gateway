@@ -1,35 +1,33 @@
-"""Authentik OIDC JWT validation.
+"""OIDC JWT validation.
 
-The hub validates inbound bearer JWTs against Authentik's published
-JWKS. Each agent identity has its own Authentik OAuth client with its
-own audience claim, e.g. ``mcp-ironclaw``. The hub extracts the
-identity name from the ``aud`` suffix after stripping a configured
-prefix (``mcp-``).
+The hub validates inbound bearer JWTs against an OIDC provider's published JWKS
+(Authentik, Keycloak, Auth0, Zitadel, ... — anything exposing standard OIDC
+discovery / a JWKS endpoint). The calling identity is derived either from a
+configured claim (``identity_claim`` — e.g. ``sub`` / ``azp`` / ``client_id``)
+or, in the audience-per-identity model, from the ``aud`` suffix after stripping
+``audience_prefix``.
 
 Security properties (called out in the architecture doc):
 
-- **JWKS URI is pinned at startup** and never resolved from the JWT's
-  ``kid``. A JWT with ``kid`` that looks like a URL is treated as a
-  lookup key into the cached JWKS dict, not a fetch target. This is
-  the single most important defense; one bug here breaks the whole
-  auth model.
+- **JWKS URI is pinned** (configured, or discovered once from the issuer's
+  ``/.well-known/openid-configuration``) and never resolved from the JWT's
+  ``kid``. A JWT with ``kid`` that looks like a URL is treated as a lookup key
+  into the cached JWKS dict, not a fetch target. This is the single most
+  important defense; one bug here breaks the whole auth model.
 
 - **Algorithm allowlist is explicit** (``RS256`` only by default).
   pyjwt is never called with ``algorithms=None`` or omitted.
 
-- **Issuer (``iss``) is validated** explicitly via pyjwt's
-  ``issuer=`` param. Defense against token reuse from another
-  Authentik client.
+- **Issuer (``iss``) is validated** explicitly via pyjwt's ``issuer=`` param.
+  Defense against token reuse from another client at the same IdP.
 
-- **Audience prefix is validated manually** because pyjwt's built-in
-  audience check is exact-match, not prefix-match. We disable
-  ``verify_aud`` and check ourselves.
+- **Audience is validated** when configured (prefix and/or exact match); pyjwt's
+  built-in exact-match is disabled so we can also support prefix-match.
 
-- **JWKS cache: serve-stale-on-warm-fail**. If JWKS fetch fails after
-  we have a warm cache, we serve the cached version and log loudly.
-  Cold-start failures propagate as :class:`AuthFailed`. This means
-  Authentik briefly going down does NOT take the MCP plane down;
-  Authentik being down at startup DOES.
+- **JWKS cache: serve-stale-on-warm-fail**. If JWKS fetch fails after we have a
+  warm cache, we serve the cached version and log loudly. Cold-start failures
+  propagate as :class:`AuthFailed` — the IdP being briefly down does NOT take
+  the MCP plane down; the IdP being down at startup DOES.
 """
 
 from __future__ import annotations
@@ -125,25 +123,45 @@ def _extract_bearer(request: Request) -> str:
 # ---------------------------------------------------------------------------
 
 
-class AuthentikJWTValidator:
-    """Validate Authentik-issued JWTs with a pinned JWKS URI."""
+class OidcJwtValidator:
+    """Validate OIDC JWTs from any standards-compliant IdP.
+
+    Identity is derived from ``identity_claim`` (e.g. ``sub`` / ``azp`` /
+    ``client_id`` / a custom claim) when set; otherwise from the ``aud`` suffix
+    after ``audience_prefix`` (the audience-per-identity model). At least one of
+    the two must be configured.
+
+    ``jwks_uri`` may be omitted, in which case it is discovered once from
+    ``<issuer>/.well-known/openid-configuration`` — so a minimal config supplies
+    only ``issuer`` + an identity strategy. ``audience`` (optional) adds an
+    exact-match audience check.
+    """
 
     def __init__(
         self,
         *,
-        jwks_uri: str,
         issuer: str,
-        audience_prefix: str,
+        jwks_uri: str | None = None,
+        audience_prefix: str | None = None,
+        identity_claim: str | None = None,
+        audience: str | None = None,
         algorithms: list[str] | None = None,
         clock_skew_s: int = 30,
         cache_ttl_s: int = 600,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        if not jwks_uri.startswith(("https://", "http://")):
+        if jwks_uri is not None and not jwks_uri.startswith(("https://", "http://")):
             raise ValueError(f"jwks_uri must be http(s)://, got {jwks_uri!r}")
-        self._jwks_uri = jwks_uri
+        if identity_claim is None and audience_prefix is None:
+            raise ValueError(
+                "OidcJwtValidator needs an identity strategy: set identity_claim "
+                "or audience_prefix"
+            )
         self._issuer = issuer
+        self._jwks_uri = jwks_uri
         self._audience_prefix = audience_prefix
+        self._identity_claim = identity_claim
+        self._audience = audience
         # Default to RS256 explicitly when omitted. An EMPTY list is a
         # config error — distinguish from None so we don't silently fall
         # back to defaults the caller didn't intend.
@@ -183,8 +201,12 @@ class AuthentikJWTValidator:
             if self._jwks is not None and (now - self._fetched_at) < self._cache_ttl_s:
                 return self._jwks
 
+            # Resolve the JWKS URI: configured value, or discover once from the
+            # issuer's OIDC well-known document.
+            jwks_uri = self._jwks_uri or await self._discover_jwks_uri()
+
             try:
-                response = await self._http.get(self._jwks_uri)
+                response = await self._http.get(jwks_uri)
                 response.raise_for_status()
                 jwks = response.json()
             except (httpx.HTTPError, ValueError) as exc:
@@ -194,11 +216,11 @@ class AuthentikJWTValidator:
                         ErrorCode.AUTH_FAILED,
                         f"JWKS fetch failed at cold start: {exc}",
                     ) from exc
-                # Warm cache: serve stale, log loudly. Authentik briefly down
-                # must not take the MCP plane down with it.
+                # Warm cache: serve stale, log loudly. The IdP being briefly
+                # down must not take the MCP plane down with it.
                 logger.warning(
                     "jwks_serving_stale: jwks_uri=%s error=%s age_s=%d",
-                    self._jwks_uri,
+                    jwks_uri,
                     exc,
                     int(now - self._fetched_at),
                 )
@@ -214,6 +236,35 @@ class AuthentikJWTValidator:
             self._fetched_at = now
             return jwks
 
+    async def _discover_jwks_uri(self) -> str:
+        """Resolve the JWKS URI from the issuer's OIDC discovery document.
+
+        Called once (under the JWKS lock) when no ``jwks_uri`` was configured;
+        the resolved value is cached on the instance for later fetches. Lets a
+        minimal config supply only ``issuer``.
+        """
+        well_known = self._issuer.rstrip("/") + "/.well-known/openid-configuration"
+        try:
+            response = await self._http.get(well_known)
+            response.raise_for_status()
+            doc = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AuthFailed(
+                ErrorCode.AUTH_FAILED,
+                f"OIDC discovery failed at {well_known}: {exc}",
+            ) from exc
+        jwks_uri = doc.get("jwks_uri") if isinstance(doc, dict) else None
+        if not isinstance(jwks_uri, str) or not jwks_uri.startswith(
+            ("https://", "http://")
+        ):
+            raise AuthFailed(
+                ErrorCode.AUTH_FAILED,
+                f"OIDC discovery doc at {well_known} has no usable jwks_uri",
+            )
+        self._jwks_uri = jwks_uri
+        logger.info("oidc_discovery: resolved jwks_uri=%s", jwks_uri)
+        return jwks_uri
+
     # -----------------------------------------------------------------------
     # Validation
     # -----------------------------------------------------------------------
@@ -221,9 +272,9 @@ class AuthentikJWTValidator:
     async def validate(self, token: str) -> Identity:
         """Validate ``token`` and return the :class:`Identity` it asserts.
 
-        Raises :class:`AuthFailed` for any failure: bad signature, wrong
-        audience prefix, expired, wrong issuer, unsupported alg, kid not
-        in JWKS, etc.
+        Raises :class:`AuthFailed` for any failure: bad signature, audience
+        or identity-claim mismatch, expired, wrong issuer, unsupported alg,
+        kid not in JWKS, etc.
         """
         # Step 1: pre-decode the unverified header. We need ``kid`` and
         # ``alg`` BEFORE we have the key to verify the signature. This
@@ -281,15 +332,42 @@ class AuthentikJWTValidator:
         except jwt.PyJWTError as exc:
             raise AuthFailed(ErrorCode.AUTH_FAILED, f"jwt validation failed: {exc}") from exc
 
-        # Step 4: validate audience prefix. The aud claim may be a
-        # string or a list of strings (RFC 7519 allows both).
-        identity = _extract_identity_from_aud(claims.get("aud"), self._audience_prefix)
-        if identity is None:
+        # Step 4: validate audience (when configured) + extract the identity.
+        # The aud claim may be a string or a list of strings (RFC 7519).
+        aud = claims.get("aud")
+        if self._audience is not None and not _aud_matches(aud, self._audience):
             raise AuthFailed(
                 ErrorCode.AUTH_FAILED,
-                f"audience {claims.get('aud')!r} does not start with "
-                f"{self._audience_prefix!r}",
+                f"audience {aud!r} does not match required {self._audience!r}",
             )
+
+        if self._identity_claim is not None:
+            identity_val = claims.get(self._identity_claim)
+            if not isinstance(identity_val, str) or not identity_val:
+                raise AuthFailed(
+                    ErrorCode.AUTH_FAILED,
+                    f"identity claim {self._identity_claim!r} missing or non-string",
+                )
+            # In claim mode, audience_prefix (if also set) is a validation gate.
+            if (
+                self._audience_prefix is not None
+                and _extract_identity_from_aud(aud, self._audience_prefix) is None
+            ):
+                raise AuthFailed(
+                    ErrorCode.AUTH_FAILED,
+                    f"audience {aud!r} does not start with {self._audience_prefix!r}",
+                )
+            identity = identity_val
+        else:
+            # aud-prefix mode: the prefix both validates and yields the identity.
+            assert self._audience_prefix is not None  # guaranteed by __init__
+            extracted = _extract_identity_from_aud(aud, self._audience_prefix)
+            if extracted is None:
+                raise AuthFailed(
+                    ErrorCode.AUTH_FAILED,
+                    f"audience {aud!r} does not start with {self._audience_prefix!r}",
+                )
+            identity = extracted
 
         return Identity(name=identity, claims=claims)
 
@@ -409,6 +487,15 @@ def _extract_identity_from_aud(aud: Any, prefix: str) -> str | None:
         if isinstance(c, str) and c.startswith(prefix):
             return c.removeprefix(prefix)
     return None
+
+
+def _aud_matches(aud: Any, expected: str) -> bool:
+    """True if ``expected`` equals the aud (str) or is in the aud (list)."""
+    if isinstance(aud, str):
+        return aud == expected
+    if isinstance(aud, list):
+        return expected in aud
+    return False
 
 
 def b64url_uint(n: int) -> str:

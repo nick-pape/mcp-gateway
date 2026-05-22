@@ -28,6 +28,11 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   a constant-time shared-secret check). `oidc` stays the default — making a true
   no-IdP `docker compose up` possible. (`jwt_passthrough` / `as_agent` /
   container MCPs remain oidc-only, with clear config errors otherwise.)
+- Generic OIDC validator: JWKS **auto-discovery** from
+  `<issuer>/.well-known/openid-configuration` (supply only `issuer`), a
+  configurable `identity_claim` (`sub`/`azp`/`client_id`/custom) alongside the
+  audience-prefix model, and an optional exact `audience` check — validates
+  against Keycloak / Auth0 / Zitadel / Authentik by config alone.
 - GitHub Actions CI (ruff + mypy --strict + pytest) and a generic image build
   published to `ghcr.io/nick-pape/mcp-gateway`.
 - gitleaks secret-scanning CI gate + pre-commit hook, with a custom rule for
@@ -39,6 +44,9 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - Renamed the distribution package `mcp-pape-house` → `mcp-gateway`.
 - The HTTP auth strategy `bao_backed_bearer` is now `secret_bearer`
   (`bao_backed_bearer` kept as a back-compat alias).
+- Renamed the inbound JWT validator `AuthentikJWTValidator` → `OidcJwtValidator`
+  (it was always generic OIDC; the name was misleading). Internal class, no
+  config impact.
 - Generic image config-path defaults are now `/etc/mcp-gateway/` (override with
   `MCP_HUB_CONFIG`).
 - The image is now MCP-agnostic — baked-in MCPs moved to deployment overlays.

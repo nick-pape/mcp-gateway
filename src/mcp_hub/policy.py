@@ -76,9 +76,12 @@ class ServerConfig(BaseModel):
 class AuthConfig(BaseModel):
     """Inbound auth config. ``mode`` selects how callers are authenticated:
 
-    - ``oidc`` (default): validate an inbound OIDC JWT against ``jwks_uri`` /
-      ``issuer``; identity = the ``aud`` suffix after ``audience_prefix``.
-      Requires ``issuer`` + ``jwks_uri`` + ``audience_prefix``.
+    - ``oidc`` (default): validate an inbound OIDC JWT against the issuer's JWKS.
+      Requires ``issuer`` and an identity strategy — ``audience_prefix`` (the
+      aud-suffix model) or ``identity_claim`` (sub / azp / client_id / custom).
+      ``jwks_uri`` is optional; when omitted it's discovered from the issuer's
+      ``/.well-known/openid-configuration``. ``audience`` (optional) adds an
+      exact aud check. Works with Authentik / Keycloak / Auth0 / Zitadel / ...
     - ``static_token``: opaque bearer tokens → identities, from ``token_file``
       (YAML/JSON mapping ``identity: token``). No IdP. Requires ``token_file``.
     - ``trusted_proxy``: trust a fronting auth proxy that injects
@@ -101,6 +104,12 @@ class AuthConfig(BaseModel):
     # Authentik publishes per-app discovery URLs even when issuer_mode=global,
     # so this can differ from `issuer`. The hub itself uses `jwks_uri` directly.
     oidc_discovery_url: str | None = None
+    # Identity extraction: default is the aud-suffix after audience_prefix
+    # (audience-per-identity). Set identity_claim to instead read the identity
+    # from a named claim (sub / azp / client_id / custom) — for IdPs that don't
+    # mint a per-identity audience. `audience` (optional) adds an exact aud check.
+    identity_claim: str | None = None
+    audience: str | None = None
     algorithms: list[str] = Field(default_factory=lambda: ["RS256"])
     clock_skew_s: int = 30
     cache_ttl_s: int = 600
@@ -115,13 +124,22 @@ class AuthConfig(BaseModel):
     @model_validator(mode="after")
     def _check_mode_fields(self) -> AuthConfig:
         required = {
-            "oidc": ("issuer", "jwks_uri", "audience_prefix"),
+            "oidc": ("issuer",),
             "static_token": ("token_file",),
             "trusted_proxy": ("identity_header", "shared_secret_file"),
         }
         missing = [f for f in required[self.mode] if getattr(self, f) is None]
         if missing:
             raise ValueError(f"auth.mode={self.mode!r} requires: {', '.join(missing)}")
+        if (
+            self.mode == "oidc"
+            and self.audience_prefix is None
+            and self.identity_claim is None
+        ):
+            raise ValueError(
+                "auth.mode='oidc' requires an identity strategy: set "
+                "audience_prefix or identity_claim"
+            )
         # Reject fields belonging to a different mode (catch copy-paste/typos).
         # Only the None-defaulted fields are checked; the OIDC tuning knobs with
         # real defaults (algorithms/clock_skew_s/cache_ttl_s) are always benign.
@@ -129,11 +147,11 @@ class AuthConfig(BaseModel):
             "oidc": ("token_file", "identity_header", "shared_secret_file"),
             "static_token": (
                 "issuer", "jwks_uri", "audience_prefix", "oidc_discovery_url",
-                "identity_header", "shared_secret_file",
+                "identity_claim", "audience", "identity_header", "shared_secret_file",
             ),
             "trusted_proxy": (
                 "issuer", "jwks_uri", "audience_prefix", "oidc_discovery_url",
-                "token_file",
+                "identity_claim", "audience", "token_file",
             ),
         }
         foreign = [f for f in cross[self.mode] if getattr(self, f) is not None]

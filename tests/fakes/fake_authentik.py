@@ -10,7 +10,7 @@ Usage::
 
     fake = FakeAuthentik(jwks_uri="https://auth.example/jwks/", issuer="...")
     client = httpx.AsyncClient(transport=fake.transport)
-    validator = AuthentikJWTValidator(
+    validator = OidcJwtValidator(
         jwks_uri="https://auth.example/jwks/",
         issuer="...",
         audience_prefix="mcp-",
@@ -47,6 +47,7 @@ class FakeAuthentik:
         self._jwks_uri = jwks_uri
         self._issuer = issuer
         self._kid = kid
+        self._well_known = issuer.rstrip("/") + "/.well-known/openid-configuration"
         self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self._fetch_count = 0
         # Build the JWKS once (the public key is fixed for this instance).
@@ -72,9 +73,15 @@ class FakeAuthentik:
         return httpx.MockTransport(self._handler)
 
     def _handler(self, request: httpx.Request) -> httpx.Response:
-        if str(request.url) == self._jwks_uri and request.method == "GET":
+        url = str(request.url)
+        if url == self._jwks_uri and request.method == "GET":
             self._fetch_count += 1
             return httpx.Response(200, json=self._jwks)
+        if url == self._well_known and request.method == "GET":
+            # OIDC discovery document — only jwks_uri is consumed by the hub.
+            return httpx.Response(
+                200, json={"issuer": self._issuer, "jwks_uri": self._jwks_uri}
+            )
         # Anything else: 404. If a test ever fetches an unexpected URL,
         # this surfaces as a clear error rather than a silent pass.
         return httpx.Response(404, text=f"unexpected {request.method} {request.url}")
