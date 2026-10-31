@@ -16,6 +16,16 @@ Eager-or-die at boot still applies: a failed JSON-RPC ``initialize``
 handshake against the upstream aborts hub startup the same way a
 failed stdio child spawn does.
 
+Sessions: if the upstream's ``initialize`` reply carries an
+``Mcp-Session-Id`` header, the upstream is stateful and the spec requires
+that id on every later request. The fanout then keeps one session per
+identity (each identity authenticates differently, and servers may bind a
+session to its principal): the boot identity's comes from the boot
+handshake, the others are opened lazily on first call. A 404 on a request
+that carried a session id means the session is gone (upstream restart or
+expiry); the fanout re-initializes once and retries. Upstreams that issue
+no session id are untouched — no extra requests, no header.
+
 This module lives in :mod:`mcp_fanout` (alongside the stdio Fanout)
 because it shares the public API surface; tests import both via
 ``from mcp_fanout import ...``.
@@ -23,6 +33,7 @@ because it shares the public API surface; tests import both via
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Sequence
 from contextlib import suppress
@@ -46,6 +57,28 @@ DEFAULT_MAX_RESPONSE_BYTES: int = 4 * 1024 * 1024
 # HTTP MCPs sometimes do nontrivial work; 30s is generous without
 # letting calls hang forever.
 DEFAULT_REQUEST_TIMEOUT_S: float = 30.0
+
+# Streamable-HTTP session header (MCP spec 2025-03-26+). httpx header
+# lookups are case-insensitive, so this spelling also matches the
+# lower-case form most servers send.
+SESSION_HEADER: str = "Mcp-Session-Id"
+
+_INITIALIZE_PARAMS: dict[str, Any] = {
+    "protocolVersion": "2025-06-18",
+    "capabilities": {"tools": {}},
+    "clientInfo": {
+        "name": "mcp-fanout-http",
+        "version": "0.0.0",
+    },
+}
+
+
+class _SessionExpired(HttpUpstreamFailed):
+    """The upstream answered 404 to a request that carried a session id.
+
+    Per the Streamable-HTTP spec the session is gone and the client must
+    start a new one; :meth:`HttpFanout.call` catches this and retries once.
+    """
 
 
 class HttpFanout:
@@ -86,9 +119,7 @@ class HttpFanout:
                 f"HttpFanout({mcp_name!r}) has duplicate identities: {sorted(identities)}"
             )
         if not url.startswith(("http://", "https://")):
-            raise ValueError(
-                f"HttpFanout({mcp_name!r}) url must be http(s)://, got {url!r}"
-            )
+            raise ValueError(f"HttpFanout({mcp_name!r}) url must be http(s)://, got {url!r}")
         self._mcp_name = mcp_name
         self._url = url
         self._auth = auth_strategy
@@ -101,6 +132,11 @@ class HttpFanout:
         self._owns_client: bool = http_client is None
         self._negotiated_protocol_version: str | None = None
         self._started: bool = False
+        # Set at boot when the upstream's initialize reply carries a session
+        # id; from then on every identity needs its own session.
+        self._session_mode: bool = False
+        self._sessions: dict[str, str] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def mcp_name(self) -> str:
@@ -175,37 +211,16 @@ class HttpFanout:
         # other identities' secrets are resolved lazily on first call.
         boot_identity = self._identities[0]
         try:
-            init_response = await self._post_jsonrpc(
-                identity=boot_identity,
-                request={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {"tools": {}},
-                        "clientInfo": {
-                            "name": "mcp-fanout-http",
-                            "version": "0.0.0",
-                        },
-                    },
-                },
-                # Boot-time request_context is empty: BaoBackedBearer
-                # ignores it; JwtPassthrough won't be configured for an
-                # MCP whose boot-time auth is identity-only.
-                request_context={},
+            # Boot-time request_context is empty: BaoBackedBearer ignores it;
+            # JwtPassthrough won't be configured for an MCP whose boot-time
+            # auth is identity-only.
+            init_response, session_id = await self._handshake(
+                identity=boot_identity, request_context={}
             )
         except HttpUpstreamFailed:
             # Make sure we don't leak the http client we just opened.
             await self.close()
             raise
-
-        if "error" in init_response:
-            await self.close()
-            raise HttpUpstreamFailed(
-                f"HttpFanout({self._mcp_name}): initialize failed: "
-                f"{init_response['error']}"
-            )
 
         # Stash the negotiated version for observability. The MCP spec
         # leaves room for the server to downgrade us; record what we got.
@@ -215,23 +230,96 @@ class HttpFanout:
             if isinstance(negotiated, str):
                 self._negotiated_protocol_version = negotiated
 
+        if session_id is not None:
+            self._session_mode = True
+            self._sessions[boot_identity] = session_id
+
+        logger.info(
+            "HttpFanout(%s) initialized: protocolVersion=%s sessions=%s",
+            self._mcp_name,
+            self._negotiated_protocol_version,
+            "per-identity" if self._session_mode else "none",
+        )
+        self._started = True
+
+    async def _handshake(
+        self,
+        *,
+        identity: str,
+        request_context: dict[str, Any],
+    ) -> tuple[dict[str, Any], str | None]:
+        """Run ``initialize`` + ``notifications/initialized`` for one identity.
+
+        Returns the parsed ``initialize`` reply and the session id the
+        upstream assigned (``None`` for a stateless upstream). Raises
+        :class:`HttpUpstreamFailed` on transport, HTTP or JSON-RPC errors.
+        """
+        response = await self._send(
+            identity=identity,
+            request={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": _INITIALIZE_PARAMS,
+            },
+            request_context=request_context,
+            session_id=None,
+        )
+        init_response = self._parse_response(response, session_id=None)
+        if "error" in init_response:
+            raise HttpUpstreamFailed(
+                f"HttpFanout({self._mcp_name}): initialize failed: {init_response['error']}"
+            )
+        session_id = response.headers.get(SESSION_HEADER) or None
+
         # Per spec: send notifications/initialized after init. Many
         # streamable-HTTP MCPs accept it as a fire-and-forget POST
         # (no JSON-RPC id, no response). Best-effort: log and continue
         # if the upstream rejects the notification.
         with suppress(HttpUpstreamFailed):
             await self._post_notification(
-                identity=boot_identity,
+                identity=identity,
                 request={"jsonrpc": "2.0", "method": "notifications/initialized"},
-                request_context={},
+                request_context=request_context,
+                session_id=session_id,
             )
+        return init_response, session_id
 
-        logger.info(
-            "HttpFanout(%s) initialized: protocolVersion=%s",
-            self._mcp_name,
-            self._negotiated_protocol_version,
-        )
-        self._started = True
+    async def _ensure_session(
+        self, *, identity: str, request_context: dict[str, Any]
+    ) -> str | None:
+        """Return ``identity``'s session id, opening a session if it has none."""
+        existing = self._sessions.get(identity)
+        if existing is not None:
+            return existing
+        lock = self._session_locks.setdefault(identity, asyncio.Lock())
+        async with lock:
+            # Another call may have opened it while we waited.
+            existing = self._sessions.get(identity)
+            if existing is not None:
+                return existing
+            _, session_id = await self._handshake(
+                identity=identity, request_context=request_context
+            )
+            if session_id is None:
+                # The upstream stopped issuing sessions (e.g. redeployed
+                # stateless): drop session handling for every identity.
+                logger.warning(
+                    "HttpFanout(%s): initialize for identity=%s returned no "
+                    "session id; upstream is stateless now, dropping sessions",
+                    self._mcp_name,
+                    identity,
+                )
+                self._session_mode = False
+                self._sessions.clear()
+                return None
+            self._sessions[identity] = session_id
+            logger.info(
+                "HttpFanout(%s): opened session for identity=%s",
+                self._mcp_name,
+                identity,
+            )
+            return session_id
 
     async def _boot_probe_no_auth(self) -> None:
         """Confirm the upstream is reachable without sending credentials.
@@ -290,22 +378,59 @@ class HttpFanout:
         """
         if not self._started:
             raise HttpUpstreamFailed(
-                f"HttpFanout({self._mcp_name}): not started; call "
-                f"start_eager_or_die() first"
+                f"HttpFanout({self._mcp_name}): not started; call start_eager_or_die() first"
             )
         if identity not in self._identities:
             raise IdentityNotFound(
                 f"HttpFanout({self._mcp_name}): unknown identity {identity!r}; "
                 f"registered: {sorted(self._identities)}"
             )
-        return await self._post_jsonrpc(
-            identity=identity,
-            request=request,
-            request_context=request_context or {},
-        )
+        ctx = request_context or {}
+        if not self._session_mode:
+            return await self._post_jsonrpc(identity=identity, request=request, request_context=ctx)
+        session_id = await self._ensure_session(identity=identity, request_context=ctx)
+        try:
+            return await self._post_jsonrpc(
+                identity=identity,
+                request=request,
+                request_context=ctx,
+                session_id=session_id,
+            )
+        except _SessionExpired:
+            # Upstream restarted or expired the session: open a new one and
+            # retry once. A second expiry propagates as HttpUpstreamFailed.
+            logger.info(
+                "HttpFanout(%s): session for identity=%s expired; re-initializing",
+                self._mcp_name,
+                identity,
+            )
+            if self._sessions.get(identity) == session_id:
+                del self._sessions[identity]
+            session_id = await self._ensure_session(identity=identity, request_context=ctx)
+            return await self._post_jsonrpc(
+                identity=identity,
+                request=request,
+                request_context=ctx,
+                session_id=session_id,
+            )
 
     async def close(self) -> None:
-        """Close the HTTP client (if owned). Idempotent."""
+        """End open sessions and close the HTTP client (if owned). Idempotent."""
+        sessions, self._sessions = self._sessions, {}
+        self._session_mode = False
+        if self._http is not None:
+            # Spec: clients SHOULD DELETE a session they no longer need, so
+            # the upstream can free it. Best-effort; servers may answer 405.
+            for identity, session_id in sessions.items():
+                with suppress(Exception):
+                    auth_headers = await self._auth.auth_header(
+                        identity=identity, request_context={}
+                    )
+                    await self._http.delete(
+                        self._url,
+                        headers={SESSION_HEADER: session_id, **auth_headers},
+                        timeout=5.0,
+                    )
         if self._http is not None and self._owns_client:
             with suppress(Exception):
                 await self._http.aclose()
@@ -324,12 +449,29 @@ class HttpFanout:
         identity: str,
         request: dict[str, Any],
         request_context: dict[str, Any],
+        session_id: str | None = None,
     ) -> dict[str, Any]:
+        response = await self._send(
+            identity=identity,
+            request=request,
+            request_context=request_context,
+            session_id=session_id,
+        )
+        return self._parse_response(response, session_id=session_id)
+
+    async def _send(
+        self,
+        *,
+        identity: str,
+        request: dict[str, Any],
+        request_context: dict[str, Any],
+        session_id: str | None,
+    ) -> httpx.Response:
+        """POST one JSON-RPC message with auth (and session) headers."""
         if self._http is None:
             # call() before start_eager_or_die() is a programming bug.
             raise HttpUpstreamFailed(
-                f"HttpFanout({self._mcp_name}): not started; call "
-                f"start_eager_or_die() first"
+                f"HttpFanout({self._mcp_name}): not started; call start_eager_or_die() first"
             )
 
         try:
@@ -353,8 +495,10 @@ class HttpFanout:
             "Accept": "application/json, text/event-stream",
             **auth_headers,
         }
+        if session_id is not None:
+            headers[SESSION_HEADER] = session_id
         try:
-            response = await self._http.post(
+            return await self._http.post(
                 self._url,
                 json=request,
                 headers=headers,
@@ -362,10 +506,18 @@ class HttpFanout:
             )
         except httpx.HTTPError as exc:
             raise HttpUpstreamFailed(
-                f"HttpFanout({self._mcp_name}): network error calling "
-                f"{self._url}: {exc}"
+                f"HttpFanout({self._mcp_name}): network error calling {self._url}: {exc}"
             ) from exc
 
+    def _parse_response(
+        self, response: httpx.Response, *, session_id: str | None
+    ) -> dict[str, Any]:
+        """Check status and size, then parse a JSON or single-message SSE body."""
+        if response.status_code == 404 and session_id is not None:
+            raise _SessionExpired(
+                f"HttpFanout({self._mcp_name}): upstream {self._url} no longer "
+                f"knows session {session_id!r} (HTTP 404)"
+            )
         if response.status_code >= 400:
             # Truncate body for log/exception sanity; upstream errors
             # can be arbitrary HTML (Cloudflare-style 5xx pages).
@@ -398,16 +550,14 @@ class HttpFanout:
                 parsed = _parse_single_sse_message(response.text)
             except ValueError as exc:
                 raise HttpUpstreamFailed(
-                    f"HttpFanout({self._mcp_name}): upstream returned "
-                    f"unparseable SSE: {exc}"
+                    f"HttpFanout({self._mcp_name}): upstream returned unparseable SSE: {exc}"
                 ) from exc
         else:
             try:
                 parsed = response.json()
             except (ValueError, UnicodeDecodeError) as exc:
                 raise HttpUpstreamFailed(
-                    f"HttpFanout({self._mcp_name}): upstream returned "
-                    f"unparseable JSON: {exc}"
+                    f"HttpFanout({self._mcp_name}): upstream returned unparseable JSON: {exc}"
                 ) from exc
 
         if not isinstance(parsed, dict):
@@ -423,6 +573,7 @@ class HttpFanout:
         identity: str,
         request: dict[str, Any],
         request_context: dict[str, Any],
+        session_id: str | None = None,
     ) -> None:
         """POST a JSON-RPC notification (no id, no response expected).
 
@@ -446,6 +597,8 @@ class HttpFanout:
             "Accept": "application/json, text/event-stream",
             **auth_headers,
         }
+        if session_id is not None:
+            headers[SESSION_HEADER] = session_id
         try:
             response = await self._http.post(
                 self._url,
@@ -460,8 +613,7 @@ class HttpFanout:
             ) from exc
         if response.status_code >= 400:
             raise HttpUpstreamFailed(
-                f"HttpFanout({self._mcp_name}): notification rejected: "
-                f"HTTP {response.status_code}"
+                f"HttpFanout({self._mcp_name}): notification rejected: HTTP {response.status_code}"
             )
 
 
