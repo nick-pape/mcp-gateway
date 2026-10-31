@@ -78,6 +78,11 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
   session re-initializes once and retries; sessions are DELETEd on close.
   Previously every call after `initialize` failed with HTTP 400 "Server not
   initialized", which aborted hub startup. Stateless upstreams are unchanged.
+- Upstream tools whose input properties aren't Python identifiers (keywords
+  like `from`, or names like `dry-run`) no longer abort hub startup with
+  `ValueError: 'from' is not a valid parameter name`. The forged handler
+  signature uses a sanitized name carrying the original as a Pydantic alias,
+  and calls are forwarded with the upstream's own names.
 
 ### Documentation
 - Rewrote `architecture.md` around the generic design: pluggable axes + the three
