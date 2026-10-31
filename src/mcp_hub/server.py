@@ -29,14 +29,17 @@ __main__.py).
 from __future__ import annotations
 
 import contextlib
+import keyword
 import logging
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from mcp.types import TextContent
+from pydantic import Field
 
 from mcp_fanout import ContainerFanout, Fanout, HttpFanout
 
@@ -67,6 +70,31 @@ logger = logging.getLogger(__name__)
 # null for fields the agent never set — Outline's Zod schemas reject
 # null on plain `string`/`boolean` optional fields.
 _UNSET: Any = object()
+
+
+def _python_param_names(prop_names: list[str]) -> dict[str, str]:
+    """Map each upstream input property to a usable Python parameter name.
+
+    The forged handler signature needs real identifiers, but JSON-schema
+    property names can be Python keywords (``from``, ``class``) or contain
+    characters like ``-``. Those get a sanitized, unique name (``from_``,
+    ``dry_run_``); valid names map to themselves.
+    """
+    taken = {p for p in prop_names if p.isidentifier() and not keyword.iskeyword(p)}
+    names: dict[str, str] = {}
+    for prop in prop_names:
+        if prop in taken:
+            names[prop] = prop
+            continue
+        candidate = re.sub(r"\W", "_", prop)
+        if not candidate or not candidate.isidentifier():
+            candidate = f"p_{candidate}"
+        candidate += "_"
+        while candidate in taken or keyword.iskeyword(candidate):
+            candidate += "_"
+        taken.add(candidate)
+        names[prop] = candidate
+    return names
 
 
 # All three fanouts implement this duck-typed interface (mcp_name,
@@ -128,9 +156,7 @@ class Hub:
         #     MCP is present. The hub deploys without DOCKER_HOST configured
         #     don't pay the import cost for the docker SDK.
         docker_client: object | None = None
-        if any(
-            mc.transport == "container" for mc in self._policy.config.mcps.values()
-        ):
+        if any(mc.transport == "container" for mc in self._policy.config.mcps.values()):
             docker_client = build_docker_client()
         for mcp_name, mcp_config in self._policy.config.mcps.items():
             self._fanouts[mcp_name] = build_fanout(
@@ -224,7 +250,8 @@ class Hub:
             if boot_bearer:
                 logger.info(
                     "registering tools with boot-time bearer from %s (len=%d)",
-                    jwt_path, len(boot_bearer),
+                    jwt_path,
+                    len(boot_bearer),
                 )
         boot_request_context: dict[str, Any] = {}
         if boot_bearer is not None:
@@ -286,6 +313,11 @@ class Hub:
             if "justification" not in input_schema["required"]:
                 input_schema["required"].append("justification")
 
+        # Python names for the forged signature below; properties that aren't
+        # identifiers (e.g. `from`) are renamed and mapped back in the handler.
+        param_names = _python_param_names(list(input_schema.get("properties", {})))
+        renamed = {py: prop for prop, py in param_names.items() if py != prop}
+
         # FastMCP introspects the function's signature for both schema
         # generation AND argument unpacking. **kwargs is rejected by its
         # validator, but a function with __signature__ overridden to a
@@ -299,9 +331,10 @@ class Hub:
             identity: str | None = ctx.get_state("identity")
             if identity is None:
                 raise RuntimeError(
-                    f"{ErrorCode.IDENTITY_UNKNOWN}: tool {prefixed_name} "
-                    f"called with no identity"
+                    f"{ErrorCode.IDENTITY_UNKNOWN}: tool {prefixed_name} called with no identity"
                 )
+            # Restore upstream property names (`from_` -> `from`).
+            arguments = {renamed.get(k, k): v for k, v in arguments.items()}
             # Defense-in-depth: HITL middleware also strips ``justification``
             # from context.message.arguments before call_next, but pop here
             # too in case the upstream FastMCP version doesn't propagate
@@ -324,7 +357,9 @@ class Hub:
                 arguments.update(forced_args)
                 logger.info(
                     "policy: forced args on %s for %s: %s",
-                    prefixed_name, identity, list(forced_args),
+                    prefixed_name,
+                    identity,
+                    list(forced_args),
                 )
             # Build request_context for HTTP-fanout auth strategies.
             # Only HttpFanout reads it; stdio Fanout ignores the kwarg.
@@ -364,14 +399,20 @@ class Hub:
         # kinds; explicit named params pass through.
         import inspect as _inspect
 
+        # A renamed parameter carries its upstream name as a Pydantic alias, so
+        # FastMCP still validates calls that use the upstream's field names.
         properties: dict[str, Any] = input_schema.get("properties", {})
         required = set(input_schema.get("required", []))
         forged_params = [
             _inspect.Parameter(
-                name=prop_name,
+                name=param_names[prop_name],
                 kind=_inspect.Parameter.KEYWORD_ONLY,
                 default=_inspect.Parameter.empty if prop_name in required else _UNSET,
-                annotation=Any,
+                annotation=(
+                    Any
+                    if param_names[prop_name] == prop_name
+                    else Annotated[Any, Field(alias=prop_name)]
+                ),
             )
             for prop_name in properties
         ]
@@ -380,7 +421,7 @@ class Hub:
         )
         # Pydantic walks __annotations__ (via typing.get_type_hints) for
         # arguments-schema validation; __signature__ alone isn't enough.
-        handler.__annotations__ = {p.name: Any for p in forged_params}
+        handler.__annotations__ = {p.name: p.annotation for p in forged_params}
         handler.__annotations__["return"] = str
 
         from fastmcp.tools.tool import FunctionTool
