@@ -70,6 +70,15 @@ follow [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 - FastMCP server name and package docstrings are now `mcp-gateway`-branded;
   `policy.example.yaml` and `scripts/` use generic `example.com` hostnames.
 
+### Fixed
+- HTTP upstreams that use Streamable-HTTP sessions now work. `HttpFanout` reads
+  the `Mcp-Session-Id` from the `initialize` reply and sends it on every later
+  request, keeping one session per identity (the boot identity's from the boot
+  handshake, the rest opened on first call). A 404 on a request that carried a
+  session re-initializes once and retries; sessions are DELETEd on close.
+  Previously every call after `initialize` failed with HTTP 400 "Server not
+  initialized", which aborted hub startup. Stateless upstreams are unchanged.
+
 ### Documentation
 - Rewrote `architecture.md` around the generic design: pluggable axes + the three
   transports (stdio/http/container) + three auth modes (oidc/static_token/
